@@ -1,0 +1,26 @@
+[
+  {
+    "id": "_readme",
+    "_comment": "JSON has no comments, so this file uses '_comment' string fields. The example schedule server ignores items whose id starts with '_' or that have \"disabled\": true. Remove \"disabled\" (or set it to false) to opt in to recording a public stream. Relative fields startOffsetSeconds / endOffsetSeconds are converted to absolute RFC3339 start / end relative to the server start; absolute start / end values pass through unchanged."
+  },
+  {
+    "id": "somafm-groovesalad",
+    "name": "SomaFM Groove Salad (public AAC icecast)",
+    "type": "icecast",
+    "source": "https://ice1.somafm.com/groovesalad-128-aac",
+    "startOffsetSeconds": -60,
+    "endOffsetSeconds": 600,
+    "disabled": true,
+    "_comment": "AAC source: with AUDIO_CODEC=auto the recorder stream-copies it (no transcoding)."
+  },
+  {
+    "id": "somafm-groovesalad-mp3",
+    "name": "SomaFM Groove Salad (public MP3 icecast)",
+    "type": "icecast",
+    "source": "https://ice1.somafm.com/groovesalad-128-mp3",
+    "startOffsetSeconds": -60,
+    "endOffsetSeconds": 600,
+    "disabled": true,
+    "_comment": "MP3 source: with AUDIO_CODEC=auto the recorder transcodes to AAC at AUDIO_BITRATE."
+  }
+]

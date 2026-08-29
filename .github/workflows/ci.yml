@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go vet / test / build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: gofmt -l . && test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test ./... -race -count=1
+      - run: CGO_ENABLED=0 go build -trimpath ./cmd/recorder
+
+  docker:
+    name: Docker build (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: stream-recorder:pr
+          cache-from: type=gha,scope=pr
+          cache-to: type=gha,mode=max,scope=pr
+      - name: Smoke test binary in image
+        run: |
+          docker run --rm stream-recorder:pr --version
+          docker run --rm --entrypoint ffmpeg stream-recorder:pr -version | head -1

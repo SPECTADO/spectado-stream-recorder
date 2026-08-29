@@ -1,0 +1,169 @@
+# spectado-stream-recorder - example Compose stack
+#
+# Full local test setup: the recorder, a tiny schedule server, a synthetic HLS
+# test stream (440 Hz tone) and an optional Prometheus + Grafana monitoring
+# stack. Uploads to R2 are disabled by default (UPLOAD_DISABLED=true in
+# .env.example), so the whole thing runs without any cloud credentials.
+#
+# How to run:
+#   cp .env.example .env                                  # edit as needed
+#   docker compose -f docker-compose.example.yml up --build
+#   docker compose -f docker-compose.example.yml --profile monitoring up --build   # + Prometheus/Grafana
+#   docker compose -f docker-compose.example.yml down -v  # stop and drop volumes
+#
+# URLs (everything is bound to 127.0.0.1 only):
+#   recorder API   http://127.0.0.1:8080/api/state      (also /api/schedule, /api/recordings, /api/system)
+#   metrics        http://127.0.0.1:8080/metrics
+#   health         http://127.0.0.1:8080/healthz  /readyz
+#   schedule       http://127.0.0.1:8081/schedule.json (dynamic, relative to server start)
+#   test stream    http://127.0.0.1:8081/hls/test.m3u8
+#   Prometheus     http://127.0.0.1:9090                (--profile monitoring)
+#   Grafana        http://127.0.0.1:3000                (--profile monitoring, admin/admin, anonymous Viewer)
+#
+# Recordings land in the named volume `recordings` (mounted at /data). Inspect with:
+#   docker compose -f docker-compose.example.yml exec recorder ls -la /data
+
+services:
+  recorder:
+    build: .
+    # Use the published image instead of building locally:
+    # image: ghcr.io/OWNER/REPO:main
+    restart: unless-stopped
+    # Give ffmpeg processes time to flush and the uploader time to finish
+    # (must be >= SHUTDOWN_TIMEOUT in .env, default 45s).
+    stop_grace_period: 60s
+    env_file: .env
+    environment:
+      # Points at the bundled schedule server unless overridden in .env / shell.
+      SCHEDULE_URL: ${SCHEDULE_URL:-http://schedule:8000/schedule.json}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # The image runs as uid 10001 (user "recorder"). The named volume is
+      # chown-ed automatically on first start. If you prefer a BIND mount
+      # (e.g. `./data:/data`) you must create and own the directory yourself:
+      #   mkdir -p data && sudo chown 10001:10001 data
+      - recordings:/data
+    # ffmpeg is one process per stream (plus short-lived ffprobe runs).
+    pids_limit: 8192
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # Sizing: a transcoding ffmpeg (AUDIO_CODEC=aac) uses roughly 50 MB RSS,
+    # so 100 streams need ~3-4 GiB; with AUDIO_CODEC=copy (no transcoding)
+    # ~2 GiB is enough. The Go process itself stays well below GOMEMLIMIT.
+    # Transcoding 100 streams needs ~2-4 cores; stream copy is nearly free.
+    mem_limit: 4g
+    cpus: 4
+    # Hardening: the binary only writes to /data (volume) and /tmp (tmpfs).
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    depends_on:
+      - schedule
+    # The image ships a built-in HEALTHCHECK: `recorder healthcheck` probes /healthz on HTTP_ADDR every 30s.
+    # Override it here only if you need different timings:
+    # healthcheck:
+    #   test: ["CMD", "/usr/local/bin/recorder", "healthcheck"]
+    #   interval: 30s
+    #   timeout: 5s
+    #   start_period: 15s
+    #   retries: 3
+
+  # Minimal stdlib-only Python server that serves a dynamic schedule.json
+  # (times relative to its own start) and the HLS test stream from /www/hls.
+  schedule:
+    image: python:3.12-alpine
+    command: ["python", "/app/server.py"]
+    restart: unless-stopped
+    volumes:
+      - ./example/schedule-server:/app:ro
+      - hls:/www/hls:ro
+    ports:
+      - "127.0.0.1:8081:8000"
+    environment:
+      # How long (minutes, from server start) the test recording should last.
+      RECORD_MINUTES: ${RECORD_MINUTES:-10}
+      # Base URL the recorder uses to reach the test stream (container network).
+      STREAM_BASE: http://schedule:8000
+      # Extra schedule items (see example/schedule-server/extra-items.json).
+      EXTRA_SCHEDULE_FILE: /app/extra-items.json
+
+  # Synthetic live HLS stream: a 440 Hz sine tone, AAC 96 kbit/s, 4 s segments,
+  # sliding window of 8 segments. Written into the shared `hls` volume.
+  # The image's ENTRYPOINT is ffmpeg, so `command` is just the argument list.
+  teststream:
+    image: mwader/static-ffmpeg:8.0.1
+    restart: unless-stopped
+    command:
+      - "-hide_banner"
+      - "-loglevel"
+      - "warning"
+      - "-re"
+      - "-f"
+      - "lavfi"
+      - "-i"
+      - "sine=frequency=440:sample_rate=44100"
+      - "-af"
+      - "volume=0.2"
+      - "-ac"
+      - "2"
+      - "-c:a"
+      - "aac"
+      - "-b:a"
+      - "96k"
+      - "-f"
+      - "hls"
+      - "-hls_time"
+      - "4"
+      - "-hls_list_size"
+      - "8"
+      - "-hls_flags"
+      - "delete_segments+append_list"
+      - "-hls_segment_filename"
+      - "/www/hls/test_%05d.ts"
+      - "/www/hls/test.m3u8"
+    volumes:
+      - hls:/www/hls
+
+  # ---------------------------------------------------------------------------
+  # Optional monitoring stack: `--profile monitoring`
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: [monitoring]
+    restart: unless-stopped
+    volumes:
+      - ./example/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./example/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    profiles: [monitoring]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./example/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  recordings: {}
+  hls: {}

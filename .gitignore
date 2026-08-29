@@ -1,0 +1,11 @@
+/data/
+/bin/
+/dist/
+.env
+.env.local
+*.aac
+!example/**/*.aac
+.DS_Store
+.idea/
+.vscode/
+coverage.out

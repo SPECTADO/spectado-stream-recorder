@@ -1,0 +1,109 @@
+name: Docker image
+
+on:
+  push:
+    # Every branch builds: main -> channel "main", anything else -> "develop".
+    # Bot branches are excluded so a dependency bump cannot overwrite :develop.
+    branches:
+      - "**"
+      - "!dependabot/**"
+      - "!renovate/**"
+    tags-ignore: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test ./... -race -count=1
+      - run: CGO_ENABLED=0 go build -trimpath ./cmd/recorder
+
+  build:
+    name: Build & push
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Version comes from the VERSION file; channel from the branch:
+      #   main            -> :main    + :<version>          + :<version>-main
+      #   any other branch -> :develop + :<version>-develop
+      # Every build also gets :sha-<short sha>.
+      - name: Compute tags
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [[ -z "$VERSION" ]]; then echo "VERSION file is empty" >&2; exit 1; fi
+          if [[ "${GITHUB_REF_NAME}" == "main" ]]; then CHANNEL="main"; else CHANNEL="develop"; fi
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY,,}"     # GHCR requires lowercase
+          SHORT_SHA="${GITHUB_SHA::7}"
+          TAGS="${IMAGE}:${CHANNEL}"$'\n'"${IMAGE}:${VERSION}-${CHANNEL}"$'\n'"${IMAGE}:sha-${SHORT_SHA}"
+          if [[ "$CHANNEL" == "main" ]]; then TAGS="${TAGS}"$'\n'"${IMAGE}:${VERSION}"; fi
+          {
+            echo "version=${VERSION}"
+            echo "channel=${CHANNEL}"
+            echo "image=${IMAGE}"
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${IMAGE} version ${VERSION} channel ${CHANNEL}"
+          echo "${TAGS}"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=spectado-stream-recorder
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+          cache-from: type=gha,scope=${{ steps.meta.outputs.channel }}
+          cache-to: type=gha,mode=max,scope=${{ steps.meta.outputs.channel }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image pushed"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

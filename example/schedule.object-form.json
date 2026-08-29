@@ -1,0 +1,31 @@
+{
+  "_comment": "Alternative object form of the schedule document: the same item objects wrapped in an \"items\" array. Top-level fields other than \"items\" are ignored.",
+  "generatedAt": "2026-08-31T18:00:00+02:00",
+  "items": [
+    {
+      "id": "radio-one-morning-show",
+      "name": "Radio One - Morning Show",
+      "type": "hls",
+      "source": "https://cdn.example.com/radio-one/live/playlist.m3u8",
+      "start": "2026-09-01T06:00:00+02:00",
+      "end": "2026-09-01T09:00:00+02:00",
+      "key": "radio-one/2026-09-01/morning-show.aac",
+      "codec": "auto",
+      "bitrate": "128k",
+      "headers": {
+        "Authorization": "Bearer example-token"
+      },
+      "startEarly": "15s",
+      "stopLate": "45s"
+    },
+    {
+      "id": "jazz-fm-evening",
+      "name": "Jazz FM - Evening Session",
+      "type": "icecast",
+      "source": "https://ice.example.com/jazzfm-128-aac",
+      "start": "2026-09-01T20:00:00+02:00",
+      "end": "2026-09-01T22:30:00+02:00",
+      "codec": "copy"
+    }
+  ]
+}

@@ -1,0 +1,87 @@
+# Prometheus alerting rules for spectado-stream-recorder.
+groups:
+  - name: recorder
+    rules:
+      - alert: ScheduleFetchStale
+        expr: time() - recorder_schedule_last_success_timestamp_seconds > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Schedule has not been fetched successfully for over 10 minutes"
+          description: "Last successful schedule fetch was {{ $value | humanizeDuration }} ago ({{ $labels.instance }}). Consecutive failures: check recorder_schedule_consecutive_failures."
+
+      - alert: StreamStalled
+        expr: recorder_recording_ffmpeg_running == 1 and (time() - recorder_recording_last_data_timestamp_seconds) > 90
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream {{ $labels.id }} is running but produced no data for over 90s"
+          description: "ffmpeg for recording {{ $labels.id }} is alive but the output file has not grown for {{ $value | humanizeDuration }}."
+
+      - alert: StreamRestartStorm
+        expr: increase(recorder_ffmpeg_restarts_total[15m]) > 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "ffmpeg for stream {{ $labels.id }} restarted more than 10 times in 15 minutes"
+          description: "{{ $value | printf \"%.0f\" }} restarts in the last 15 minutes for {{ $labels.id }}; the source is probably unreachable or unstable."
+
+      - alert: UploadsBacklog
+        expr: recorder_uploads_pending > 20
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 20 recordings are waiting for upload"
+          description: "{{ $value }} recordings pending upload for 30 minutes on {{ $labels.instance }}. Check R2 connectivity and UPLOAD_CONCURRENCY."
+
+      - alert: UploadStuck
+        expr: recorder_upload_oldest_pending_age_seconds > 1800
+        labels:
+          severity: critical
+        annotations:
+          summary: "Oldest pending upload is older than 30 minutes"
+          description: "A recording has been waiting for upload for {{ $value | humanizeDuration }} on {{ $labels.instance }}."
+
+      - alert: UploadsBlocked
+        expr: recorder_uploads_blocked > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Uploads are blocked"
+          description: "The uploader has been blocked for 10 minutes on {{ $labels.instance }} (persistent S3 errors, e.g. bad credentials or a missing bucket)."
+
+      - alert: DiskLow
+        expr: recorder_disk_low == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Free disk space below MIN_FREE_DISK"
+          description: "The recorder on {{ $labels.instance }} refuses to start new recordings because free space in DATA_DIR is below MIN_FREE_DISK."
+
+      - alert: DiskFullPredicted
+        expr: predict_linear(recorder_disk_free_bytes[1h], 6 * 3600) < 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk {{ $labels.path }} predicted to fill up within 6 hours"
+          description: "Based on the last hour, free space on {{ $labels.path }} ({{ $labels.instance }}) will reach zero within 6 hours."
+
+      - alert: ContainerMemoryHigh
+        expr: (recorder_cgroup_memory_working_set_bytes / recorder_cgroup_memory_limit_bytes > 0.9) and recorder_cgroup_memory_limit_bytes > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Recorder container is using over 90% of its memory limit"
+          description: "cgroup memory usage is {{ $value | humanizePercentage }} of the limit on {{ $labels.instance }}; ffmpeg processes may get OOM-killed."
+
+      - alert: RecordingsSkipped
+        expr: increase(recorder_recordings_skipped_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Recordings were skipped (reason: {{ $labels.reason }})"
+          description: "{{ $value | printf \"%.0f\" }} scheduled recordings were not started in the last 10 minutes on {{ $labels.instance }} because of {{ $labels.reason }}."

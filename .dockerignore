@@ -1,0 +1,15 @@
+.git
+.github
+data/
+example/
+docs/
+*.md
+!README.md
+.env
+.env.*
+docker-compose*.yml
+Makefile
+.idea
+.vscode
+.DS_Store
+scripts/
