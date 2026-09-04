@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"math"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"testing"
@@ -83,5 +84,33 @@ func TestScanFile(t *testing.T) {
 	}
 	if _, err := Scan(filepath.Join(t.TempDir(), "missing.aac")); err == nil {
 		t.Fatal("missing file must be an error")
+	}
+}
+
+// Frames straddling the reader's buffer boundary must be handled with the
+// bytes of the most recent Peek: an earlier Peek's slice is invalidated when
+// bufio slides the buffer (this panicked on real recordings > 256 KiB).
+func TestScanAcrossBufferRefills(t *testing.T) {
+	// Varying frame sizes so that no stale offset happens to land on a header.
+	rng := rand.New(rand.NewPCG(7, 11))
+	var data []byte
+	for i := 0; i < 5000; i++ {
+		data = append(data, frame(50+rng.IntN(350), i%7 == 0)...)
+	}
+	info, err := scan(bufio.NewReaderSize(bytes.NewReader(data), 512))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Frames != 5000 || info.Junk != 0 {
+		t.Fatalf("info = %+v, want 5000 frames and no junk", info)
+	}
+	// Same through the public API with the production buffer size and a
+	// file several times larger than that buffer.
+	p := filepath.Join(t.TempDir(), "big.aac")
+	if err := os.WriteFile(p, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := Scan(p); err != nil || info.Frames != 5000 || info.Junk != 0 {
+		t.Fatalf("Scan(big) = %+v, %v", info, err)
 	}
 }

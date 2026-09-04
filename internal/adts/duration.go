@@ -68,31 +68,37 @@ func scan(r *bufio.Reader) (Info, error) {
 			synced = false
 			continue
 		}
-		frame, err := r.Peek(frameLen)
+		// Peek the whole frame, plus the following header when resyncing. A
+		// Peek may slide the buffer and invalidate earlier slices (hdr!), so
+		// from here on only buf is read.
+		want := frameLen
+		if !synced {
+			want += minHeader
+		}
+		buf, err := r.Peek(want)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				return info, err
 			}
-			// Truncated final frame (or junk that looked like a header).
-			info.Junk += int64(len(frame))
-			break
-		}
-		if !synced {
-			next, err := r.Peek(frameLen + minHeader)
-			if err == nil {
-				if _, ok := parseHeader(next[frameLen:]); !ok {
-					skip(r, &info)
-					continue
-				}
-			} else if !errors.Is(err, io.EOF) {
-				return info, err
-			} else if len(next) != frameLen {
+			if len(buf) < frameLen {
+				// Truncated final frame (or junk that looked like a header).
+				info.Junk += int64(len(buf))
+				break
+			}
+			if len(buf) != frameLen {
 				// Followed by a few stray bytes: cannot be a frame boundary.
 				skip(r, &info)
 				continue
 			}
-			synced = true
+			// Exactly one frame left: a clean end of file.
+		} else if !synced {
+			if _, ok := parseHeader(buf[frameLen:]); !ok {
+				skip(r, &info)
+				continue
+			}
 		}
+		synced = true
+		hdr = buf[:minHeader]
 		rate := sampleRates[(hdr[2]>>2)&0x0F]
 		blocks := int(hdr[6]&0x03) + 1
 		seconds += float64(1024*blocks) / float64(rate)

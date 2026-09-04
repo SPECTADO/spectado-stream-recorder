@@ -859,12 +859,12 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
 	m.mu.Unlock()
 
 	// The playlist needs the exact playback time, which only the ADTS frame
-	// headers can tell (one sequential read of the file).
-	info, err := adts.Scan(path)
+	// headers can tell (one sequential read of the file). The scan must never
+	// stop an upload: on any problem the wall-clock length is used instead.
+	info, err := scanRecording(path)
 	if err != nil {
-		return fmt.Errorf("scan recording: %w", err)
-	}
-	if info.Junk > 0 {
+		m.log.Warn("could not measure recording; using the session length", "id", s.ID, "session", s.SessionID, "error", err)
+	} else if info.Junk > 0 {
 		m.log.Warn("recording contains bytes outside ADTS frames", "id", s.ID, "session", s.SessionID,
 			"bytes", info.Junk, "frames", info.Frames)
 	}
@@ -930,6 +930,18 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
 	m.log.Info("audio uploaded", "id", s.ID, "session", s.SessionID, "key", key, "bytes", size,
 		"duration", dur.Truncate(time.Millisecond).String(), "etag", etag)
 	return m.completeUpload(ctx, s)
+}
+
+// scanRecording measures the file with adts.Scan, converting a panic in the
+// parser into an error: a malformed recording must never crash the process
+// (and with it every live recording) in an upload retry loop.
+func scanRecording(path string) (info adts.Info, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			info, err = adts.Info{}, fmt.Errorf("adts scan panicked: %v", r)
+		}
+	}()
+	return adts.Scan(path)
 }
 
 // completeUpload publishes the folder's playlist, marks the session uploaded
