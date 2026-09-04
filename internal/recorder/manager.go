@@ -24,10 +24,18 @@ import (
 	"github.com/spectado/stream-recorder/internal/sysmon"
 )
 
-// Uploader stores a finished recording. Implementations must only return nil
-// once the object is durably stored and verified.
+// Uploader stores finished recordings and the playlists next to them.
+// Implementations must only return nil from Upload once the object is durably
+// stored and verified.
 type Uploader interface {
+	// Upload stores the file at path under key without overwriting a
+	// different existing object (see ErrObjectExists).
 	Upload(ctx context.Context, path, key, contentType string, metadata map[string]string) (etag string, err error)
+	// PutObject stores a small object under key, replacing any existing one.
+	PutObject(ctx context.Context, key, contentType string, body []byte) error
+	// GetObject returns the content of key; found is false when there is no
+	// such object.
+	GetObject(ctx context.Context, key string) (body []byte, found bool, err error)
 }
 
 // Verifier is optionally implemented by an Uploader: it reports whether an
@@ -96,10 +104,11 @@ type Manager struct {
 	diskLow       atomic.Bool
 	diskFree      func() (free uint64, ok bool)
 
-	uploadCtx    context.Context
-	uploadCancel context.CancelFunc
-	uploadWG     sync.WaitGroup
-	stopWG       sync.WaitGroup
+	uploadCtx     context.Context
+	uploadCancel  context.CancelFunc
+	uploadWG      sync.WaitGroup
+	stopWG        sync.WaitGroup
+	playlistLocks keyedLocks // serialises rewrites of the same index.m3u8
 }
 
 // NewManager creates a Manager. up may be nil to keep recordings locally.
@@ -460,21 +469,16 @@ func (m *Manager) startSessionLocked(it schedule.Item, now time.Time) error {
 			}
 		}
 	}
+	// Every session gets its own file inside the recording's folder; later
+	// parts of the same show (rotation, extension after the end) land next to
+	// the first one and are added to the folder's index.m3u8.
+	folder := defaultFolder(m.cfg.S3Prefix, s)
 	if it.Key != "" {
+		// An explicit key names the folder.
 		s.KeyTemplate = it.Key
-		key := it.Key
-		for _, other := range m.sessions {
-			if other.ID == it.ID && other.KeyTemplate == it.Key {
-				// Later parts of the same explicit key get the session stamp so
-				// they never overwrite the first part.
-				key = withSuffix(it.Key, "_"+stamp)
-				break
-			}
-		}
-		s.Key = m.cfg.S3Prefix + key
-	} else {
-		s.Key = defaultKey(m.cfg.S3Prefix, s)
+		folder = m.cfg.S3Prefix + strings.Trim(it.Key, "/") + "/"
 	}
+	s.Key = mediaKey(folder, s)
 
 	// Sidecar first: a crash between the two steps leaves metadata without a
 	// file (harmless) rather than an orphan file without metadata. No fsync
@@ -789,33 +793,33 @@ func (m *Manager) uploadLoop(s *Session) {
 	}
 }
 
-// uploadOnce performs one upload attempt. A nil return means the session
-// reached a terminal state (uploaded, or failed for a non-retryable reason).
+// uploadOnce performs one upload attempt: the audio file (skipped when an
+// earlier attempt already stored it), then the folder's index.m3u8. A nil
+// return means the session reached a terminal state (uploaded, or failed for
+// a non-retryable reason).
 func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
 	m.mu.Lock()
 	path, key := s.FilePath(), s.Key
 	st, err := os.Stat(path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			size := s.Size
+		if !errors.Is(err, os.ErrNotExist) {
 			m.mu.Unlock()
-			// The file may be gone because a previous run uploaded it and crashed
-			// before recording that; ask the store before declaring data lost.
+			return err
+		}
+		size, stored := s.Size, s.MediaUploaded
+		m.mu.Unlock()
+		// The file may be gone because a previous run uploaded it and crashed
+		// before recording that; ask the store before declaring data lost.
+		if !stored {
 			if v, ok := m.up.(Verifier); ok && key != "" && size > 0 {
-				if exists, verr := v.Exists(ctx, key, size); verr != nil {
+				exists, verr := v.Exists(ctx, key, size)
+				if verr != nil {
 					return fmt.Errorf("recording file missing; could not verify remote object: %w", verr)
-				} else if exists {
-					now := time.Now()
-					m.mu.Lock()
-					s.State = StateUploaded
-					s.UploadedAt = &now
-					s.LastError = ""
-					_ = s.save()
-					m.mu.Unlock()
-					m.log.Warn("recording file missing locally but the object exists remotely; marked uploaded", "id", s.ID, "key", key)
-					return nil
 				}
+				stored = exists
 			}
+		}
+		if !stored {
 			m.mu.Lock()
 			s.State = StateFailed
 			s.LastError = "recording file missing"
@@ -824,8 +828,15 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
 			m.log.Error("recording file missing, cannot upload", "id", s.ID, "file", path)
 			return nil
 		}
+		m.mu.Lock()
+		if !s.MediaUploaded {
+			m.log.Warn("recording file missing locally but the object exists remotely", "id", s.ID, "key", key)
+			s.MediaUploaded = true
+		}
+		s.State = StateUploading
+		_ = s.save()
 		m.mu.Unlock()
-		return err
+		return m.completeUpload(ctx, s)
 	}
 	if st.Size() == 0 {
 		s.State = StateFailed
@@ -835,10 +846,35 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
 		m.log.Error("empty recording, nothing to upload", "id", s.ID, "session", s.SessionID)
 		return nil
 	}
+	size := st.Size()
 	s.State = StateUploading
-	s.Bytes = st.Size()
-	s.Size = st.Size()
+	s.Bytes = size
+	s.Size = size
 	_ = s.save()
+	if s.MediaUploaded {
+		// Stored by an earlier attempt; only the playlist is left to do.
+		m.mu.Unlock()
+		return m.completeUpload(ctx, s)
+	}
+	m.mu.Unlock()
+
+	// The playlist needs the exact playback time, which only the ADTS frame
+	// headers can tell (one sequential read of the file).
+	info, err := adts.Scan(path)
+	if err != nil {
+		return fmt.Errorf("scan recording: %w", err)
+	}
+	if info.Junk > 0 {
+		m.log.Warn("recording contains bytes outside ADTS frames", "id", s.ID, "session", s.SessionID,
+			"bytes", info.Junk, "frames", info.Frames)
+	}
+
+	m.mu.Lock()
+	s.DurationSeconds = info.Duration.Seconds()
+	if info.Frames == 0 && s.SessionEnd != nil {
+		// Not recognisable as ADTS: fall back to the wall-clock length.
+		s.DurationSeconds = s.SessionEnd.Sub(s.SessionStart).Seconds()
+	}
 	meta := map[string]string{
 		"recording-id":     s.ID,
 		"session-id":       s.SessionID,
@@ -847,6 +883,7 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
 		"scheduled-start":  s.Start.UTC().Format(time.RFC3339),
 		"scheduled-end":    s.End.UTC().Format(time.RFC3339),
 		"session-start":    s.SessionStart.UTC().Format(time.RFC3339),
+		"duration-seconds": strconv.FormatFloat(s.DurationSeconds, 'f', 3, 64),
 		"codec":            s.ResolvedCodec,
 		"ffmpeg-restarts":  strconv.Itoa(s.Restarts),
 		"finish-reason":    s.FinishReason,
@@ -855,7 +892,6 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
 	if s.SessionEnd != nil {
 		meta["session-end"] = s.SessionEnd.UTC().Format(time.RFC3339)
 	}
-	size := st.Size()
 	m.mu.Unlock()
 
 	// Per-attempt deadline: 10 minutes plus the transfer time at the assumed
@@ -869,7 +905,8 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
 	uctx, cancel := context.WithTimeout(ctx, attempt)
 	defer cancel()
 
-	m.log.Info("upload started", "id", s.ID, "session", s.SessionID, "key", key, "bytes", size)
+	m.log.Info("upload started", "id", s.ID, "session", s.SessionID, "key", key, "bytes", size,
+		"duration", info.Duration.Truncate(time.Millisecond).String())
 	t0 := time.Now()
 	etag, err := m.up.Upload(uctx, path, key, "audio/aac", meta)
 	if err != nil {
@@ -877,34 +914,54 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
 	}
 	dur := time.Since(t0)
 
-	// Record success BEFORE deleting the local file so a crash in between
-	// leaves a re-checkable sidecar rather than an unexplained gap.
+	// Remember the stored object BEFORE touching the playlist so a retry never
+	// uploads the audio twice. If the sidecar write fails the in-memory flag
+	// still skips the re-upload; after a crash the conditional put + size
+	// check converge on the same result.
+	m.mu.Lock()
+	s.MediaUploaded = true
+	s.UploadETag = etag
+	if err := s.save(); err != nil {
+		m.log.Warn("record upload in sidecar", "id", s.ID, "session", s.SessionID, "error", err)
+	}
+	m.mu.Unlock()
+	m.met.UploadBytesTotal.Add(float64(size))
+	m.met.UploadDuration.Observe(dur.Seconds())
+	m.log.Info("audio uploaded", "id", s.ID, "session", s.SessionID, "key", key, "bytes", size,
+		"duration", dur.Truncate(time.Millisecond).String(), "etag", etag)
+	return m.completeUpload(ctx, s)
+}
+
+// completeUpload publishes the folder's playlist, marks the session uploaded
+// and removes the local file (in that order: the file is only deleted once
+// the sidecar durably says "uploaded").
+func (m *Manager) completeUpload(ctx context.Context, s *Session) error {
+	if err := m.publishPlaylist(ctx, s); err != nil {
+		return err
+	}
 	now := time.Now()
 	m.mu.Lock()
+	path := s.FilePath()
 	s.State = StateUploaded
 	s.UploadedAt = &now
-	s.UploadETag = etag
 	s.UploadAttempts++
 	s.UploadBlocked = false
 	s.LastError = ""
 	s.NextUploadAt = nil
 	if err := s.save(); err != nil {
-		// Never delete the file while the sidecar still says "uploading": the
-		// retry converges through the conditional put + size check.
+		// Never delete the file while the sidecar still says "uploading".
 		s.State = StateFinalized
 		m.mu.Unlock()
 		return fmt.Errorf("record upload in sidecar: %w", err)
 	}
+	key, size := s.Key, s.Size
 	m.mu.Unlock()
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		m.log.Warn("remove uploaded file (will be retried on next start)", "file", path, "error", err)
 	}
 
 	m.met.UploadsTotal.WithLabelValues("success").Inc()
-	m.met.UploadBytesTotal.Add(float64(size))
-	m.met.UploadDuration.Observe(dur.Seconds())
-	m.log.Info("upload finished", "id", s.ID, "session", s.SessionID, "key", key, "bytes", size,
-		"duration", dur.Truncate(time.Millisecond).String(), "etag", etag)
+	m.log.Info("upload finished", "id", s.ID, "session", s.SessionID, "key", key, "playlist", playlistKey(key), "bytes", size)
 	return nil
 }
 
@@ -1124,35 +1181,37 @@ func (m *Manager) Shutdown(ctx context.Context) {
 
 // RecordingView is the API representation of a session.
 type RecordingView struct {
-	ID             string     `json:"id"`
-	SessionID      string     `json:"sessionId"`
-	Name           string     `json:"name,omitempty"`
-	State          State      `json:"state"`
-	FinishReason   string     `json:"finishReason,omitempty"`
-	Source         string     `json:"source"`
-	Type           string     `json:"type,omitempty"`
-	Codec          string     `json:"codec"`
-	ResolvedCodec  string     `json:"resolvedCodec,omitempty"`
-	Start          time.Time  `json:"start"`
-	End            time.Time  `json:"end"`
-	SessionStart   time.Time  `json:"sessionStart"`
-	SessionEnd     *time.Time `json:"sessionEnd,omitempty"`
-	Bytes          int64      `json:"bytes"`
-	Restarts       int        `json:"restarts"`
-	Stalls         int        `json:"stalls"`
-	WriteErrors    int        `json:"writeErrors,omitempty"`
-	FFmpegRunning  bool       `json:"ffmpegRunning"`
-	PID            int        `json:"pid,omitempty"`
-	LastDataAt     *time.Time `json:"lastDataAt,omitempty"`
-	LastError      string     `json:"lastError,omitempty"`
-	ScheduleNote   string     `json:"scheduleNote,omitempty"`
-	LastStderr     []string   `json:"lastStderr,omitempty"`
-	Key            string     `json:"key"`
-	UploadAttempts int        `json:"uploadAttempts"`
-	UploadBlocked  bool       `json:"uploadBlocked,omitempty"`
-	UploadedAt     *time.Time `json:"uploadedAt,omitempty"`
-	NextUploadAt   *time.Time `json:"nextUploadAt,omitempty"`
-	File           string     `json:"file,omitempty"`
+	ID              string     `json:"id"`
+	SessionID       string     `json:"sessionId"`
+	Name            string     `json:"name,omitempty"`
+	State           State      `json:"state"`
+	FinishReason    string     `json:"finishReason,omitempty"`
+	Source          string     `json:"source"`
+	Type            string     `json:"type,omitempty"`
+	Codec           string     `json:"codec"`
+	ResolvedCodec   string     `json:"resolvedCodec,omitempty"`
+	Start           time.Time  `json:"start"`
+	End             time.Time  `json:"end"`
+	SessionStart    time.Time  `json:"sessionStart"`
+	SessionEnd      *time.Time `json:"sessionEnd,omitempty"`
+	Bytes           int64      `json:"bytes"`
+	Restarts        int        `json:"restarts"`
+	Stalls          int        `json:"stalls"`
+	WriteErrors     int        `json:"writeErrors,omitempty"`
+	FFmpegRunning   bool       `json:"ffmpegRunning"`
+	PID             int        `json:"pid,omitempty"`
+	LastDataAt      *time.Time `json:"lastDataAt,omitempty"`
+	LastError       string     `json:"lastError,omitempty"`
+	ScheduleNote    string     `json:"scheduleNote,omitempty"`
+	LastStderr      []string   `json:"lastStderr,omitempty"`
+	Key             string     `json:"key"`
+	Playlist        string     `json:"playlist,omitempty"`
+	DurationSeconds float64    `json:"durationSeconds,omitempty"`
+	UploadAttempts  int        `json:"uploadAttempts"`
+	UploadBlocked   bool       `json:"uploadBlocked,omitempty"`
+	UploadedAt      *time.Time `json:"uploadedAt,omitempty"`
+	NextUploadAt    *time.Time `json:"nextUploadAt,omitempty"`
+	File            string     `json:"file,omitempty"`
 }
 
 // UploadStats summarises upload queue state.
@@ -1177,8 +1236,12 @@ func (m *Manager) Recordings() []RecordingView {
 			Start: s.Start, End: s.End, SessionStart: s.SessionStart, SessionEnd: s.SessionEnd,
 			Bytes: s.Bytes, Restarts: s.Restarts, Stalls: s.Stalls, WriteErrors: s.WriteErrors,
 			LastError: redactLine(s.LastError), ScheduleNote: s.ScheduleNote, Key: s.Key,
-			UploadAttempts: s.UploadAttempts, UploadBlocked: s.UploadBlocked, UploadedAt: s.UploadedAt,
+			DurationSeconds: s.DurationSeconds,
+			UploadAttempts:  s.UploadAttempts, UploadBlocked: s.UploadBlocked, UploadedAt: s.UploadedAt,
 			NextUploadAt: s.NextUploadAt, File: s.FilePath(),
+		}
+		if s.Key != "" {
+			v.Playlist = playlistKey(s.Key)
 		}
 		if s.State == StateUploaded {
 			v.File = ""

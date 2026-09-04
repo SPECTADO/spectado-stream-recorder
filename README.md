@@ -1,9 +1,10 @@
 # spectado-stream-recorder
 
 Records many live audio streams (HLS or Icecast/HTTP) in parallel — one `ffmpeg`
-per stream — into a single `.aac` file per scheduled show, then uploads each file
-to Cloudflare R2 (or any S3-compatible bucket). Designed to run ~100 concurrent
-recordings in one container.
+per stream — into a single `.aac` file per scheduled show, then uploads it to
+Cloudflare R2 (or any S3-compatible bucket) into a folder per recording together
+with an HLS playlist (`index.m3u8`). Designed to run ~100 concurrent recordings in
+one container.
 
 * Schedule is a JSON document fetched periodically from a URL (default every 60 s).
   A failed fetch never changes anything: the last known good schedule stays in force.
@@ -41,7 +42,7 @@ recordings in one container.
                           │   sidecar <session>.json     ├─ supervisor goroutine
                           │   (state, bytes, key, …)     │    └─ ffmpeg … -f adts pipe:1 ──▶ append <session>.aac
                           │                              │       (restart with backoff, stall watchdog)
-                          └─ finalize ─▶ upload queue ──▶ S3/R2 (multipart, verified) ─▶ delete local file
+                          └─ finalize ─▶ upload queue ──▶ S3/R2 (multipart, verified) ─▶ index.m3u8 ─▶ delete local file
 ```
 
 * **One process per stream.** `ffmpeg` reads the source (HLS or Icecast) and writes
@@ -56,9 +57,9 @@ recordings in one container.
   source of truth after a restart: unfinished sessions resume, finished ones upload.
 * **Upload after the end.** When the window closes the file is fsynced, closed,
   uploaded with the AWS SDK multipart uploader, verified with `HeadObject`
-  (size must match) and only then deleted locally. Failures retry forever with
-  backoff; permanent-looking errors (credentials, bucket) retry slowly and are
-  flagged as *blocked*.
+  (size must match), listed in the folder's `index.m3u8` and only then deleted
+  locally. Failures retry forever with backoff; permanent-looking errors
+  (credentials, bucket) retry slowly and are flagged as *blocked*.
 
 State machine per session:
 
@@ -121,7 +122,7 @@ are ignored.
     "source": "https://ice.example.com/radio2.mp3",
     "start": 1756576800,
     "end":   1756587600,
-    "key": "radio2/2026-08-30/evening.aac",
+    "key": "radio2/2026-08-30/evening",
     "codec": "aac",
     "bitrate": "96k",
     "headers": { "Authorization": "Bearer …" },
@@ -138,7 +139,7 @@ are ignored.
 | `source` / `url` | yes | `http(s)` URL of an HLS playlist or an Icecast/HTTP stream. Prefer *media* playlists over master playlists. |
 | `type` | no | `hls`, `icecast` or `auto` (default). Only used to pick HLS-specific ffmpeg options; `.m3u8` URLs are detected automatically. |
 | `start`, `end` | yes | RFC 3339 (`2026-08-30T06:00:00+02:00`, fractional seconds allowed) or unix seconds (number or numeric string; > 1e11 is treated as milliseconds). Timestamps **without an offset** are interpreted in `SCHEDULE_DEFAULT_TZ` (default UTC). `end` must be after `start`. Aliases: `startTime`, `start_time`, `from`; `endTime`, `end_time`, `to`. |
-| `key` / `objectKey` | no | Explicit object key in the bucket (`S3_PREFIX` is still prepended). Without it the default key is used (see below). |
+| `key` / `objectKey` | no | Explicit folder in the bucket for this recording (`S3_PREFIX` is still prepended); it receives the audio file(s) and `index.m3u8`. Without it the default folder is used (see below). |
 | `codec` | no | `auto` (default, probe and copy AAC sources), `copy`, or `aac` (always transcode). |
 | `bitrate` | no | Transcode bitrate (`"128k"` or a number in bit/s). Default `AUDIO_BITRATE`. |
 | `headers` | no | Extra HTTP headers sent by ffmpeg (auth tokens, referer …). Never exposed by the API. |
@@ -169,8 +170,8 @@ Duplicate `id`s: the first wins. Duplicate explicit `key`s: the second is invali
   logged and counted; the last known schedule stays in force. On startup the last
   good schedule is also loaded from `DATA_DIR/schedule.cache.json`.
 * **Extension after the end**: if `end` is moved later after the session already
-  finished, a new session (new file, new key with the session timestamp) records
-  the extension. A removed and re-added item records again.
+  finished, a new session (a second file in the same folder, added to its
+  `index.m3u8`) records the extension. A removed and re-added item records again.
 * **Restart / crash**: unfinished sessions found in `DATA_DIR` are resumed from
   their sidecar (no schedule needed), appending to the same file after trimming a
   possibly partial trailing ADTS frame. Finished sessions are queued for upload.
@@ -184,7 +185,7 @@ Duplicate `id`s: the first wins. Duplicate explicit `key`s: the second is invali
   If ffmpeg rejects one of the optional tuning options (older build, unusual
   source) the session automatically falls back to a minimal command line.
 * **Optional rotation**: `MAX_SESSION_DURATION=6h` splits very long windows into
-  parts that are uploaded as they complete.
+  parts that are uploaded as they complete (all listed in the same `index.m3u8`).
 * **Disk protection**: below `MIN_FREE_DISK` no new recordings start
   (`recorder_disk_low=1`, `/readyz` → 503); running ones continue. A write error
   (disk full) pauses the affected recording and retries every minute.
@@ -192,15 +193,39 @@ Duplicate `id`s: the first wins. Duplicate explicit `key`s: the second is invali
 ## Output files and object keys
 
 * Local: `DATA_DIR/recordings/<safeId>/<safeId>_<sessionStartUTC>.aac` + `.json`.
-* Default object key: `{S3_PREFIX}{safeId}/{YYYY-MM-DD of scheduled start, UTC}/{safeId}_{sessionStart YYYYMMDDTHHMMSSZ}.aac`.
-* Explicit `key`: used as given (with `S3_PREFIX`); later parts of the same item get
-  `_<sessionStart>` inserted before the extension. Uploads use `If-None-Match: *`
-  so an existing object is never overwritten silently (a different object under the
-  same key makes the recorder pick `-2`, `-3`, …).
-* Object metadata (`x-amz-meta-*`): `recording-id`, `session-id`, `name`
-  (RFC 2047 encoded when non-ASCII), `source` (credentials redacted),
-  `scheduled-start`, `scheduled-end`, `session-start`, `session-end`, `codec`,
-  `ffmpeg-restarts`, `finish-reason`, `recorder-version`. Content type `audio/aac`.
+* Bucket: **one folder per recording** holding the audio file(s) and an HLS playlist:
+
+  ```
+  {S3_PREFIX}{YYYY-MM-DD of scheduled start, UTC}/{safeId}/
+  ├── index.m3u8                                     lists every audio file of the folder
+  └── {safeId}_{sessionStart YYYYMMDDTHHMMSSZ}.aac   one per session — normally exactly one
+  ```
+
+  Example: `2026-09-03/match-fr-V946ydgjnx/index.m3u8` and
+  `2026-09-03/match-fr-V946ydgjnx/match-fr-V946ydgjnx_20260903T184400Z.aac`.
+* Explicit `key`: names the folder instead (`{S3_PREFIX}{key}/`); the file names inside
+  are the same.
+* Several sessions of one show (rotation via `MAX_SESSION_DURATION`, an extension after
+  the end, a removed and re-added item) become several files in the same folder. After
+  each audio upload `index.m3u8` is rewritten as the union of what it already lists and
+  the files the recorder knows about, in chronological order and separated by
+  `#EXT-X-DISCONTINUITY`. Order of operations: audio uploaded and verified → sidecar
+  remembers it → playlist written → sidecar says *uploaded* → local file deleted. A
+  failure in the playlist step retries without re-uploading the audio.
+* `index.m3u8` is a VOD "packed audio" playlist: `#EXT-X-VERSION:3`,
+  `#EXT-X-PLAYLIST-TYPE:VOD`, one `#EXTINF` per file with the exact duration counted
+  from the ADTS frames, `#EXT-X-ENDLIST`; content type `application/vnd.apple.mpegurl`.
+  The audio files carry no ID3 `PRIV` timestamp tag (RFC 8216 asks for one at the start
+  of packed-audio segments); hls.js does not need it — if a native Apple player refuses
+  the playlist, that is the first thing to add.
+* Audio uploads use `If-None-Match: *` so an existing object is never overwritten
+  silently (a different object under the same key makes the recorder pick `-2`, `-3`, …).
+  The playlist is the one object that is rewritten in place.
+* Object metadata (`x-amz-meta-*`) on the audio file: `recording-id`, `session-id`,
+  `name` (RFC 2047 encoded when non-ASCII), `source` (credentials redacted),
+  `scheduled-start`, `scheduled-end`, `session-start`, `session-end`,
+  `duration-seconds`, `codec`, `ffmpeg-restarts`, `finish-reason`, `recorder-version`.
+  Content type `audio/aac`.
 * Format: raw ADTS (`.aac`). Every frame is self-describing, so a file made of
   several ffmpeg runs (restarts, resume) plays in any decoder. Notes for consumers:
   live HLS is delivered a few segments behind real time — the first run starts
@@ -231,7 +256,7 @@ Durations accept Go syntax (`90s`, `5m`, `1h30m`) or plain seconds; sizes accept
 | `DATA_DIR` | `/data` | Recordings, sidecars, schedule cache, lock file. |
 | `S3_ENDPOINT` | *required*¹ | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` |
 | `S3_REGION` | `auto` | R2 uses `auto`. |
-| `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | *required*¹ | R2 API token with *Object Read & Write* on the bucket. |
+| `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | *required*¹ | R2 API token with *Object Read & Write* on the bucket (read is needed to merge `index.m3u8`). |
 | `S3_PREFIX` | – | Key prefix (`recordings/`); normalised to end with `/`. |
 | `S3_FORCE_PATH_STYLE` | `true` | Path-style URLs (works for every bucket name on R2). |
 | `S3_CHECKSUM_ALGORITHM` | `none` | `none`, `crc32` or `crc32c`. Checksums are only sent when required (R2 compatibility); size is always verified with `HeadObject`. |
@@ -303,7 +328,8 @@ Example (abridged):
     "uploads": { "pending": 1, "inProgress": 1, "blocked": 0, "uploaded": 130, "failed": 0 },
     "items": [
       { "id": "radio1-morning", "state": "recording", "resolvedCodec": "copy", "bytes": 48213904,
-        "ffmpegRunning": true, "pid": 4711, "restarts": 1, "lastDataAt": "…", "key": "radio1-morning/2026-08-30/…aac" }
+        "ffmpegRunning": true, "pid": 4711, "restarts": 1, "lastDataAt": "…",
+        "key": "2026-08-30/radio1-morning/radio1-morning_20260830T035950Z.aac", "playlist": "2026-08-30/radio1-morning/index.m3u8" }
     ]
   },
   "system": { "container": { "memoryUsage": 1932735283, "memoryLimit": 4294967296, "cpuUsageCores": 1.4 }, "…": "…" }

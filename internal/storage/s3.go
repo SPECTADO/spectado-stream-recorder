@@ -3,9 +3,11 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"mime"
 	"net"
@@ -192,6 +194,55 @@ func (s *S3) Upload(ctx context.Context, path, key, contentType string, metadata
 		etag = strings.Trim(aws.ToString(out.ETag), `"`)
 	}
 	return etag, nil
+}
+
+// maxSmallObject bounds what GetObject is willing to read (playlists are a
+// few hundred bytes; anything larger under that key is not ours).
+const maxSmallObject = 4 << 20
+
+// PutObject stores body under key, replacing any existing object. It is used
+// for the folder playlists, which are rewritten whenever a file is added.
+func (s *S3) PutObject(ctx context.Context, key, contentType string, body []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	in := &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader(body),
+		ContentLength: aws.Int64(int64(len(body))),
+		ContentType:   aws.String(contentType),
+	}
+	if s.checksum != "" {
+		in.ChecksumAlgorithm = s.checksum
+	}
+	if _, err := s.client.PutObject(ctx, in); err != nil {
+		return classify(err)
+	}
+	return nil
+}
+
+// GetObject returns the content stored under key; found is false when there
+// is no such object.
+func (s *S3) GetObject(ctx context.Context, key string) (body []byte, found bool, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+	if err != nil {
+		code, status := errorCodeAndStatus(err)
+		if status == http.StatusNotFound || code == "NoSuchKey" || code == "NotFound" {
+			return nil, false, nil
+		}
+		return nil, false, classify(err)
+	}
+	defer out.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(out.Body, maxSmallObject+1))
+	if err != nil {
+		return nil, false, classify(err)
+	}
+	if len(data) > maxSmallObject {
+		return nil, false, &recorder.PermanentError{Err: fmt.Errorf("object %s is larger than %d bytes", key, maxSmallObject)}
+	}
+	return data, true, nil
 }
 
 // Exists reports whether an object of exactly size bytes is stored under key.

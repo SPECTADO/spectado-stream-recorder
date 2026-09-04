@@ -9,7 +9,7 @@
       "source": "https://cdn.example.com/radio-one/live/playlist.m3u8",
       "start": "2026-09-01T06:00:00+02:00",
       "end": "2026-09-01T09:00:00+02:00",
-      "key": "radio-one/2026-09-01/morning-show.aac",
+      "key": "radio-one/2026-09-01/morning-show",
       "codec": "auto",
       "bitrate": "128k",
       "headers": {

@@ -4,10 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"unicode/utf8"
 
@@ -15,6 +22,7 @@ import (
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 
+	"github.com/spectado/stream-recorder/internal/config"
 	"github.com/spectado/stream-recorder/internal/recorder"
 )
 
@@ -441,5 +449,118 @@ func TestSanitizeKey(t *testing.T) {
 		if got := sanitizeKey(in); got != want {
 			t.Errorf("sanitizeKey(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// fakeBucket is a minimal S3 endpoint: PUT/GET/HEAD of whole objects under
+// /<bucket>/<key>, NoSuchKey on unknown keys and If-None-Match: * support.
+type fakeBucket struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+	puts    int
+}
+
+func (b *fakeBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimPrefix(r.URL.Path, "/bucket/")
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch r.Method {
+	case http.MethodPut:
+		if r.Header.Get("If-None-Match") == "*" {
+			if _, exists := b.objects[key]; exists {
+				w.WriteHeader(http.StatusPreconditionFailed)
+				fmt.Fprint(w, `<Error><Code>PreconditionFailed</Code><Message>exists</Message></Error>`)
+				return
+			}
+		}
+		data, _ := io.ReadAll(r.Body)
+		b.objects[key] = data
+		b.puts++
+		w.Header().Set("ETag", `"etag-`+key+`"`)
+		w.WriteHeader(http.StatusOK)
+	case http.MethodHead, http.MethodGet:
+		data, ok := b.objects[key]
+		if !ok {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>`)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodGet {
+			_, _ = w.Write(data)
+		}
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func newTestS3(t *testing.T) (*S3, *fakeBucket) {
+	t.Helper()
+	b := &fakeBucket{objects: map[string][]byte{}}
+	srv := httptest.NewServer(b)
+	t.Cleanup(srv.Close)
+	cfg := &config.Config{
+		S3Endpoint: srv.URL, S3Region: "auto", S3Bucket: "bucket",
+		S3AccessKeyID: "k", S3SecretAccessKey: "s", S3ForcePathStyle: true,
+		S3ConditionalPut: true, UploadPartSize: 5 * 1024 * 1024,
+	}
+	s, err := NewS3(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, b
+}
+
+func TestPutGetObject(t *testing.T) {
+	s, b := newTestS3(t)
+	ctx := context.Background()
+
+	body, found, err := s.GetObject(ctx, "2026-09-03/x/index.m3u8")
+	if err != nil || found || body != nil {
+		t.Fatalf("missing object: body=%q found=%v err=%v", body, found, err)
+	}
+	if err := s.PutObject(ctx, "2026-09-03/x/index.m3u8", "application/vnd.apple.mpegurl", []byte("#EXTM3U\n")); err != nil {
+		t.Fatal(err)
+	}
+	body, found, err = s.GetObject(ctx, "2026-09-03/x/index.m3u8")
+	if err != nil || !found || string(body) != "#EXTM3U\n" {
+		t.Fatalf("after put: body=%q found=%v err=%v", body, found, err)
+	}
+	// Playlists are rewritten in place: no conditional put, no error.
+	if err := s.PutObject(ctx, "2026-09-03/x/index.m3u8", "application/vnd.apple.mpegurl", []byte("#EXTM3U\n#EXT-X-ENDLIST\n")); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(b.objects["2026-09-03/x/index.m3u8"]); got != "#EXTM3U\n#EXT-X-ENDLIST\n" || b.puts != 2 {
+		t.Fatalf("stored=%q puts=%d", got, b.puts)
+	}
+}
+
+func TestUploadVerifiesAndTreatsSameSizeConflictAsDone(t *testing.T) {
+	s, b := newTestS3(t)
+	ctx := context.Background()
+	p := filepath.Join(t.TempDir(), "a.aac")
+	if err := os.WriteFile(p, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	etag, err := s.Upload(ctx, p, "2026-09-03/x/a.aac", "audio/aac", map[string]string{"name": "x"})
+	if err != nil || etag != "etag-2026-09-03/x/a.aac" {
+		t.Fatalf("etag=%q err=%v", etag, err)
+	}
+	// Second attempt (retry after a crash): the conditional put is refused,
+	// the sizes match, so the upload counts as done.
+	if _, err := s.Upload(ctx, p, "2026-09-03/x/a.aac", "audio/aac", nil); err != nil {
+		t.Fatalf("retry with identical object: %v", err)
+	}
+	// A different object under the same key is a conflict.
+	if err := os.WriteFile(p, []byte("01234567890123"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Upload(ctx, p, "2026-09-03/x/a.aac", "audio/aac", nil); !errors.Is(err, recorder.ErrObjectExists) {
+		t.Fatalf("different object: err=%v, want ErrObjectExists", err)
+	}
+	if b.puts != 1 {
+		t.Fatalf("puts=%d, want 1", b.puts)
 	}
 }

@@ -26,14 +26,23 @@ func TestWithSuffix(t *testing.T) {
 	}
 }
 
-func TestDefaultKey(t *testing.T) {
-	s := &Session{SafeID: "radio-1",
+func TestDefaultKeys(t *testing.T) {
+	s := &Session{SafeID: "radio-1", SessionID: "radio-1_20260829T212950Z",
 		Start:        time.Date(2026, 8, 29, 23, 30, 0, 0, time.FixedZone("CEST", 2*3600)), // 21:30Z
 		SessionStart: time.Date(2026, 8, 29, 21, 29, 50, 0, time.UTC)}
-	got := defaultKey("archive/", s)
-	want := "archive/radio-1/2026-08-29/radio-1_20260829T212950Z.aac"
-	if got != want {
-		t.Fatalf("got %q want %q", got, want)
+	folder := defaultFolder("archive/", s)
+	if want := "archive/2026-08-29/radio-1/"; folder != want {
+		t.Fatalf("folder = %q want %q", folder, want)
+	}
+	key := mediaKey(folder, s)
+	if want := "archive/2026-08-29/radio-1/radio-1_20260829T212950Z.aac"; key != want {
+		t.Fatalf("media key = %q want %q", key, want)
+	}
+	if got, want := playlistKey(key), "archive/2026-08-29/radio-1/index.m3u8"; got != want {
+		t.Fatalf("playlist key = %q want %q", got, want)
+	}
+	if got, want := mediaKey(defaultFolder("", s), s), "2026-08-29/radio-1/radio-1_20260829T212950Z.aac"; got != want {
+		t.Fatalf("media key without prefix = %q want %q", got, want)
 	}
 }
 

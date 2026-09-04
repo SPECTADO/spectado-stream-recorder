@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -81,12 +82,14 @@ type Session struct {
 	ScheduleNote  string     `json:"scheduleNote,omitempty"` // e.g. "item invalid in schedule since ..."
 	SuspendedAt   *time.Time `json:"suspendedAt,omitempty"`  // set when paused for shutdown
 
-	UploadAttempts int        `json:"uploadAttempts"`
-	KeyRenames     int        `json:"keyRenames,omitempty"`    // times the key was changed after a conflict
-	UploadBlocked  bool       `json:"uploadBlocked,omitempty"` // permanent-looking error; slow retries
-	UploadedAt     *time.Time `json:"uploadedAt,omitempty"`
-	UploadETag     string     `json:"uploadEtag,omitempty"`
-	NextUploadAt   *time.Time `json:"nextUploadAt,omitempty"`
+	UploadAttempts  int        `json:"uploadAttempts"`
+	KeyRenames      int        `json:"keyRenames,omitempty"`      // times the key was changed after a conflict
+	UploadBlocked   bool       `json:"uploadBlocked,omitempty"`   // permanent-looking error; slow retries
+	MediaUploaded   bool       `json:"mediaUploaded,omitempty"`   // audio object stored and verified; playlist may still be pending
+	DurationSeconds float64    `json:"durationSeconds,omitempty"` // playback time derived from the ADTS frames
+	UploadedAt      *time.Time `json:"uploadedAt,omitempty"`
+	UploadETag      string     `json:"uploadEtag,omitempty"`
+	NextUploadAt    *time.Time `json:"nextUploadAt,omitempty"`
 
 	UpdatedAt time.Time `json:"updatedAt"`
 
@@ -234,14 +237,29 @@ func scanSessions(root string) ([]*Session, []error) {
 	return out, errs
 }
 
-// defaultKey builds the object key for a new session.
+// defaultFolder is the bucket folder of a session without an explicit key.
+// Every folder holds the media files of one recording plus its index.m3u8.
 //
-//	{prefix}{safeId}/{scheduled start date, UTC}/{safeId}_{session start, UTC}.aac
-func defaultKey(prefix string, s *Session) string {
-	return fmt.Sprintf("%s%s/%s/%s_%s.aac",
-		prefix, s.SafeID,
-		s.Start.UTC().Format("2006-01-02"),
-		s.SafeID, s.SessionStart.UTC().Format("20060102T150405Z"))
+//	{prefix}{scheduled start date, UTC}/{safeId}/
+func defaultFolder(prefix string, s *Session) string {
+	return prefix + s.Start.UTC().Format("2006-01-02") + "/" + s.SafeID + "/"
+}
+
+// mediaKey is the object key of the session's audio file inside folder. It
+// reuses the local file name ({safeId}_{session start, UTC}.aac), which is
+// unique per session and sorts chronologically within the folder.
+func mediaKey(folder string, s *Session) string {
+	return folder + s.SessionID + ".aac"
+}
+
+// playlistKey returns the key of the index.m3u8 listing the media object key
+// (always the same folder).
+func playlistKey(mediaKey string) string {
+	dir := path.Dir(mediaKey)
+	if dir == "." || dir == "/" {
+		return "index.m3u8"
+	}
+	return dir + "/index.m3u8"
 }
 
 // withSuffix inserts suffix before the file extension: ("a/b.aac", "_x") ->

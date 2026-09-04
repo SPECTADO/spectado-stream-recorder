@@ -51,12 +51,58 @@ type uploadCall struct {
 	meta      map[string]string
 }
 
-// fakeUploader records calls and returns queued errors first.
+// fakeUploader records calls and returns queued errors first. Small objects
+// written with PutObject (the playlists) are kept in memory.
 type fakeUploader struct {
-	mu    sync.Mutex
-	calls []uploadCall
-	errs  []error
-	block chan struct{} // when non-nil, Upload blocks until closed or ctx done
+	mu      sync.Mutex
+	calls   []uploadCall
+	errs    []error
+	putErrs []error
+	block   chan struct{} // when non-nil, Upload blocks until closed or ctx done
+	objects map[string][]byte
+}
+
+func (f *fakeUploader) PutObject(ctx context.Context, key, contentType string, body []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.putErrs) > 0 {
+		var err error
+		err, f.putErrs = f.putErrs[0], f.putErrs[1:]
+		if err != nil {
+			return err
+		}
+	}
+	if contentType != "application/vnd.apple.mpegurl" {
+		return fmt.Errorf("unexpected content type %q for %s", contentType, key)
+	}
+	if f.objects == nil {
+		f.objects = map[string][]byte{}
+	}
+	f.objects[key] = append([]byte(nil), body...)
+	return nil
+}
+
+func (f *fakeUploader) GetObject(ctx context.Context, key string) ([]byte, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, ok := f.objects[key]
+	return b, ok, nil
+}
+
+// object returns a stored small object as text ("" when absent).
+func (f *fakeUploader) object(key string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return string(f.objects[key])
+}
+
+func (f *fakeUploader) seed(key, body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.objects == nil {
+		f.objects = map[string][]byte{}
+	}
+	f.objects[key] = []byte(body)
 }
 
 func (f *fakeUploader) Upload(ctx context.Context, path, key, contentType string, meta map[string]string) (string, error) {
@@ -212,10 +258,11 @@ func TestStartRecordEndUpload(t *testing.T) {
 		t.Fatalf("process count = %d", m.FFmpegProcessCount())
 	}
 	sid := ar.s.SessionID
-	wantKey := fmt.Sprintf("a/%s/a_%s.aac", now.UTC().Format("2006-01-02"), now.UTC().Format("20060102T150405Z"))
+	wantKey := fmt.Sprintf("%s/a/a_%s.aac", now.UTC().Format("2006-01-02"), now.UTC().Format("20060102T150405Z"))
 	if ar.s.Key != wantKey {
 		t.Fatalf("key = %q, want %q", ar.s.Key, wantKey)
 	}
+	wantPlaylist := now.UTC().Format("2006-01-02") + "/a/index.m3u8"
 
 	// End reached (even though wall clock has not moved): stop + upload.
 	m.Reconcile(now.Add(2 * time.Hour))
@@ -229,6 +276,14 @@ func TestStartRecordEndUpload(t *testing.T) {
 	}
 	if up.count() != 1 || up.calls[0].key != wantKey || up.calls[0].size == 0 {
 		t.Fatalf("upload calls: %+v", up.calls)
+	}
+	if got := up.calls[0].meta["duration-seconds"]; got == "" {
+		t.Fatalf("duration missing from object metadata: %v", up.calls[0].meta)
+	}
+	pl := up.object(wantPlaylist)
+	if !strings.HasPrefix(pl, "#EXTM3U\n") || !strings.Contains(pl, "#EXTINF:") || !strings.Contains(pl, "\n"+sid+".aac\n") ||
+		!strings.HasSuffix(pl, "#EXT-X-ENDLIST\n") {
+		t.Fatalf("playlist %s = %q", wantPlaylist, pl)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "recordings", "a", sid+".aac")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("audio file should be deleted after upload, stat err=%v", err)
@@ -334,15 +389,16 @@ func TestExtensionAfterEndStartsNewPart(t *testing.T) {
 	m, _ := newTestManager(t, up)
 	now := time.Now()
 	it := item("a", now.Add(-time.Second), now.Add(time.Hour))
-	it.Key = "shows/morning.aac"
+	it.Key = "/shows/morning/"
 	m.SetSchedule(sched(it))
 	first := m.activeFor("a")
 	if first == nil {
 		t.Fatal("not started")
 	}
-	if first.s.Key != "shows/morning.aac" {
-		t.Fatalf("explicit key not used: %q", first.s.Key)
+	if first.s.Key != "shows/morning/"+first.s.SessionID+".aac" {
+		t.Fatalf("explicit key must name the folder: %q", first.s.Key)
 	}
+	waitFor(t, 5*time.Second, "bytes", func() bool { return first.bytes.Load() > 0 })
 	m.Reconcile(now.Add(90 * time.Minute)) // ended
 	m.settle()
 
@@ -358,8 +414,91 @@ func TestExtensionAfterEndStartsNewPart(t *testing.T) {
 	if second.s.SessionID == first.s.SessionID {
 		t.Fatal("new session expected")
 	}
-	if !strings.HasPrefix(second.s.Key, "shows/morning_") || !strings.HasSuffix(second.s.Key, ".aac") {
-		t.Fatalf("second part key = %q", second.s.Key)
+	if second.s.Key != "shows/morning/"+second.s.SessionID+".aac" || second.s.Key == first.s.Key {
+		t.Fatalf("second part key = %q (first %q)", second.s.Key, first.s.Key)
+	}
+	waitFor(t, 5*time.Second, "bytes", func() bool { return second.bytes.Load() > 0 })
+	m.Reconcile(now.Add(4 * time.Hour))
+	m.settle()
+
+	// Both parts are listed, in order, in the folder's single playlist.
+	pl := up.object("shows/morning/index.m3u8")
+	i, j := strings.Index(pl, "\n"+first.s.SessionID+".aac\n"), strings.Index(pl, "\n"+second.s.SessionID+".aac\n")
+	if i < 0 || j < 0 || i > j || strings.Count(pl, "#EXTINF:") != 2 || strings.Count(pl, "#EXT-X-DISCONTINUITY") != 1 {
+		t.Fatalf("playlist after two parts:\n%s", pl)
+	}
+	if up.count() != 2 {
+		t.Fatalf("uploads = %d, want 2", up.count())
+	}
+}
+
+func TestPlaylistFailureRetriesWithoutReupload(t *testing.T) {
+	up := &fakeUploader{putErrs: []error{errors.New("r2 hiccup")}}
+	m, dir := newTestManager(t, up)
+	now := time.Now()
+	m.SetSchedule(sched(item("a", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("a")
+	if ar == nil {
+		t.Fatal("not started")
+	}
+	waitFor(t, 5*time.Second, "bytes", func() bool { return ar.bytes.Load() > 0 })
+	m.Reconcile(now.Add(2 * time.Hour))
+	m.settle()
+
+	st, _ := m.sessionState(ar.s.SessionID)
+	if st != StateUploaded {
+		t.Fatalf("state=%s", st)
+	}
+	if up.count() != 1 {
+		t.Fatalf("audio uploaded %d times, want exactly once", up.count())
+	}
+	m.mu.Lock()
+	s := m.sessions[ar.s.SessionID]
+	attempts, media := s.UploadAttempts, s.MediaUploaded
+	m.mu.Unlock()
+	if attempts != 2 || !media {
+		t.Fatalf("attempts=%d mediaUploaded=%v", attempts, media)
+	}
+	if pl := up.object(playlistKey(ar.s.Key)); !strings.Contains(pl, ar.s.SessionID+".aac") {
+		t.Fatalf("playlist = %q", pl)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "recordings", "a", ar.s.SessionID+".aac")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("audio file should be deleted after the playlist is published, stat err=%v", err)
+	}
+}
+
+func TestPlaylistMergesExistingEntries(t *testing.T) {
+	up := &fakeUploader{}
+	m, _ := newTestManager(t, up)
+	now := time.Now()
+	day := now.UTC().Format("2006-01-02")
+	// An older part uploaded by a previous run whose sidecar is long gone.
+	up.seed(day+"/a/index.m3u8", "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:100.000,\na_20000101T000000Z.aac\n#EXT-X-ENDLIST\n")
+	m.SetSchedule(sched(item("a", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("a")
+	if ar == nil {
+		t.Fatal("not started")
+	}
+	waitFor(t, 5*time.Second, "bytes", func() bool { return ar.bytes.Load() > 0 })
+	m.Reconcile(now.Add(2 * time.Hour))
+	m.settle()
+
+	pl := up.object(day + "/a/index.m3u8")
+	i, j := strings.Index(pl, "\na_20000101T000000Z.aac\n"), strings.Index(pl, "\n"+ar.s.SessionID+".aac\n")
+	if i < 0 || j < 0 || i > j || !strings.Contains(pl, "#EXTINF:100.000,") {
+		t.Fatalf("merged playlist:\n%s", pl)
+	}
+}
+
+func TestPlaylistKey(t *testing.T) {
+	for in, want := range map[string]string{
+		"2026-09-03/match/match_20260903T184400Z.aac": "2026-09-03/match/index.m3u8",
+		"p/2026-09-03/match/x.aac":                    "p/2026-09-03/match/index.m3u8",
+		"x.aac":                                       "index.m3u8",
+	} {
+		if got := playlistKey(in); got != want {
+			t.Errorf("playlistKey(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
