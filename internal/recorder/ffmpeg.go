@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"os/exec"
@@ -22,6 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/spectado/stream-recorder/internal/adts"
+	"github.com/spectado/stream-recorder/internal/id3"
 )
 
 // FFmpegCapabilities describes version-dependent options of the ffmpeg binary
@@ -62,9 +64,35 @@ type activeRecording struct {
 	stallKilled  atomic.Bool
 	savedBytes   int64
 
+	// Frame-aware writer state. splitter is owned by the writer goroutine
+	// (single-threaded per run); run holds the live per-run counters and clock
+	// anchor read by the persister and the API.
+	splitter adts.Splitter
+	run      runState
+
 	// child process accounting (persister goroutine only)
 	statPID int
 	statCPU float64 // cumulative cpu seconds of statPID at last sample
+}
+
+// runState holds the live state of the current ffmpeg run for the frame-aware
+// writer. The writer goroutine is its only mutator; readers (persister, API)
+// take mu for a consistent snapshot. mu is always the inner lock: code that also
+// needs Manager.mu takes m.mu first (never m.mu while holding this mu).
+type runState struct {
+	mu           sync.Mutex
+	startedAt    time.Time
+	anchor       time.Time
+	anchorSource string  // "hls-pdt" | "wallclock"
+	offset       int64   // file size at run start (first byte of the run)
+	bytes        int64   // bytes written this run (frames + tags + junk)
+	frames       int     // complete frames written this run
+	seconds      float64 // media time of the run so far
+	nextTagAt    float64 // media seconds at which the next ID3 tag is due
+	tagsWritten  int
+	mediaBefore  float64 // media seconds of the previous runs of this session
+	started      bool    // at least one frame written this run
+	closed       bool    // endRun has finalized this run's record
 }
 
 func (ar *activeRecording) lastDataTime() time.Time {
@@ -75,26 +103,198 @@ func (ar *activeRecording) lastDataTime() time.Time {
 	return time.Unix(0, n)
 }
 
-// captureWriter appends ffmpeg's stdout to the recording file.
+// captureWriter appends ffmpeg's stdout to the recording file, splitting it into
+// ADTS frames so it can insert in-band ID3 wall-clock tags between them. It never
+// drops or reorders ffmpeg's bytes: frames and junk are written through verbatim
+// (plus the inserted tags), so the file stays a faithful copy plus timing.
 type captureWriter struct {
 	ar *activeRecording
+	m  *Manager
 }
 
 func (w *captureWriter) Write(p []byte) (int, error) {
-	n, err := w.ar.file.Write(p)
+	// The stall watchdog keys off raw arrival time, so stamp it here regardless
+	// of whether p completes a frame (a partial frame still means data flows).
+	now := time.Now()
+	w.ar.lastData.Store(now.UnixNano())
+	w.ar.lastDataGauge.Set(float64(now.Unix()))
+	w.ar.splitter.Feed(p, w.onFrame, w.onJunk)
+	if perr := w.ar.writeErr.Load(); perr != nil {
+		return len(p), *perr
+	}
+	return len(p), nil
+}
+
+// onFrame handles one complete ADTS frame: it inserts an ID3 wall-clock tag when
+// one is due, then writes the frame. The first frame of a run also opens the
+// run's record.
+func (w *captureWriter) onFrame(b []byte, h adts.Header) {
+	ar := w.ar
+	rs := &ar.run
+	interval := w.m.cfg.ClockID3Interval
+
+	rs.mu.Lock()
+	first := !rs.started
+	rs.started = true
+	t := rs.seconds // media time of this frame's first sample within the run
+	if first && rs.anchorSource == "wallclock" {
+		rs.anchor = time.Now()
+	}
+	anchor := rs.anchor
+	source := rs.anchorSource
+	mediaBefore := rs.mediaBefore
+	writeTag := interval > 0 && (first || t >= rs.nextTagAt)
+	if writeTag {
+		if first {
+			// The first tag sits at t=0 and does not shift the cadence.
+			rs.nextTagAt = interval.Seconds()
+		} else {
+			rs.nextTagAt = t + interval.Seconds()
+		}
+		rs.tagsWritten++
+	}
+	rs.mu.Unlock()
+
+	if first {
+		w.m.openRunRecord(ar)
+	}
+	if writeTag {
+		wall := anchor.Add(time.Duration(t * float64(time.Second)))
+		pts90k := uint64(math.Round((mediaBefore + t) * 90000))
+		tag := id3.Tag(
+			id3.AppleTimestamp(pts90k),
+			id3.TXXX("WALLCLOCK", wall.UTC().Format("2006-01-02T15:04:05.000Z07:00")),
+			id3.TXXX("WALLCLOCK-SOURCE", source),
+		)
+		ar.writeRaw(tag)
+	}
+	ar.writeRaw(b)
+
+	rs.mu.Lock()
+	rs.frames++
+	rs.seconds += h.Duration()
+	rs.mu.Unlock()
+}
+
+// onJunk writes bytes that are not part of a complete frame straight through so
+// the file remains a faithful copy of ffmpeg's output.
+func (w *captureWriter) onJunk(b []byte) { w.ar.writeRaw(b) }
+
+// writeRaw appends b to the recording file and updates the byte counters. After
+// a write error it becomes a no-op (ffmpeg will exit on EPIPE), matching the
+// previous pass-through behaviour where a failing write stopped the copy.
+func (ar *activeRecording) writeRaw(b []byte) {
+	if ar.writeErr.Load() != nil {
+		return
+	}
+	n, err := ar.file.Write(b)
 	if n > 0 {
-		w.ar.bytes.Add(int64(n))
-		w.ar.runBytes.Add(int64(n))
-		now := time.Now()
-		w.ar.lastData.Store(now.UnixNano())
-		w.ar.bytesCounter.Add(float64(n))
-		w.ar.lastDataGauge.Set(float64(now.Unix()))
+		ar.bytes.Add(int64(n))
+		ar.runBytes.Add(int64(n))
+		ar.bytesCounter.Add(float64(n))
+		ar.run.mu.Lock()
+		ar.run.bytes += int64(n)
+		ar.run.mu.Unlock()
 	}
 	if err != nil {
 		e := err
-		w.ar.writeErr.Store(&e)
+		ar.writeErr.Store(&e)
 	}
-	return n, err
+}
+
+// beginRun resets the frame-aware writer for the upcoming ffmpeg run with the
+// clock anchor looked up for it. mediaBefore is the media time already captured
+// by earlier runs of this session, so in-band PTS values keep increasing across
+// restarts. It must be called before runFFmpegOnce (after any tail trim, so the
+// offset is the true file size at run start).
+func (ar *activeRecording) beginRun(anchor time.Time, source string, mediaBefore float64) {
+	ar.run.mu.Lock()
+	ar.run.startedAt = time.Now()
+	ar.run.anchor = anchor
+	ar.run.anchorSource = source
+	ar.run.offset = ar.bytes.Load()
+	ar.run.bytes = 0
+	ar.run.frames = 0
+	ar.run.seconds = 0
+	ar.run.nextTagAt = 0
+	ar.run.tagsWritten = 0
+	ar.run.mediaBefore = mediaBefore
+	ar.run.started = false
+	ar.run.closed = false
+	ar.run.mu.Unlock()
+	ar.splitter = adts.Splitter{}
+}
+
+// openRunRecord appends the record for the run that just produced its first
+// frame. Runs that never produce audio leave no record.
+func (m *Manager) openRunRecord(ar *activeRecording) {
+	ar.run.mu.Lock()
+	r := Run{
+		StartedAt:    ar.run.startedAt,
+		Anchor:       ar.run.anchor,
+		AnchorSource: ar.run.anchorSource,
+		Offset:       ar.run.offset,
+	}
+	ar.run.mu.Unlock()
+
+	m.mu.Lock()
+	if ar.s.appendRun(r) {
+		m.log.Warn("run history reached the cap; coalescing oldest runs", "id", ar.s.ID, "session", ar.s.SessionID, "cap", maxRuns)
+	}
+	m.mu.Unlock()
+}
+
+// sessionMediaBefore returns the media time already captured by the previous
+// runs of the session, so the in-band PTS keeps increasing across restarts.
+func (m *Manager) sessionMediaBefore(ar *activeRecording) float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var sum float64
+	for _, r := range ar.s.Runs {
+		sum += r.DurationSeconds
+	}
+	return sum
+}
+
+// endRun flushes any buffered partial frame to the file and finalizes the open
+// run record. It is idempotent (called from supervise on a normal run end and
+// from finalize on the ctx-cancel path) and a no-op for a run that produced no
+// audio.
+func (m *Manager) endRun(ar *activeRecording) {
+	ar.run.mu.Lock()
+	if ar.run.closed {
+		ar.run.mu.Unlock()
+		return
+	}
+	ar.run.closed = true
+	// Capture the byte count BEFORE flushing the trailing partial frame: for a
+	// run that restarts, TrimPartialTail removes that partial before the next run
+	// appends, so the run's real byte range ends here. The last run's partial
+	// stays in the file and is reconciled by the finalize sanity check instead.
+	started := ar.run.started
+	bytes := ar.run.bytes
+	frames := ar.run.frames
+	seconds := ar.run.seconds
+	ar.run.mu.Unlock()
+
+	// Write the trailing partial frame (if any) as junk; TrimPartialTail removes
+	// it before the next run appends (the last run keeps it until finalize).
+	ar.splitter.Flush(func(b []byte) { ar.writeRaw(b) })
+
+	if !started {
+		return // no audio this run: no record to close
+	}
+
+	now := time.Now()
+	m.mu.Lock()
+	if r := ar.s.openRun(); r != nil {
+		r.EndedAt = &now
+		r.Bytes = bytes
+		r.Frames = frames
+		r.DurationSeconds = seconds
+	}
+	_ = ar.s.saveQuick()
+	m.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -157,8 +357,12 @@ type stderrBuffer struct {
 	window      time.Time
 	inWindow    int
 	perMinute   int
-	suppressed  int
+	suppressed  int // log lines dropped by the per-minute rate limit
 	lastMessage string
+	// Benign-noise filter and per-run diagnostics (A1/A2).
+	onSuppressed  func(reason string) // hook fired for each benign line dropped
+	benignRun     int                 // benign lines dropped during the current run
+	lastErrorLine string              // most recent [error]/[fatal]/[panic] line of the run
 }
 
 func newStderrBuffer(mode string, logLine func(slog.Level, string)) *stderrBuffer {
@@ -212,6 +416,23 @@ func (b *stderrBuffer) pushLocked(line string) {
 	}
 	level, msg := parseLevel(line)
 	msg = redactLine(msg)
+	// Drop provably-harmless noise (see benignStderrMarkers): it must not fill
+	// the tail, pollute lastMessage/LastError, or burn the log rate budget. In
+	// debug mode the operator asked for everything, so it is still logged (at
+	// Debug) but stays out of the tail and lastMessage.
+	if reason := benignReason(msg); reason != "" {
+		b.benignRun++
+		if b.onSuppressed != nil {
+			b.onSuppressed(reason)
+		}
+		if b.mode == "debug" && b.logLine != nil {
+			b.logLine(slog.LevelDebug, msg)
+		}
+		return
+	}
+	if level == slog.LevelError {
+		b.lastErrorLine = msg
+	}
 	b.lastMessage = msg
 	b.tail = append(b.tail, time.Now().UTC().Format(time.RFC3339)+" "+msg)
 	if len(b.tail) > b.maxTail {
@@ -256,6 +477,30 @@ func (b *stderrBuffer) Last() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.lastMessage
+}
+
+// resetRun zeroes the per-run diagnostics (benign counter and error line) at
+// the start of a new ffmpeg run. The rolling tail and lastMessage are kept.
+func (b *stderrBuffer) resetRun() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.benignRun = 0
+	b.lastErrorLine = ""
+}
+
+// suppressedRun returns how many benign lines were dropped in the current run.
+func (b *stderrBuffer) suppressedRun() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.benignRun
+}
+
+// LastErrorLine returns the most recent error-level line of the current run
+// (post-redaction), or "" when none was seen.
+func (b *stderrBuffer) LastErrorLine() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastErrorLine
 }
 
 // ---------------------------------------------------------------------------
@@ -497,15 +742,34 @@ func (m *Manager) supervise(ar *activeRecording) {
 		if restart {
 			m.trimTail(ar)
 		}
+		// Anchor the upcoming run to the source playlist's wall clock (best
+		// effort). Looked up synchronously right before ffmpeg starts, so the
+		// race window to ffmpeg's own first playlist fetch is only its start-up.
+		anchor, source := m.lookupAnchor(ctx, &snap, restart)
+		if ctx.Err() != nil {
+			return
+		}
+		ar.beginRun(anchor, source, m.sessionMediaBefore(ar))
 		started := time.Now()
 		ar.runBytes.Store(0)
+		ar.stderr.resetRun()
 		ar.writeErr.Store(nil)
+		// Clear the previous run's stall flag here (not only after a successful
+		// cmd.Start): a run that never starts, e.g. a fork/exec failure right
+		// after a stalled run, must not inherit stallKilled and be mislabelled
+		// "stall" by classifyExit.
+		ar.stallKilled.Store(false)
 		runErr := m.runFFmpegOnce(ctx, ar, &snap, codec, restart)
 		ran := time.Since(started)
 		runBytes := ar.runBytes.Load()
 		if ctx.Err() != nil {
 			return // intentional stop
 		}
+		// Close the run record (flush the partial, record byte/frame/duration
+		// counters) before the exit bookkeeping. The ctx-cancel path above
+		// returns first; finalize closes the run there instead (endRun is
+		// idempotent).
+		m.endRun(ar)
 		restart = true
 
 		var werr error
@@ -514,21 +778,55 @@ func (m *Manager) supervise(ar *activeRecording) {
 		}
 		diskFull := werr != nil && isDiskFull(werr)
 		killed := wasKilled(runErr) && !ar.stallKilled.Load() // our own escalation is not an OOM kill
+		stallKilled := ar.stallKilled.Load()
+
+		// Read the filtered stderr once (each call locks the buffer): the last
+		// meaningful line, the last error-level line (preferred for diagnosis)
+		// and how many benign lines were dropped this run.
+		lastLine := ar.stderr.Last()
+		errorLine := ar.stderr.LastErrorLine()
+		suppressed := ar.stderr.suppressedRun()
+		reason := classifyExit(runErr, werr, diskFull, killed, stallKilled, errorLine)
+
+		// base mirrors LastError's human prefix so RecordLastError reads the same.
+		var base string
+		switch {
+		case werr != nil:
+			base = fmt.Sprintf("write to recording file failed: %v", werr)
+		case runErr != nil:
+			base = fmt.Sprintf("ffmpeg exited after %s: %v", ran.Truncate(time.Millisecond), runErr)
+		default:
+			base = fmt.Sprintf("ffmpeg exited after %s (stream ended)", ran.Truncate(time.Millisecond))
+		}
 
 		m.mu.Lock()
 		ar.s.Restarts++
-		switch {
-		case werr != nil:
+		if werr != nil {
 			ar.s.WriteErrors++
-			ar.s.LastError = fmt.Sprintf("write to recording file failed: %v", werr)
-		case runErr != nil:
-			ar.s.LastError = fmt.Sprintf("ffmpeg exited after %s: %v", ran.Truncate(time.Millisecond), runErr)
-		default:
-			ar.s.LastError = fmt.Sprintf("ffmpeg exited after %s (stream ended)", ran.Truncate(time.Millisecond))
 		}
-		if last := ar.stderr.Last(); last != "" && werr == nil {
-			ar.s.LastError += " | " + last
+		ar.s.LastError = base
+		if lastLine != "" && werr == nil {
+			ar.s.LastError += " | " + lastLine
 		}
+		// RecordLastError survives the upload and prefers the error-level line.
+		recDetail := errorLine
+		if recDetail == "" {
+			recDetail = lastLine
+		}
+		ar.s.RecordLastError = base
+		if recDetail != "" && werr == nil {
+			ar.s.RecordLastError += " | " + recDetail
+		}
+		ar.s.addExit(RunExit{
+			At:         time.Now(),
+			RanSeconds: ran.Seconds(),
+			Bytes:      runBytes,
+			Reason:     reason,
+			ExitError:  firstNonEmptyErr(runErr, werr),
+			Stderr:     lastLine,
+			ErrorLine:  errorLine,
+			Suppressed: suppressed,
+		})
 		// ffmpeg rejects unknown input options outright ("Option X not found"):
 		// retry with the minimal, always-valid command line.
 		if last := ar.stderr.Last(); runBytes == 0 && !ar.safeArgs && werr == nil &&
@@ -555,6 +853,7 @@ func (m *Manager) supervise(ar *activeRecording) {
 		_ = ar.s.saveQuick()
 		m.mu.Unlock()
 		ar.restartsCounter.Inc()
+		m.met.FFmpegExitsTotal.WithLabelValues(reason).Inc()
 		if werr != nil {
 			m.met.WriteErrorsTotal.Inc()
 		}
@@ -563,32 +862,48 @@ func (m *Manager) supervise(ar *activeRecording) {
 			log.Error("ffmpeg was killed by SIGKILL (OOM killer or external); restarting", "ran", ran.Truncate(time.Millisecond).String())
 		}
 
-		wait := backoff
+		// Backoff: a run > 1 min counts as stable and resets the sequence, so the
+		// first restart after a long healthy run waits only min (not the stale
+		// accumulated value); disk-full forces a fixed 1 min instead.
+		wait, next := nextBackoff(backoff, m.cfg.FFmpegRestartBackoffMin, m.cfg.FFmpegRestartBackoffMax, ran)
+		// exitCode is the process status; runErr==nil means ffmpeg exited 0 (a
+		// stream-ended/demux-error run), so report 0 rather than the -1 sentinel
+		// that would otherwise read as a signal/unknown death.
+		ec := exitCode(runErr)
+		if runErr == nil {
+			ec = 0
+		}
 		switch {
 		case diskFull:
 			wait = time.Minute
 			log.Error("disk full while recording; retrying in 1m (recording continues into the same file when space frees up)",
-				"error", werr, "bytes", ar.bytes.Load())
+				"error", werr, "bytes", ar.bytes.Load(), "reason", reason)
 		case werr != nil:
-			log.Error("recording file write failed; restarting ffmpeg", "error", werr, "backoff", wait.String())
+			log.Error("recording file write failed; restarting ffmpeg", "error", werr, "backoff", wait.String(), "reason", reason)
 		default:
-			log.Warn("ffmpeg exited, restarting", "error", runErr, "ran", ran.Truncate(time.Millisecond).String(),
-				"bytes", runBytes, "backoff", wait.String(), "stderr", ar.stderr.Last())
+			log.Warn("ffmpeg exited, restarting", "reason", reason, "error", runErr,
+				"exitCode", ec, "ran", ran.Truncate(time.Millisecond).String(),
+				"bytes", runBytes, "backoff", wait.String(), "errorLine", errorLine,
+				"suppressed", suppressed, "stderr", lastLine)
 		}
 
-		if ran > time.Minute {
-			backoff = m.cfg.FFmpegRestartBackoffMin
-		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(wait):
 		}
-		backoff *= 2
-		if backoff > m.cfg.FFmpegRestartBackoffMax {
-			backoff = m.cfg.FFmpegRestartBackoffMax
+		backoff = next
+	}
+}
+
+// firstNonEmptyErr returns the message of the first non-nil error, or "".
+func firstNonEmptyErr(errs ...error) string {
+	for _, e := range errs {
+		if e != nil {
+			return e.Error()
 		}
 	}
+	return ""
 }
 
 // copyRejectionMarkers are stderr fragments ffmpeg prints when the ADTS muxer
@@ -596,6 +911,33 @@ func (m *Manager) supervise(ar *activeRecording) {
 var copyRejectionMarkers = []string{
 	"could not write header", "adts", "only aac", "matches no streams",
 	"unsupported codec", "not currently supported in container",
+}
+
+// benignStderrMarkers are stderr fragments that are PROVABLY harmless for this
+// recorder and are dropped before they reach the tail, lastMessage or the log.
+// Add an entry ONLY when the message is verified benign for both copy and
+// transcode — otherwise a real error could be hidden.
+//
+//   - duplicate_moov: with fMP4/CMAF live HLS the hls demuxer re-fetches and
+//     re-pushes init.mp4 before every segment (it compares init sections by
+//     pointer and never resets them across reloads), so mov_read_moov warns
+//     "Found duplicated MOOV Atom. Skipped it" once per ~5 s reload. Timing
+//     comes from moof/tfdt, so the skipped second moov changes nothing; no
+//     ffmpeg option suppresses it. It otherwise fills the 20-line tail, is
+//     glued onto LastError and burns the 10/min log budget.
+var benignStderrMarkers = []struct{ reason, substr string }{
+	{"duplicate_moov", "Found duplicated MOOV Atom"},
+}
+
+// benignReason returns the marker reason when line is provably-harmless noise,
+// or "" otherwise.
+func benignReason(line string) string {
+	for _, mk := range benignStderrMarkers {
+		if strings.Contains(line, mk.substr) {
+			return mk.reason
+		}
+	}
+	return ""
 }
 
 func looksLikeCopyRejection(tail []string) bool {
@@ -629,6 +971,58 @@ func (m *Manager) trimTail(ar *activeRecording) {
 	}
 }
 
+// classifyExit maps one ffmpeg run's outcome to a stable reason label. Order of
+// precedence: write errors first (disk-full before write-error), then stall, a
+// SIGKILL we did not send, a non-zero exit, an exit-0 that trailed an "Error
+// during demuxing" line (transient live-reload failure, fact 0.3), and finally
+// a genuine stream end.
+func classifyExit(runErr, werr error, diskFull, killed, stallKilled bool, errorLine string) (reason string) {
+	switch {
+	case diskFull:
+		return "disk-full"
+	case werr != nil:
+		return "write-error"
+	case stallKilled:
+		return "stall"
+	case killed:
+		return "killed"
+	case runErr != nil:
+		return "exit-error"
+	case strings.Contains(errorLine, "Error during demuxing"):
+		return "demux-error"
+	default:
+		return "stream-ended"
+	}
+}
+
+// nextBackoff computes the wait before the upcoming restart and the backoff to
+// carry into the one after it. A run that lasted longer than a minute counts as
+// stable, so the sequence restarts from min (the first restart after a long,
+// healthy run waits only min); otherwise it doubles up to max. Pure so the
+// sequence (long run → min; consecutive short runs → min,2·min,…,max,max) is
+// unit-testable.
+func nextBackoff(cur, min, max, ran time.Duration) (wait, next time.Duration) {
+	if ran > time.Minute {
+		cur = min
+	}
+	wait = cur
+	next = cur * 2
+	if next > max {
+		next = max
+	}
+	return wait, next
+}
+
+// exitCode returns the process exit status from an *exec.ExitError, or -1 when
+// the error is not an exit (signal, start failure, nil).
+func exitCode(err error) int {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
+}
+
 // wasKilled reports whether the process died from SIGKILL.
 func wasKilled(err error) bool {
 	var ee *exec.ExitError
@@ -649,7 +1043,7 @@ func (m *Manager) runFFmpegOnce(ctx context.Context, ar *activeRecording, snap *
 
 	args := m.ffmpegArgs(snap, codec, restart, ar.safeArgs)
 	cmd := exec.CommandContext(pctx, m.cfg.FFmpegPath, args...)
-	cmd.Stdout = &captureWriter{ar: ar}
+	cmd.Stdout = &captureWriter{ar: ar, m: m}
 	cmd.Stderr = ar.stderr
 	cmd.Stdin = nil
 	setSysProcAttr(cmd)
@@ -680,7 +1074,6 @@ func (m *Manager) runFFmpegOnce(ctx context.Context, ar *activeRecording, snap *
 		m.met.FFmpegSpawnFailuresTotal.Inc()
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
-	ar.stallKilled.Store(false)
 	ar.lastData.Store(time.Now().UnixNano())
 	ar.pid.Store(int64(cmd.Process.Pid))
 	ar.running.Store(true)
@@ -695,7 +1088,9 @@ func (m *Manager) runFFmpegOnce(ctx context.Context, ar *activeRecording, snap *
 		stall = snap.StallTimeout.D()
 	}
 	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
 	go func() {
+		defer close(watchDone)
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
 		for {
@@ -703,6 +1098,17 @@ func (m *Manager) runFFmpegOnce(ctx context.Context, ar *activeRecording, snap *
 			case <-stopWatch:
 				return
 			case <-t.C:
+				// ffmpeg may have exited between ticks. A stall check that
+				// coincides with a self-exit must not be counted as a stall: the
+				// process is already gone and its real exit reason (e.g.
+				// demux-error) must stand. exited is closed the instant Wait
+				// returns, before stopWatch, and select picks randomly when both
+				// it and the ticker are ready — so check it explicitly first.
+				select {
+				case <-exited:
+					return
+				default:
+				}
 				if time.Since(ar.lastDataTime()) > stall {
 					m.log.Warn("no data from ffmpeg, restarting", "id", ar.s.ID, "pid", cmd.Process.Pid,
 						"stall", stall.String(), "stderr", ar.stderr.Last())
@@ -721,6 +1127,10 @@ func (m *Manager) runFFmpegOnce(ctx context.Context, ar *activeRecording, snap *
 	err := cmd.Wait()
 	close(exited)
 	close(stopWatch)
+	// Join the watchdog so ar.stallKilled is settled before supervise reads it
+	// to classify this run: an unjoined late tick could otherwise flip the
+	// classification between demux-error and stall.
+	<-watchDone
 	ar.running.Store(false)
 	ar.pid.Store(0)
 	ar.runningGauge.Set(0)

@@ -434,6 +434,9 @@ func (m *Manager) openActive(s *Session, resume bool) (*activeRecording, error) 
 		lastDataGauge:   m.met.RecordingLastData.WithLabelValues(id),
 		restartsCounter: m.met.FFmpegRestartsTotal.WithLabelValues(id),
 	}
+	ar.stderr.onSuppressed = func(reason string) {
+		m.met.FFmpegStderrSuppressedTotal.WithLabelValues(reason).Inc()
+	}
 	ar.bytes.Store(size)
 	ar.savedBytes = size
 	ar.runningGauge.Set(0)
@@ -532,6 +535,10 @@ func (m *Manager) stopLocked(ar *activeRecording, reason string) {
 // finalize closes the file and either parks the session for resume (shutdown)
 // or hands it to the uploader.
 func (m *Manager) finalize(ar *activeRecording, reason string) {
+	// Close a still-open run (the ctx-cancel path returns from supervise before
+	// its own endRun). Idempotent, and must run before the file is closed because
+	// it flushes the buffered partial frame.
+	m.endRun(ar)
 	if err := ar.file.Sync(); err != nil {
 		m.log.Warn("fsync recording", "id", ar.s.ID, "error", err)
 	}
@@ -605,7 +612,6 @@ func (m *Manager) Recover() {
 				toUpload = append(toUpload, prev.s)
 			}
 			s.SessionEnd = nil
-			s.SuspendedAt = nil
 			ar, err := m.openActive(s, true)
 			if err != nil {
 				m.log.Error("cannot reopen recording, finalizing instead", "id", s.ID, "session", s.SessionID, "error", err)
@@ -618,6 +624,11 @@ func (m *Manager) Recover() {
 				toUpload = append(toUpload, s)
 				continue
 			}
+			// A crash may have left the last run open (no clean endRun): close it
+			// using the trimmed file size before nil-ing SuspendedAt, so its end
+			// time is the suspend time when known.
+			s.fixOpenRun(ar.bytes.Load(), time.Now())
+			s.SuspendedAt = nil
 			ar.recovered = true
 			m.active[s.ID] = ar
 			m.log.Info("recovered unfinished recording", "id", s.ID, "session", s.SessionID, "bytes", ar.bytes.Load(),
@@ -860,16 +871,63 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
 
 	// The playlist needs the exact playback time, which only the ADTS frame
 	// headers can tell (one sequential read of the file). The scan must never
-	// stop an upload: on any problem the wall-clock length is used instead.
-	info, err := scanRecording(path)
-	if err != nil {
-		m.log.Warn("could not measure recording; using the session length", "id", s.ID, "session", s.SessionID, "error", err)
-	} else if info.Junk > 0 {
+	// stop an upload: on any problem the wall-clock length is used instead. When
+	// the session has run records, ScanRuns gives every byte range its
+	// authoritative frame count and duration for the per-run playlist segments.
+	m.mu.Lock()
+	runOffsets := make([]int64, len(s.Runs))
+	for i := range s.Runs {
+		runOffsets[i] = s.Runs[i].Offset
+	}
+	m.mu.Unlock()
+
+	var (
+		info     adts.Info
+		runInfos []adts.Info
+	)
+	if len(runOffsets) > 0 {
+		var rerr error
+		runInfos, info, rerr = scanRunsRecording(path, runOffsets)
+		if rerr != nil {
+			m.log.Warn("could not measure recording runs; falling back to a whole-file scan",
+				"id", s.ID, "session", s.SessionID, "error", rerr)
+			runInfos = nil
+			info, rerr = scanRecording(path)
+			if rerr != nil {
+				m.log.Warn("could not measure recording; using the session length", "id", s.ID, "session", s.SessionID, "error", rerr)
+			}
+		}
+	} else {
+		var serr error
+		info, serr = scanRecording(path)
+		if serr != nil {
+			m.log.Warn("could not measure recording; using the session length", "id", s.ID, "session", s.SessionID, "error", serr)
+		}
+	}
+	if info.Junk > 0 {
 		m.log.Warn("recording contains bytes outside ADTS frames", "id", s.ID, "session", s.SessionID,
-			"bytes", info.Junk, "frames", info.Frames)
+			"bytes", info.Junk, "frames", info.Frames, "tags", info.Tags)
 	}
 
 	m.mu.Lock()
+	if runInfos != nil {
+		for i := range s.Runs {
+			if i < len(runInfos) {
+				s.Runs[i].Frames = runInfos[i].Frames
+				s.Runs[i].DurationSeconds = runInfos[i].Duration.Seconds()
+			}
+		}
+		// Sanity: reconcile the last run's byte length with the real file size
+		// (the sidecar counter can lag the on-disk file by a persist interval).
+		if n := len(s.Runs); n > 0 {
+			last := &s.Runs[n-1]
+			if last.Offset+last.Bytes != size {
+				m.log.Debug("adjusting last run byte length to file size", "id", s.ID, "session", s.SessionID,
+					"was", last.Bytes, "now", size-last.Offset)
+				last.Bytes = size - last.Offset
+			}
+		}
+	}
 	s.DurationSeconds = info.Duration.Seconds()
 	if info.Frames == 0 && s.SessionEnd != nil {
 		// Not recognisable as ADTS: fall back to the wall-clock length.
@@ -891,6 +949,17 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
 	}
 	if s.SessionEnd != nil {
 		meta["session-end"] = s.SessionEnd.UTC().Format(time.RFC3339)
+	}
+	// Why the runs restarted, e.g. "demux-error=3,stream-ended=1" (kept small:
+	// bounded set of reasons, omitted when there were no exits).
+	if reasons := exitReasonsSummary(s.Exits); reasons != "" {
+		meta["ffmpeg-exit-reasons"] = reasons
+	}
+	// Clock provenance of the recording (omitted for old sidecars without runs).
+	if len(s.Runs) > 0 {
+		meta["ffmpeg-runs"] = strconv.Itoa(len(s.Runs))
+		meta["first-sample-time"] = s.Runs[0].Anchor.UTC().Format("2006-01-02T15:04:05.000Z07:00")
+		meta["clock-source"] = s.Runs[0].AnchorSource
 	}
 	m.mu.Unlock()
 
@@ -942,6 +1011,17 @@ func scanRecording(path string) (info adts.Info, err error) {
 		}
 	}()
 	return adts.Scan(path)
+}
+
+// scanRunsRecording is scanRecording for the per-run byte ranges, with the same
+// panic-to-error guard.
+func scanRunsRecording(path string, offsets []int64) (runs []adts.Info, total adts.Info, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			runs, total, err = nil, adts.Info{}, fmt.Errorf("adts scanRuns panicked: %v", r)
+		}
+	}()
+	return adts.ScanRuns(path, offsets)
 }
 
 // completeUpload publishes the folder's playlist, marks the session uploaded
@@ -1004,6 +1084,15 @@ func (m *Manager) persist() {
 	m.mu.Lock()
 	samples := make([]sample, 0, len(m.active))
 	for _, ar := range m.active {
+		// Copy the live run counters into the open run so a crash loses at most
+		// one persist interval of counters (~10 s).
+		if r := ar.s.openRun(); r != nil {
+			ar.run.mu.Lock()
+			r.Bytes = ar.run.bytes
+			r.Frames = ar.run.frames
+			r.DurationSeconds = ar.run.seconds
+			ar.run.mu.Unlock()
+		}
 		if b := ar.bytes.Load(); b != ar.savedBytes {
 			ar.s.Bytes = b
 			if err := ar.s.saveQuick(); err != nil {
@@ -1193,37 +1282,43 @@ func (m *Manager) Shutdown(ctx context.Context) {
 
 // RecordingView is the API representation of a session.
 type RecordingView struct {
-	ID              string     `json:"id"`
-	SessionID       string     `json:"sessionId"`
-	Name            string     `json:"name,omitempty"`
-	State           State      `json:"state"`
-	FinishReason    string     `json:"finishReason,omitempty"`
-	Source          string     `json:"source"`
-	Type            string     `json:"type,omitempty"`
-	Codec           string     `json:"codec"`
-	ResolvedCodec   string     `json:"resolvedCodec,omitempty"`
-	Start           time.Time  `json:"start"`
-	End             time.Time  `json:"end"`
-	SessionStart    time.Time  `json:"sessionStart"`
-	SessionEnd      *time.Time `json:"sessionEnd,omitempty"`
-	Bytes           int64      `json:"bytes"`
-	Restarts        int        `json:"restarts"`
-	Stalls          int        `json:"stalls"`
-	WriteErrors     int        `json:"writeErrors,omitempty"`
-	FFmpegRunning   bool       `json:"ffmpegRunning"`
-	PID             int        `json:"pid,omitempty"`
-	LastDataAt      *time.Time `json:"lastDataAt,omitempty"`
-	LastError       string     `json:"lastError,omitempty"`
-	ScheduleNote    string     `json:"scheduleNote,omitempty"`
-	LastStderr      []string   `json:"lastStderr,omitempty"`
-	Key             string     `json:"key"`
-	Playlist        string     `json:"playlist,omitempty"`
-	DurationSeconds float64    `json:"durationSeconds,omitempty"`
-	UploadAttempts  int        `json:"uploadAttempts"`
-	UploadBlocked   bool       `json:"uploadBlocked,omitempty"`
-	UploadedAt      *time.Time `json:"uploadedAt,omitempty"`
-	NextUploadAt    *time.Time `json:"nextUploadAt,omitempty"`
-	File            string     `json:"file,omitempty"`
+	ID               string     `json:"id"`
+	SessionID        string     `json:"sessionId"`
+	Name             string     `json:"name,omitempty"`
+	State            State      `json:"state"`
+	FinishReason     string     `json:"finishReason,omitempty"`
+	Source           string     `json:"source"`
+	Type             string     `json:"type,omitempty"`
+	Codec            string     `json:"codec"`
+	ResolvedCodec    string     `json:"resolvedCodec,omitempty"`
+	Start            time.Time  `json:"start"`
+	End              time.Time  `json:"end"`
+	SessionStart     time.Time  `json:"sessionStart"`
+	SessionEnd       *time.Time `json:"sessionEnd,omitempty"`
+	Bytes            int64      `json:"bytes"`
+	Restarts         int        `json:"restarts"`
+	Stalls           int        `json:"stalls"`
+	WriteErrors      int        `json:"writeErrors,omitempty"`
+	FFmpegRunning    bool       `json:"ffmpegRunning"`
+	PID              int        `json:"pid,omitempty"`
+	LastDataAt       *time.Time `json:"lastDataAt,omitempty"`
+	LastError        string     `json:"lastError,omitempty"`
+	RecordLastError  string     `json:"recordLastError,omitempty"`
+	Exits            []RunExit  `json:"exits,omitempty"`
+	Runs             []Run      `json:"runs,omitempty"`             // per-run byte ranges + clock anchors (all states)
+	ClockAnchor      *time.Time `json:"clockAnchor,omitempty"`      // wall clock of the current run's first sample (active)
+	ClockSource      string     `json:"clockSource,omitempty"`      // "hls-pdt" | "wallclock" (active)
+	StderrSuppressed int        `json:"stderrSuppressed,omitempty"` // benign lines dropped this run (active only)
+	ScheduleNote     string     `json:"scheduleNote,omitempty"`
+	LastStderr       []string   `json:"lastStderr,omitempty"`
+	Key              string     `json:"key"`
+	Playlist         string     `json:"playlist,omitempty"`
+	DurationSeconds  float64    `json:"durationSeconds,omitempty"`
+	UploadAttempts   int        `json:"uploadAttempts"`
+	UploadBlocked    bool       `json:"uploadBlocked,omitempty"`
+	UploadedAt       *time.Time `json:"uploadedAt,omitempty"`
+	NextUploadAt     *time.Time `json:"nextUploadAt,omitempty"`
+	File             string     `json:"file,omitempty"`
 }
 
 // UploadStats summarises upload queue state.
@@ -1247,10 +1342,20 @@ func (m *Manager) Recordings() []RecordingView {
 			Source: RedactURL(s.Source), Type: s.Type, Codec: s.Codec, ResolvedCodec: s.ResolvedCodec,
 			Start: s.Start, End: s.End, SessionStart: s.SessionStart, SessionEnd: s.SessionEnd,
 			Bytes: s.Bytes, Restarts: s.Restarts, Stalls: s.Stalls, WriteErrors: s.WriteErrors,
-			LastError: redactLine(s.LastError), ScheduleNote: s.ScheduleNote, Key: s.Key,
+			LastError: redactLine(s.LastError), RecordLastError: redactLine(s.RecordLastError),
+			ScheduleNote: s.ScheduleNote, Key: s.Key,
 			DurationSeconds: s.DurationSeconds,
 			UploadAttempts:  s.UploadAttempts, UploadBlocked: s.UploadBlocked, UploadedAt: s.UploadedAt,
 			NextUploadAt: s.NextUploadAt, File: s.FilePath(),
+		}
+		// exits[] and runs[] are shown for ALL states so finished/uploaded items
+		// still reveal why they restarted and where each run's clock sits; copy
+		// the slices so the view never aliases the session.
+		if len(s.Exits) > 0 {
+			v.Exits = append([]RunExit(nil), s.Exits...)
+		}
+		if len(s.Runs) > 0 {
+			v.Runs = append([]Run(nil), s.Runs...)
 		}
 		if s.Key != "" {
 			v.Playlist = playlistKey(s.Key)
@@ -1266,6 +1371,14 @@ func (m *Manager) Recordings() []RecordingView {
 				v.LastDataAt = &t
 			}
 			v.LastStderr = ar.stderr.Tail()
+			v.StderrSuppressed = ar.stderr.suppressedRun()
+			ar.run.mu.Lock()
+			if ar.run.started {
+				a := ar.run.anchor
+				v.ClockAnchor = &a
+				v.ClockSource = ar.run.anchorSource
+			}
+			ar.run.mu.Unlock()
 		}
 		out = append(out, v)
 	}

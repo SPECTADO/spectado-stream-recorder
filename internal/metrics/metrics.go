@@ -29,27 +29,29 @@ type Metrics struct {
 	ScheduleClockSkew           prometheus.Gauge
 
 	// Recording.
-	RecordingsActive         prometheus.Gauge
-	RecordingsStartedTotal   prometheus.Counter
-	RecordingsFinishedTotal  *prometheus.CounterVec // reason=ended|removed|rotated|superseded|error
-	RecordingsSuspendedTotal prometheus.Counter     // paused for shutdown (resumed on next start)
-	RecordingsSkippedTotal   *prometheus.CounterVec // reason=max_recordings|disk_low|error
-	RecordingBytes           *prometheus.CounterVec // id
-	RecordingFFmpegRunning   *prometheus.GaugeVec   // id
-	RecordingLastData        *prometheus.GaugeVec   // id (unix seconds)
-	FFmpegRestartsTotal      *prometheus.CounterVec // id
-	FFmpegCPUSeconds         *prometheus.CounterVec // id
-	FFmpegRSS                *prometheus.GaugeVec   // id
-	FFmpegStallsTotal        prometheus.Counter
-	FFmpegKilledTotal        prometheus.Counter
-	FFmpegSpawnFailuresTotal prometheus.Counter
-	FFmpegProcesses          prometheus.Gauge
-	FFmpegSpawnedTotal       prometheus.Counter
-	FFmpegInfo               *prometheus.GaugeVec // version, path
-	CodecFallbacksTotal      prometheus.Counter
-	WriteErrorsTotal         prometheus.Counter
-	RecordingsOnDiskBytes    prometheus.Gauge
-	DiskLow                  prometheus.Gauge
+	RecordingsActive            prometheus.Gauge
+	RecordingsStartedTotal      prometheus.Counter
+	RecordingsFinishedTotal     *prometheus.CounterVec // reason=ended|removed|rotated|superseded|error
+	RecordingsSuspendedTotal    prometheus.Counter     // paused for shutdown (resumed on next start)
+	RecordingsSkippedTotal      *prometheus.CounterVec // reason=max_recordings|disk_low|error
+	RecordingBytes              *prometheus.CounterVec // id
+	RecordingFFmpegRunning      *prometheus.GaugeVec   // id
+	RecordingLastData           *prometheus.GaugeVec   // id (unix seconds)
+	FFmpegRestartsTotal         *prometheus.CounterVec // id
+	FFmpegExitsTotal            *prometheus.CounterVec // reason
+	FFmpegStderrSuppressedTotal *prometheus.CounterVec // reason (benign stderr lines dropped)
+	FFmpegCPUSeconds            *prometheus.CounterVec // id
+	FFmpegRSS                   *prometheus.GaugeVec   // id
+	FFmpegStallsTotal           prometheus.Counter
+	FFmpegKilledTotal           prometheus.Counter
+	FFmpegSpawnFailuresTotal    prometheus.Counter
+	FFmpegProcesses             prometheus.Gauge
+	FFmpegSpawnedTotal          prometheus.Counter
+	FFmpegInfo                  *prometheus.GaugeVec // version, path
+	CodecFallbacksTotal         prometheus.Counter
+	WriteErrorsTotal            prometheus.Counter
+	RecordingsOnDiskBytes       prometheus.Gauge
+	DiskLow                     prometheus.Gauge
 
 	// Upload.
 	UploadsTotal           *prometheus.CounterVec // result=success|failure
@@ -164,6 +166,14 @@ func New(version string) *Metrics {
 	m.RecordingFFmpegRunning = gaugeVec("recording_ffmpeg_running", "1 while an ffmpeg process is running for the recording id.", "id")
 	m.RecordingLastData = gaugeVec("recording_last_data_timestamp_seconds", "Unix time when data last arrived for the recording id.", "id")
 	m.FFmpegRestartsTotal = counterVec("ffmpeg_restarts_total", "ffmpeg restarts per recording id.", "id")
+	m.FFmpegExitsTotal = counterVec("ffmpeg_exits_total", "ffmpeg runs that ended, by classified reason.", "reason")
+	for _, r := range []string{"write-error", "disk-full", "stall", "killed", "exit-error", "demux-error", "stream-ended"} {
+		m.FFmpegExitsTotal.WithLabelValues(r)
+	}
+	m.FFmpegStderrSuppressedTotal = counterVec("ffmpeg_stderr_suppressed_total", "Benign ffmpeg stderr lines dropped, by reason.", "reason")
+	for _, r := range []string{"duplicate_moov"} {
+		m.FFmpegStderrSuppressedTotal.WithLabelValues(r)
+	}
 	m.FFmpegCPUSeconds = counterVec("ffmpeg_cpu_seconds_total", "CPU time consumed by the ffmpeg processes of a recording id (accumulated across restarts).", "id")
 	m.FFmpegRSS = gaugeVec("ffmpeg_memory_rss_bytes", "Resident memory of the current ffmpeg process per recording id.", "id")
 	m.FFmpegStallsTotal = counter("ffmpeg_stalls_total", "ffmpeg processes killed because no data arrived within the stall timeout.")

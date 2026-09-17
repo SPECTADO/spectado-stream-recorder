@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,40 @@ const (
 )
 
 const sidecarSchemaVersion = 1
+
+// maxExits bounds Session.Exits so a long, flapping recording cannot grow the
+// sidecar without limit; only the most recent runs matter for diagnosis.
+const maxExits = 20
+
+// maxRuns bounds Session.Runs. When exceeded the two oldest adjacent runs are
+// coalesced so a pathologically flapping recording cannot grow the sidecar (and
+// the published playlist) without limit.
+const maxRuns = 2000
+
+// Run is one ffmpeg run that produced audio: the byte range it wrote and the
+// wall-clock time of its first sample (the clock anchor of that range).
+type Run struct {
+	StartedAt       time.Time  `json:"startedAt"`
+	EndedAt         *time.Time `json:"endedAt,omitempty"`
+	Anchor          time.Time  `json:"anchor"`       // wall-clock time of the first sample
+	AnchorSource    string     `json:"anchorSource"` // "hls-pdt" | "wallclock"
+	Offset          int64      `json:"offset"`       // first byte of the run in the file
+	Bytes           int64      `json:"bytes"`        // bytes written (frames + ID3 tags)
+	Frames          int        `json:"frames"`
+	DurationSeconds float64    `json:"durationSeconds"`
+}
+
+// RunExit records why one ffmpeg run ended (kept for diagnosis after upload).
+type RunExit struct {
+	At         time.Time `json:"at"`
+	RanSeconds float64   `json:"ranSeconds"`
+	Bytes      int64     `json:"bytes"`
+	Reason     string    `json:"reason"`
+	ExitError  string    `json:"exitError,omitempty"`  // runErr.Error() for non-zero exits / write errors
+	Stderr     string    `json:"stderr,omitempty"`     // last meaningful stderr line (post filter)
+	ErrorLine  string    `json:"errorLine,omitempty"`  // last error-level line of the run, if any
+	Suppressed int       `json:"suppressed,omitempty"` // benign lines dropped during the run
+}
 
 // Session is the persistent description of one recording session. It is
 // stored next to the audio file as <session>.json so the recorder can resume
@@ -79,8 +114,15 @@ type Session struct {
 	WriteErrors   int        `json:"writeErrors,omitempty"`
 	FinishReason  string     `json:"finishReason,omitempty"`
 	LastError     string     `json:"lastError,omitempty"`
-	ScheduleNote  string     `json:"scheduleNote,omitempty"` // e.g. "item invalid in schedule since ..."
-	SuspendedAt   *time.Time `json:"suspendedAt,omitempty"`  // set when paused for shutdown
+	// RecordLastError is why the *recording* last restarted, built from the
+	// filtered stderr. Set only by supervise; unlike LastError it survives the
+	// upload (completeUpload clears LastError, not this) so a finished object
+	// still shows why it flapped.
+	RecordLastError string     `json:"recordLastError,omitempty"`
+	Exits           []RunExit  `json:"exits,omitempty"`        // last runs' exits (bounded)
+	Runs            []Run      `json:"runs,omitempty"`         // per ffmpeg run byte ranges + clock anchors
+	ScheduleNote    string     `json:"scheduleNote,omitempty"` // e.g. "item invalid in schedule since ..."
+	SuspendedAt     *time.Time `json:"suspendedAt,omitempty"`  // set when paused for shutdown
 
 	UploadAttempts  int        `json:"uploadAttempts"`
 	KeyRenames      int        `json:"keyRenames,omitempty"`      // times the key was changed after a conflict
@@ -93,7 +135,8 @@ type Session struct {
 
 	UpdatedAt time.Time `json:"updatedAt"`
 
-	dir string // directory holding the files (not serialized)
+	dir           string // directory holding the files (not serialized)
+	runsCoalesced bool   // whether a coalesce has already been logged this session
 }
 
 // FilePath returns the path of the audio file.
@@ -260,6 +303,106 @@ func playlistKey(mediaKey string) string {
 		return "index.m3u8"
 	}
 	return dir + "/index.m3u8"
+}
+
+// addExit appends e to the session's exit history, keeping only the most recent
+// maxExits entries (oldest dropped). Caller holds Manager.mu.
+func (s *Session) addExit(e RunExit) {
+	s.Exits = append(s.Exits, e)
+	if len(s.Exits) > maxExits {
+		s.Exits = s.Exits[len(s.Exits)-maxExits:]
+	}
+}
+
+// appendRun appends r to the session's run history. When the cap is exceeded the
+// two OLDEST adjacent runs are coalesced into one (their bytes/frames/duration
+// summed, the first anchor/start kept, the later end taken). It returns true the
+// first time a coalesce happens so the caller can log it once. Caller holds
+// Manager.mu.
+func (s *Session) appendRun(r Run) (coalescedNow bool) {
+	s.Runs = append(s.Runs, r)
+	if len(s.Runs) <= maxRuns {
+		return false
+	}
+	a, b := s.Runs[0], s.Runs[1]
+	a.Bytes += b.Bytes
+	a.Frames += b.Frames
+	a.DurationSeconds += b.DurationSeconds
+	a.EndedAt = laterTime(a.EndedAt, b.EndedAt)
+	merged := make([]Run, 0, len(s.Runs)-1)
+	merged = append(merged, a)
+	merged = append(merged, s.Runs[2:]...)
+	s.Runs = merged
+	if !s.runsCoalesced {
+		s.runsCoalesced = true
+		return true
+	}
+	return false
+}
+
+// openRun returns a pointer to the last, still-open run (EndedAt == nil), or nil
+// when there is none. Caller holds Manager.mu.
+func (s *Session) openRun() *Run {
+	if n := len(s.Runs); n > 0 && s.Runs[n-1].EndedAt == nil {
+		return &s.Runs[n-1]
+	}
+	return nil
+}
+
+// fixOpenRun closes an open run left by a crash (no clean endRun): its end is
+// the suspend time if known else now, and its byte length is the (already
+// trimmed) file size minus its offset. Frames/duration are recomputed by
+// ScanRuns at finalize. Caller holds Manager.mu.
+func (s *Session) fixOpenRun(size int64, now time.Time) {
+	r := s.openRun()
+	if r == nil {
+		return
+	}
+	end := now
+	if s.SuspendedAt != nil {
+		end = *s.SuspendedAt
+	}
+	r.EndedAt = &end
+	if size >= r.Offset {
+		r.Bytes = size - r.Offset
+	}
+}
+
+// laterTime returns the later of two optional times.
+func laterTime(a, b *time.Time) *time.Time {
+	switch {
+	case a == nil:
+		return b
+	case b == nil:
+		return a
+	case b.After(*a):
+		return b
+	default:
+		return a
+	}
+}
+
+// exitReasonsSummary renders a compact, deterministic "reason=count" list of
+// the session's exits, sorted by reason (e.g. "demux-error=3,stream-ended=1").
+// Empty when there were no exits. Used for small S3 object metadata.
+func exitReasonsSummary(exits []RunExit) string {
+	if len(exits) == 0 {
+		return ""
+	}
+	counts := make(map[string]int, len(exits))
+	for _, e := range exits {
+		counts[e.Reason]++
+	}
+	reasons := make([]string, 0, len(counts))
+	for r := range counts {
+		reasons = append(reasons, r)
+	}
+	sort.Strings(reasons)
+	parts := make([]string, 0, len(reasons))
+	for _, r := range reasons {
+		parts = append(parts, r+"="+strconv.Itoa(counts[r]))
+	}
+	return strings.Join(parts, ",")
 }
 
 // withSuffix inserts suffix before the file extension: ("a/b.aac", "_x") ->

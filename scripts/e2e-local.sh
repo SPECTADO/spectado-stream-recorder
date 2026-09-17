@@ -37,7 +37,7 @@ say "build"
 
 say "start local HLS test stream"
 ffmpeg -hide_banner -loglevel warning -re -f lavfi -i "sine=frequency=440:sample_rate=44100" -ac 2 -c:a aac -b:a 96k \
-  -f hls -hls_time 2 -hls_list_size 6 -hls_flags delete_segments+append_list \
+  -f hls -hls_time 2 -hls_list_size 6 -hls_flags delete_segments+append_list+program_date_time \
   -hls_segment_filename "$WWW/hls/test_%05d.ts" "$WWW/hls/test.m3u8" >"$WORK/teststream.log" 2>&1 &
 FF=$!
 sleep 7
@@ -89,6 +89,11 @@ for f in "$DATA"/recordings/*/*.aac; do
   ffprobe -v error -show_entries format=format_name,duration:stream=codec_name,profile,sample_rate,channels -of default=nw=1 "$f" || fail "ffprobe"
   ERRS=$(ffmpeg -v error -i "$f" -f null - 2>&1 | wc -l | tr -d ' ')
   echo "decode errors: $ERRS"; [ "$ERRS" -eq 0 ] || fail "decode errors in $f"
+  # In-band wall clock: ffprobe reads the first ID3 tag, and the file should hold
+  # several tags (one per run start plus every CLOCK_ID3_INTERVAL of media time).
+  ffprobe -v error -show_format "$f" | grep -q "TAG:WALLCLOCK=" || fail "no WALLCLOCK ID3 tag in $f"
+  NTAGS=$(python3 -c "import sys;print(open('$f','rb').read().count(b'ID3'))")
+  echo "ID3 tags: $NTAGS"; [ "$NTAGS" -ge 3 ] || fail "expected >= 3 ID3 tags in $f (got $NTAGS)"
 done
 kill -TERM $REC; wait $REC
 echo; echo "E2E OK"

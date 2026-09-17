@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"time"
+
+	"github.com/spectado/stream-recorder/internal/id3"
 )
 
 // sampleRates maps sampling_frequency_index to Hz (indexes 13..15 are
@@ -17,7 +19,9 @@ var sampleRates = [...]int{96000, 88200, 64000, 48000, 44100, 32000, 24000, 2205
 type Info struct {
 	Frames   int           // complete frames
 	Duration time.Duration // playback time of those frames
-	Junk     int64         // bytes that were not part of a complete frame
+	Junk     int64         // bytes that were not part of a complete frame or tag
+	Tags     int           // well-formed ID3v2 tags skipped
+	TagBytes int64         // bytes those tags occupied
 }
 
 // Scan walks the whole file and derives its playback duration from the frame
@@ -25,8 +29,9 @@ type Info struct {
 // ADTS carries no timestamps, so this is the only exact way to know how long
 // a recording is; the file is read once sequentially.
 //
-// A leading ID3v2 tag is skipped. Bytes that do not form a valid frame are
-// skipped one at a time and counted in Junk; after such a gap a candidate
+// Well-formed ID3v2 tags (which the recorder writes between frames) are skipped
+// and counted in Tags/TagBytes, not Junk. Bytes that do not form a valid frame
+// are skipped one at a time and counted in Junk; after such a gap a candidate
 // frame is only trusted when the frame following it is valid too.
 func Scan(path string) (Info, error) {
 	f, err := os.Open(path)
@@ -39,21 +44,28 @@ func Scan(path string) (Info, error) {
 
 func scan(r *bufio.Reader) (Info, error) {
 	var info Info
-	if hdr, err := r.Peek(10); err == nil && bytes.HasPrefix(hdr, []byte("ID3")) {
-		size := int(hdr[6]&0x7F)<<21 | int(hdr[7]&0x7F)<<14 | int(hdr[8]&0x7F)<<7 | int(hdr[9]&0x7F)
-		size += 10
-		if hdr[5]&0x10 != 0 { // footer present
-			size += 10
-		}
-		if n, err := r.Discard(size); err != nil {
-			info.Junk += int64(n)
-			return info, nil
-		}
-	}
-
 	seconds := 0.0
 	synced := false
 	for {
+		// An ID3v2 tag may appear anywhere (at the start of the file and between
+		// frames). Skip it and count it separately from junk. A tag breaks frame
+		// adjacency, so re-sync afterwards.
+		if hdr, err := r.Peek(10); err == nil && bytes.HasPrefix(hdr, []byte("ID3")) {
+			if n, ok := id3.TagLen(hdr); ok {
+				d, derr := r.Discard(n)
+				info.Tags++
+				info.TagBytes += int64(d)
+				if derr != nil {
+					if !errors.Is(derr, io.EOF) {
+						return info, derr
+					}
+					break // truncated tag at EOF
+				}
+				synced = false
+				continue
+			}
+		}
+
 		hdr, err := r.Peek(minHeader)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
@@ -115,4 +127,131 @@ func skip(r *bufio.Reader, info *Info) {
 	if n, _ := r.Discard(1); n > 0 {
 		info.Junk += int64(n)
 	}
+}
+
+// ScanRuns walks the file once and attributes every frame, tag and junk byte to
+// the run whose byte range contains that element's first byte. offsets holds the
+// first byte of each run (ascending); run i covers [offsets[i], offsets[i+1]),
+// the last run extends to EOF, and any bytes before offsets[0] fall in run 0. It
+// returns one Info per run plus the totals. Used at finalize to give every
+// #EXT-X-BYTERANGE segment its authoritative frame count and duration.
+func ScanRuns(path string, offsets []int64) (runs []Info, total Info, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, Info{}, err
+	}
+	defer f.Close()
+	r := bufio.NewReaderSize(f, 256<<10)
+
+	n := len(offsets)
+	if n == 0 {
+		n = 1 // a single implicit run covering the whole file
+	}
+	runs = make([]Info, n)
+	runSeconds := make([]float64, n)
+
+	cur := 0
+	idxFor := func(pos int64) int {
+		for cur+1 < len(offsets) && pos >= offsets[cur+1] {
+			cur++
+		}
+		return cur
+	}
+
+	var pos int64
+	synced := false
+	for {
+		if hdr, e := r.Peek(10); e == nil && bytes.HasPrefix(hdr, []byte("ID3")) {
+			if tl, ok := id3.TagLen(hdr); ok {
+				idx := idxFor(pos)
+				d, derr := r.Discard(tl)
+				runs[idx].Tags++
+				runs[idx].TagBytes += int64(d)
+				pos += int64(d)
+				if derr != nil {
+					if !errors.Is(derr, io.EOF) {
+						return runs, Info{}, derr
+					}
+					break
+				}
+				synced = false
+				continue
+			}
+		}
+
+		hdr, e := r.Peek(minHeader)
+		if e != nil {
+			if !errors.Is(e, io.EOF) {
+				return runs, Info{}, e
+			}
+			runs[idxFor(pos)].Junk += int64(len(hdr))
+			pos += int64(len(hdr))
+			break
+		}
+		frameLen, ok := parseHeader(hdr)
+		if !ok {
+			idx := idxFor(pos)
+			if d, _ := r.Discard(1); d > 0 {
+				runs[idx].Junk += int64(d)
+				pos += int64(d)
+			}
+			synced = false
+			continue
+		}
+		want := frameLen
+		if !synced {
+			want += minHeader
+		}
+		buf, e := r.Peek(want)
+		if e != nil {
+			if !errors.Is(e, io.EOF) {
+				return runs, Info{}, e
+			}
+			if len(buf) < frameLen {
+				runs[idxFor(pos)].Junk += int64(len(buf))
+				pos += int64(len(buf))
+				break
+			}
+			if len(buf) != frameLen {
+				idx := idxFor(pos)
+				if d, _ := r.Discard(1); d > 0 {
+					runs[idx].Junk += int64(d)
+					pos += int64(d)
+				}
+				continue
+			}
+		} else if !synced {
+			if _, ok := parseHeader(buf[frameLen:]); !ok {
+				idx := idxFor(pos)
+				if d, _ := r.Discard(1); d > 0 {
+					runs[idx].Junk += int64(d)
+					pos += int64(d)
+				}
+				continue
+			}
+		}
+		synced = true
+		idx := idxFor(pos)
+		rate := sampleRates[(buf[2]>>2)&0x0F]
+		blocks := int(buf[6]&0x03) + 1
+		runSeconds[idx] += float64(1024*blocks) / float64(rate)
+		runs[idx].Frames++
+		d, derr := r.Discard(frameLen)
+		pos += int64(d)
+		if derr != nil {
+			return runs, Info{}, derr
+		}
+	}
+
+	var totalSeconds float64
+	for i := range runs {
+		runs[i].Duration = time.Duration(runSeconds[i] * float64(time.Second))
+		total.Frames += runs[i].Frames
+		total.Junk += runs[i].Junk
+		total.Tags += runs[i].Tags
+		total.TagBytes += runs[i].TagBytes
+		totalSeconds += runSeconds[i]
+	}
+	total.Duration = time.Duration(totalSeconds * float64(time.Second))
+	return runs, total, nil
 }

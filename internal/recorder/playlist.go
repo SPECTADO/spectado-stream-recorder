@@ -13,10 +13,42 @@ import (
 
 const playlistContentType = "application/vnd.apple.mpegurl"
 
-// segmentFor describes the session's audio file as a playlist entry. The
-// duration comes from the ADTS scan done before the upload; sidecars written
-// by older versions fall back to the wall-clock length of the session.
-func segmentFor(s *Session) hls.Segment {
+// segmentsFor describes the session's audio file as one or more playlist
+// entries: one #EXT-X-BYTERANGE segment per ffmpeg run, each carrying its own
+// #EXT-X-PROGRAM-DATE-TIME (the wall-clock anchor of that byte range). Runs that
+// wrote no bytes are dropped. Sidecars written by older versions (no run
+// records) fall back to a single whole-file segment with the wall-clock length.
+func segmentsFor(s *Session) []hls.Segment {
+	base := path.Base(s.Key)
+	if len(s.Runs) == 0 {
+		return []hls.Segment{{URI: base, Duration: wholeFileDuration(s)}}
+	}
+	out := make([]hls.Segment, 0, len(s.Runs))
+	for _, r := range s.Runs {
+		if r.Bytes == 0 {
+			continue
+		}
+		d := r.DurationSeconds
+		if d < 0 {
+			d = 0
+		}
+		out = append(out, hls.Segment{
+			URI:             base,
+			Duration:        d,
+			Offset:          r.Offset,
+			Length:          r.Bytes,
+			ProgramDateTime: r.Anchor,
+		})
+	}
+	if len(out) == 0 {
+		return []hls.Segment{{URI: base, Duration: wholeFileDuration(s)}}
+	}
+	return out
+}
+
+// wholeFileDuration is the fallback playback length used when no per-run data is
+// available: the ADTS scan length, or the wall-clock session length.
+func wholeFileDuration(s *Session) float64 {
 	d := s.DurationSeconds
 	if d <= 0 && s.SessionEnd != nil {
 		d = s.SessionEnd.Sub(s.SessionStart).Seconds()
@@ -24,7 +56,7 @@ func segmentFor(s *Session) hls.Segment {
 	if d < 0 {
 		d = 0
 	}
-	return hls.Segment{URI: path.Base(s.Key), Duration: d}
+	return d
 }
 
 // publishPlaylist rewrites the index.m3u8 of the folder holding s.Key so it
@@ -35,13 +67,13 @@ func segmentFor(s *Session) hls.Segment {
 func (m *Manager) publishPlaylist(ctx context.Context, s *Session) error {
 	m.mu.Lock()
 	pkey := playlistKey(s.Key)
-	fresh := []hls.Segment{segmentFor(s)}
+	fresh := segmentsFor(s)
 	for _, other := range m.sessions {
 		if other == s || other.Key == "" || playlistKey(other.Key) != pkey {
 			continue
 		}
 		if other.State == StateUploaded || other.MediaUploaded {
-			fresh = append(fresh, segmentFor(other))
+			fresh = append(fresh, segmentsFor(other)...)
 		}
 	}
 	m.mu.Unlock()

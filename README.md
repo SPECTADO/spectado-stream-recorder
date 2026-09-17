@@ -212,20 +212,55 @@ Duplicate `id`s: the first wins. Duplicate explicit `key`s: the second is invali
   `#EXT-X-DISCONTINUITY`. Order of operations: audio uploaded and verified → sidecar
   remembers it → playlist written → sidecar says *uploaded* → local file deleted. A
   failure in the playlist step retries without re-uploading the audio.
-* `index.m3u8` is a VOD "packed audio" playlist: `#EXT-X-VERSION:3`,
-  `#EXT-X-PLAYLIST-TYPE:VOD`, one `#EXTINF` per file with the exact duration counted
-  from the ADTS frames, `#EXT-X-ENDLIST`; content type `application/vnd.apple.mpegurl`.
-  The audio files carry no ID3 `PRIV` timestamp tag (RFC 8216 asks for one at the start
-  of packed-audio segments); hls.js does not need it — if a native Apple player refuses
-  the playlist, that is the first thing to add.
+* `index.m3u8` is a VOD "packed audio" playlist: `#EXT-X-PLAYLIST-TYPE:VOD`,
+  `#EXT-X-ENDLIST`; content type `application/vnd.apple.mpegurl`. Each ffmpeg run of a
+  file is one segment: `#EXT-X-PROGRAM-DATE-TIME` (the wall-clock time of the run's first
+  sample), `#EXTINF` with the exact duration counted from the ADTS frames, and
+  `#EXT-X-BYTERANGE:<length>@<offset>` into the file. Restarts and resumes therefore show
+  up as several byte-range segments of the same `.aac`, each separated by
+  `#EXT-X-DISCONTINUITY` and carrying its own program-date-time. The playlist is
+  `#EXT-X-VERSION:4` as soon as any segment carries a byte range; a legacy folder written
+  before this feature (one whole-file segment, no byte range) still renders as
+  `#EXT-X-VERSION:3` and both merge losslessly.
+* The wall clock is also embedded **in band**. Every run starts with, and then every
+  `CLOCK_ID3_INTERVAL` of media time carries, a small ID3v2.4 tag between ADTS frames
+  holding: an Apple `PRIV` `com.apple.streaming.transportStreamTimestamp` frame (a 33-bit
+  90 kHz PTS — what hls.js turns into `basePTS`), a `TXXX WALLCLOCK` frame with the
+  RFC 3339 wall clock in milliseconds UTC, and a `TXXX WALLCLOCK-SOURCE` frame
+  (`hls-pdt` or `wallclock`). Set `CLOCK_ID3_INTERVAL=0` to disable the in-band tags.
+* **Consuming the clock.** In hls.js the per-segment time is on `frag.programDateTime`
+  and `hls.playingDate` maps playback position to wall time; the in-band tags arrive as
+  `Hls.Events.FRAG_PARSING_METADATA` samples (decode the ID3 with `id3.js` or hls.js's own
+  `Hls.utils` demuxer). `ffprobe -show_format file.aac` prints the first tag as
+  `TAG:WALLCLOCK=…`; ffmpeg's ADTS demuxer raises a metadata-update event for each later
+  tag. The `PRIV` timestamp makes the file acceptable to native Apple packed-audio players
+  as well.
+* **Accuracy** (target "a few seconds"). When the source playlist has
+  `#EXT-X-PROGRAM-DATE-TIME` and `CLOCK_PDT_LOOKUP` is on, a run is anchored to the PDT of
+  the segment ffmpeg will start with (`hls-pdt`); the residual error is at most one segment
+  (the race between the recorder's playlist read and ffmpeg's own, ~5 s). Without a PDT (or
+  with the lookup off) the anchor is the recorder's receipt time (`wallclock`), late by the
+  live latency (~3 segments on a fresh start). Because a restart re-captures ~one segment
+  (fact: a gap is worse than a small overlap), a later run's program-date-time can step
+  slightly back from the previous run's end.
 * Audio uploads use `If-None-Match: *` so an existing object is never overwritten
   silently (a different object under the same key makes the recorder pick `-2`, `-3`, …).
   The playlist is the one object that is rewritten in place.
 * Object metadata (`x-amz-meta-*`) on the audio file: `recording-id`, `session-id`,
   `name` (RFC 2047 encoded when non-ASCII), `source` (credentials redacted),
   `scheduled-start`, `scheduled-end`, `session-start`, `session-end`,
-  `duration-seconds`, `codec`, `ffmpeg-restarts`, `finish-reason`, `recorder-version`.
-  Content type `audio/aac`.
+  `duration-seconds`, `codec`, `ffmpeg-restarts`, `ffmpeg-exit-reasons`,
+  `finish-reason`, `recorder-version`, and — when the session has run records —
+  `ffmpeg-runs` (number of byte-range segments), `first-sample-time` (the first
+  run's wall-clock anchor, RFC 3339 ms) and `clock-source` (`hls-pdt` or
+  `wallclock`). Content type `audio/aac`.
+  `ffmpeg-exit-reasons` is a compact, sorted `reason=count` summary of why the
+  runs ended (e.g. `demux-error=3,stream-ended=1`); it is omitted when there were
+  no exits. It stays small (S3/R2 user metadata is capped at ~2 KB total). It
+  summarises only the last 20 exits kept in `exits[]`, so for a session that
+  flapped more than 20 times its counts sum to less than `ffmpeg-restarts`
+  (the cumulative restart count); the unbounded per-reason totals live in the
+  `recorder_ffmpeg_exits_total{reason}` metric.
 * Format: raw ADTS (`.aac`). Every frame is self-describing, so a file made of
   several ffmpeg runs (restarts, resume) plays in any decoder. Notes for consumers:
   live HLS is delivered a few segments behind real time — the first run starts
@@ -289,6 +324,8 @@ Durations accept Go syntax (`90s`, `5m`, `1h30m`) or plain seconds; sizes accept
 | `FFMPEG_STOP_GRACE` | `5s` | Time between SIGINT and SIGKILL when stopping ffmpeg. |
 | `FFMPEG_STDERR_LOG` | `warn` | `warn` (warnings/errors, rate-limited 10/min per stream), `debug`, `off`. The last 20 lines are always kept in the API. |
 | `FFMPEG_TLS_VERIFY` | `false` | Verify TLS certificates of `https` sources (ffmpeg's default is off; only the initial request is covered for HLS, ffmpeg does not pass TLS options to segment downloads). |
+| `CLOCK_ID3_INTERVAL` | `10s` | Cadence of in-band ID3 wall-clock tags between ADTS frames (plus one at every run start). `0` disables in-band tags; otherwise ≥ 1 s. |
+| `CLOCK_PDT_LOOKUP` | `true` | Read the source playlist's `#EXT-X-PROGRAM-DATE-TIME` to anchor each run to the broadcaster's clock; when off (or no PDT) each run is anchored to the recorder's receipt time. Best effort, 3 s timeout, HLS sources only. |
 
 **HTTP / monitoring / lifecycle**
 
@@ -336,6 +373,29 @@ Example (abridged):
 }
 ```
 
+Per-recording diagnostic fields (in each `recordings.items[]` entry):
+
+* `lastError` — the last error string; cleared once the recording uploads
+  successfully (kept for upload-error visibility, so it is empty on a healthy
+  finished object).
+* `recordLastError` — why the *recording* last restarted, built from the
+  filtered ffmpeg stderr (preferring the last error-level line). Unlike
+  `lastError` it **survives the upload**, so a finished/uploaded item still shows
+  why it flapped.
+* `exits[]` — a bounded history (last 20) of why each ffmpeg run ended, present
+  in every state. Each entry has `at`, `ranSeconds`, `bytes`, `reason` (same set
+  as `recorder_ffmpeg_exits_total`), and optionally `exitError`, `stderr`,
+  `errorLine`, `suppressed`.
+* `stderrSuppressed` — for active recordings, how many benign stderr lines were
+  dropped during the current run (see `recorder_ffmpeg_stderr_suppressed_total`).
+* `runs[]` — one entry per ffmpeg run that produced audio, present in every state.
+  Each has `startedAt`, `endedAt`, `anchor` (wall clock of the run's first sample),
+  `anchorSource` (`hls-pdt` or `wallclock`), `offset`/`bytes` (its `#EXT-X-BYTERANGE`
+  into the file), `frames` and `durationSeconds`. These are the segments the folder's
+  `index.m3u8` lists.
+* `clockAnchor` / `clockSource` — for active recordings, the wall-clock anchor and
+  its source (`hls-pdt` | `wallclock`) of the run currently being captured.
+
 ## Prometheus metrics
 
 All metrics carry the `recorder_` prefix. Highlights (see `/metrics` for the full,
@@ -349,6 +409,8 @@ documented list):
 | `recordings_started_total`, `recordings_finished_total{reason}`, `recordings_suspended_total`, `recordings_skipped_total{reason}` | counter | Lifecycle (`reason`: ended, removed, rotated, superseded, error / max_recordings, disk_low) |
 | `recording_bytes_total{id}`, `recording_ffmpeg_running{id}`, `recording_last_data_timestamp_seconds{id}` | per stream | Throughput and liveness per stream (alert on `time() - last_data > 90`) |
 | `ffmpeg_restarts_total{id}`, `ffmpeg_stalls_total`, `ffmpeg_killed_total`, `ffmpeg_spawn_failures_total`, `codec_fallbacks_total`, `write_errors_total` | counter | Stream trouble |
+| `ffmpeg_exits_total{reason}` | counter | ffmpeg runs that ended, classified: `write-error`, `disk-full`, `stall`, `killed`, `exit-error`, `demux-error`, `stream-ended`. A rising `demux-error` share points at the origin failing playlist reloads. |
+| `ffmpeg_stderr_suppressed_total{reason}` | counter | Benign ffmpeg stderr lines dropped before logging (`reason="duplicate_moov"`; see Troubleshooting). |
 | `ffmpeg_cpu_seconds_total{id}`, `ffmpeg_memory_rss_bytes{id}` | per stream | Resource use of the ffmpeg children |
 | `uploads_total{result}`, `upload_bytes_total`, `upload_duration_seconds` (histogram 1 s – 1 h), `uploads_pending`, `upload_pending_bytes`, `uploads_in_progress`, `uploads_blocked`, `upload_oldest_pending_age_seconds`, `recordings_failed` | | Upload pipeline |
 | `recordings_on_disk_bytes`, `disk_free_bytes{path}`, `disk_used_percent{path}`, `disk_low` | gauge | Local storage |
@@ -458,7 +520,9 @@ server, Prometheus rules, Grafana dashboard).
 | Symptom | Where to look |
 |---|---|
 | Recording never starts | `/api/schedule` → is the item valid (`info.invalidItems`)? Is `now` inside `start−startEarly … end+stopLate`? `recorder_recordings_skipped_total{reason}` (disk low, max recordings). |
-| `ffmpegRunning: false`, `restarts` climbing | `lastError` / `lastStderr` in `/api/recordings` (404s, DNS, `matches no streams` = not an audio stream, `not in allowed_segment_extensions` = unusual HLS segment names — handled automatically on ffmpeg ≥ 7.1). |
+| `ffmpegRunning: false`, `restarts` climbing | `lastError` / `lastStderr` in `/api/recordings` (404s, DNS, `matches no streams` = not an audio stream, `not in allowed_segment_extensions` = unusual HLS segment names — handled automatically on ffmpeg ≥ 7.1). Also see `recordLastError` and `exits[].reason` (survive the upload). |
+| `restarts` climbing with `exits[].reason = demux-error` | The origin returned 5xx or timed out on a live-playlist reload. ffmpeg retries a failed reload exactly once and then exits 0 (logging a trailing `[error] Error during demuxing`), so the supervisor restarts. `-reconnect*` options do **not** apply to segment/reload requests, so they cannot help here. Fixes: ask the origin to stop returning 5xx on reloads, and raise `hls_list_size` on the origin to a 30–60 s DVR window so a single failed reload is not fatal. |
+| `Found duplicated MOOV Atom. Skipped it` in ffmpeg output | Benign. With fMP4/CMAF live HLS the ffmpeg hls demuxer re-fetches and re-pushes `init.mp4` before every segment (~every 5 s) and the mov reader warns about the second moov; timing comes from `moof`/`tfdt`, so nothing is lost for copy or transcode. The recorder filters it out of `lastStderr`/`lastError` and counts it in `recorder_ffmpeg_stderr_suppressed_total{reason="duplicate_moov"}`. No ffmpeg option suppresses it; the only way to remove it at the source is an MPEG-TS segmenter (`-hls_segment_type mpegts`) on the origin. |
 | File grows but upload never happens | Uploads happen only after the window closes. Then check `uploads.blocked`, `lastError` (`AccessDenied`, `NoSuchBucket` …), `recorder_upload_oldest_pending_age_seconds`. |
 | `/readyz` 503 | No schedule loaded yet (URL unreachable and no cache), disk below `MIN_FREE_DISK`, or shutting down. |
 | Recording stopped unexpectedly | `finishReason`: `ended` (end passed — check `end`/`stopLate`), `removed` (item absent from a successful fetch), `rotated` (`MAX_SESSION_DURATION`). |

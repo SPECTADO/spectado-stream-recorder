@@ -66,6 +66,10 @@ type Config struct {
 	FFmpegStderrLog         string // warn | debug | off
 	FFmpegTLSVerify         bool   // verify TLS certificates of stream sources
 
+	// Real-world clock embedding.
+	ClockID3Interval time.Duration // in-band ID3 wall-clock tag cadence (0 disables)
+	ClockPDTLookup   bool          // read the source playlist's PDT to anchor each run
+
 	// Lifecycle / monitoring / logging.
 	ShutdownTimeout time.Duration
 	SysmonInterval  time.Duration
@@ -126,6 +130,9 @@ func Load() (*Config, error) {
 	c.FFmpegStderrLog = strings.ToLower(envString("FFMPEG_STDERR_LOG", "warn"))
 	c.FFmpegTLSVerify = envBool(&errs, "FFMPEG_TLS_VERIFY", false)
 
+	c.ClockID3Interval = envDuration(&errs, "CLOCK_ID3_INTERVAL", 10*time.Second)
+	c.ClockPDTLookup = envBool(&errs, "CLOCK_PDT_LOOKUP", true)
+
 	c.ShutdownTimeout = envDuration(&errs, "SHUTDOWN_TIMEOUT", 45*time.Second)
 	c.SysmonInterval = envDuration(&errs, "SYSMON_INTERVAL", 10*time.Second)
 	c.LogLevel = strings.ToLower(envString("LOG_LEVEL", "info"))
@@ -177,6 +184,9 @@ func Load() (*Config, error) {
 	}
 	if c.FFmpegStopGrace < time.Second {
 		errs = append(errs, errors.New("FFMPEG_STOP_GRACE must be at least 1s"))
+	}
+	if c.ClockID3Interval != 0 && c.ClockID3Interval < time.Second {
+		errs = append(errs, errors.New("CLOCK_ID3_INTERVAL must be 0 (disabled) or at least 1s"))
 	}
 	if c.ProbeConcurrency < 1 {
 		errs = append(errs, errors.New("PROBE_CONCURRENCY must be >= 1"))

@@ -20,6 +20,7 @@ var envKeys = []string{
 	"FFMPEG_PATH", "FFPROBE_PATH", "FFPROBE_TIMEOUT", "PROBE_CONCURRENCY", "AUDIO_CODEC", "AUDIO_BITRATE",
 	"FFMPEG_USER_AGENT", "FFMPEG_RW_TIMEOUT", "FFMPEG_STALL_TIMEOUT", "FFMPEG_RESTART_BACKOFF_MIN",
 	"FFMPEG_RESTART_BACKOFF_MAX", "FFMPEG_STOP_GRACE", "FFMPEG_STDERR_LOG", "FFMPEG_TLS_VERIFY",
+	"CLOCK_ID3_INTERVAL", "CLOCK_PDT_LOOKUP",
 	"SHUTDOWN_TIMEOUT", "SYSMON_INTERVAL", "LOG_LEVEL", "LOG_FORMAT",
 }
 
@@ -135,6 +136,8 @@ func TestLoad_Defaults(t *testing.T) {
 		{"FFmpegStopGrace", c.FFmpegStopGrace, 5 * time.Second},
 		{"FFmpegStderrLog", c.FFmpegStderrLog, "warn"},
 		{"FFmpegTLSVerify", c.FFmpegTLSVerify, false},
+		{"ClockID3Interval", c.ClockID3Interval, 10 * time.Second},
+		{"ClockPDTLookup", c.ClockPDTLookup, true},
 		{"ShutdownTimeout", c.ShutdownTimeout, 45 * time.Second},
 		{"SysmonInterval", c.SysmonInterval, 10 * time.Second},
 		{"LogLevel", c.LogLevel, "info"},
@@ -269,6 +272,9 @@ func TestLoad_InvalidValues(t *testing.T) {
 		{"FFMPEG_STOP_GRACE", "0", "FFMPEG_STOP_GRACE must be at least 1s"},
 		{"FFMPEG_RESTART_BACKOFF_MIN", "0", "FFMPEG_RESTART_BACKOFF_MIN/MAX must be positive and MIN <= MAX"},
 		{"FFMPEG_RESTART_BACKOFF_MAX", "500ms", "FFMPEG_RESTART_BACKOFF_MIN/MAX must be positive and MIN <= MAX"},
+		{"CLOCK_ID3_INTERVAL", "500ms", "CLOCK_ID3_INTERVAL must be 0 (disabled) or at least 1s"},
+		{"CLOCK_ID3_INTERVAL", "nope", `CLOCK_ID3_INTERVAL: invalid duration "nope"`},
+		{"CLOCK_PDT_LOOKUP", "maybe", `CLOCK_PDT_LOOKUP: invalid boolean "maybe"`},
 		{"PROBE_CONCURRENCY", "0", "PROBE_CONCURRENCY must be >= 1"},
 		{"RECORD_START_EARLY", "-5s", "RECORD_START_EARLY and RECORD_STOP_LATE must not be negative"},
 		{"RECORD_STOP_LATE", "-1", "RECORD_START_EARLY and RECORD_STOP_LATE must not be negative"},
@@ -376,6 +382,21 @@ func TestLoad_ValuesAndNormalization(t *testing.T) {
 	}
 	if c.DataDir != "/var/lib/recorder" || c.HTTPAddr != "127.0.0.1:9090" {
 		t.Errorf("DataDir %q HTTPAddr %q", c.DataDir, c.HTTPAddr)
+	}
+}
+
+func TestLoad_ClockKeys(t *testing.T) {
+	setEnv(t, localEnv(map[string]string{"CLOCK_ID3_INTERVAL": "0", "CLOCK_PDT_LOOKUP": "false"}))
+	c := mustLoad(t)
+	if c.ClockID3Interval != 0 {
+		t.Errorf("ClockID3Interval = %v, want 0 (disabled)", c.ClockID3Interval)
+	}
+	if c.ClockPDTLookup {
+		t.Error("ClockPDTLookup = true, want false")
+	}
+	setEnv(t, localEnv(map[string]string{"CLOCK_ID3_INTERVAL": "30s"}))
+	if c := mustLoad(t); c.ClockID3Interval != 30*time.Second || !c.ClockPDTLookup {
+		t.Errorf("ClockID3Interval = %v ClockPDTLookup = %v", c.ClockID3Interval, c.ClockPDTLookup)
 	}
 }
 

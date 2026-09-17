@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/spectado/stream-recorder/internal/id3"
 )
 
 const (
@@ -147,6 +149,24 @@ func walk(tail []byte, start int) (complete int, partialStart int, valid bool) {
 	q := start
 	for q < len(tail) {
 		rest := tail[q:]
+		// A well-formed ID3v2 tag continues the chain (the recorder writes tags
+		// between frames): skip it so a tag near the end does not block trimming
+		// a partial frame after it, and a file ending exactly after a tag is
+		// clean. A truncated tag at the end is itself the trailing partial.
+		if len(rest) >= 3 && rest[0] == 'I' && rest[1] == 'D' && rest[2] == '3' {
+			if len(rest) < 10 {
+				return complete, q, true // partial tag header at the end
+			}
+			n, ok := id3.TagLen(rest)
+			if !ok {
+				return 0, -1, false // "ID3" prefix but not a valid tag: chain broken
+			}
+			if n > len(rest) {
+				return complete, q, true // incomplete tag at the end
+			}
+			q += n
+			continue
+		}
 		if len(rest) < minHeader {
 			// Truncated header: a partial frame if the visible bytes are
 			// consistent with an ADTS header, otherwise garbage.

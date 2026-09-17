@@ -1,6 +1,7 @@
 package recorder
 
 import (
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -102,6 +103,139 @@ func TestStderrBufferTailAndRateLimit(t *testing.T) {
 	_, _ = b2.Write([]byte("def\nsecond\r\n"))
 	if tail := b2.Tail(); len(tail) != 2 || !strings.HasSuffix(tail[0], "abcdef") || !strings.HasSuffix(tail[1], "second") {
 		t.Fatalf("tail=%v", tail)
+	}
+}
+
+func TestStderrBufferBenignFilterAndErrorLine(t *testing.T) {
+	var logged []string
+	var suppressedReasons []string
+	b := newStderrBuffer("warn", func(_ slog.Level, l string) { logged = append(logged, l) })
+	b.onSuppressed = func(reason string) { suppressedReasons = append(suppressedReasons, reason) }
+
+	// A benign MOOV line (with an ffmpeg level tag) is dropped: not in the tail,
+	// not in Last, counted, and the hook fires with the reason.
+	_, _ = b.Write([]byte("[mov,mp4,m4a @ 0x1] [warning] Found duplicated MOOV Atom. Skipped it\n"))
+	// A real error line is kept and remembered as the run's error line.
+	_, _ = b.Write([]byte("[error] Error during demuxing: Server returned 500\n"))
+	// Another benign line after the error must not overwrite Last/LastErrorLine.
+	_, _ = b.Write([]byte("[warning] Found duplicated MOOV Atom. Skipped it\n"))
+
+	for _, l := range b.Tail() {
+		if strings.Contains(l, "MOOV") {
+			t.Fatalf("benign line leaked into tail: %v", b.Tail())
+		}
+	}
+	if got := b.Last(); got != "Error during demuxing: Server returned 500" {
+		t.Fatalf("Last()=%q", got)
+	}
+	if got := b.LastErrorLine(); got != "Error during demuxing: Server returned 500" {
+		t.Fatalf("LastErrorLine()=%q", got)
+	}
+	if got := b.suppressedRun(); got != 2 {
+		t.Fatalf("suppressedRun()=%d, want 2", got)
+	}
+	if len(suppressedReasons) != 2 || suppressedReasons[0] != "duplicate_moov" {
+		t.Fatalf("hook reasons=%v", suppressedReasons)
+	}
+	// Benign lines are not logged in warn mode; the error line is (within budget).
+	for _, l := range logged {
+		if strings.Contains(l, "MOOV") {
+			t.Fatalf("benign line was logged in warn mode: %v", logged)
+		}
+	}
+
+	// resetRun clears the per-run counter and error line but keeps the tail/Last.
+	b.resetRun()
+	if b.suppressedRun() != 0 || b.LastErrorLine() != "" {
+		t.Fatalf("resetRun did not clear: suppressed=%d errorLine=%q", b.suppressedRun(), b.LastErrorLine())
+	}
+	if b.Last() != "Error during demuxing: Server returned 500" {
+		t.Fatalf("resetRun must not clear Last(): %q", b.Last())
+	}
+
+	// In debug mode a benign line is still logged (at Debug) but stays out of tail/Last.
+	var dbg []string
+	d := newStderrBuffer("debug", func(_ slog.Level, l string) { dbg = append(dbg, l) })
+	_, _ = d.Write([]byte("[warning] Found duplicated MOOV Atom. Skipped it\n"))
+	if len(dbg) != 1 || !strings.Contains(dbg[0], "MOOV") {
+		t.Fatalf("debug mode should log the benign line: %v", dbg)
+	}
+	if len(d.Tail()) != 0 || d.Last() != "" {
+		t.Fatalf("debug mode must keep benign lines out of tail/Last: tail=%v last=%q", d.Tail(), d.Last())
+	}
+	if d.suppressedRun() != 1 {
+		t.Fatalf("debug mode must still count suppressed: %d", d.suppressedRun())
+	}
+}
+
+func TestClassifyExit(t *testing.T) {
+	exit := errors.New("exit status 1")
+	write := errors.New("no space")
+	cases := []struct {
+		name                          string
+		runErr, werr                  error
+		diskFull, killed, stallKilled bool
+		errorLine                     string
+		want                          string
+	}{
+		{"disk-full wins", exit, write, true, false, false, "", "disk-full"},
+		{"write-error", exit, write, false, false, false, "", "write-error"},
+		{"stall beats killed", exit, nil, false, true, true, "", "stall"},
+		{"killed not ours", exit, nil, false, true, false, "", "killed"},
+		{"exit-error beats demux", exit, nil, false, false, false, "Error during demuxing: x", "exit-error"},
+		{"demux-error on exit 0", nil, nil, false, false, false, "[some] Error during demuxing: x", "demux-error"},
+		{"stream-ended", nil, nil, false, false, false, "", "stream-ended"},
+		{"stream-ended ignores non-demux error line", nil, nil, false, false, false, "unrelated error", "stream-ended"},
+	}
+	for _, c := range cases {
+		if got := classifyExit(c.runErr, c.werr, c.diskFull, c.killed, c.stallKilled, c.errorLine); got != c.want {
+			t.Errorf("%s: classifyExit = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestNextBackoff(t *testing.T) {
+	min, max := time.Second, 30*time.Second
+	// Consecutive short runs double up to the cap: 1,2,4,8,16,30,30.
+	cur := min
+	want := []time.Duration{1, 2, 4, 8, 16, 30, 30}
+	for i, w := range want {
+		wait, next := nextBackoff(cur, min, max, time.Second /* short run */)
+		if wait != time.Duration(w)*time.Second {
+			t.Fatalf("step %d: wait=%s want %ds", i, wait, w)
+		}
+		cur = next
+	}
+	// A run longer than a minute resets the sequence to min regardless of cur.
+	wait, next := nextBackoff(max, min, max, 2*time.Minute)
+	if wait != min || next != 2*time.Second {
+		t.Fatalf("long run reset: wait=%s next=%s", wait, next)
+	}
+}
+
+func TestExitReasonsSummary(t *testing.T) {
+	if got := exitReasonsSummary(nil); got != "" {
+		t.Fatalf("empty exits should yield empty string, got %q", got)
+	}
+	exits := []RunExit{
+		{Reason: "stream-ended"}, {Reason: "demux-error"}, {Reason: "demux-error"}, {Reason: "demux-error"},
+	}
+	if got := exitReasonsSummary(exits); got != "demux-error=3,stream-ended=1" {
+		t.Fatalf("summary=%q", got)
+	}
+}
+
+func TestSessionAddExitBounded(t *testing.T) {
+	s := &Session{}
+	for i := 0; i < maxExits+5; i++ {
+		s.addExit(RunExit{Bytes: int64(i)})
+	}
+	if len(s.Exits) != maxExits {
+		t.Fatalf("len(Exits)=%d, want %d", len(s.Exits), maxExits)
+	}
+	// Oldest dropped: the first kept entry is index 5 (Bytes==5).
+	if s.Exits[0].Bytes != 5 {
+		t.Fatalf("oldest not dropped: first Bytes=%d", s.Exits[0].Bytes)
 	}
 }
 

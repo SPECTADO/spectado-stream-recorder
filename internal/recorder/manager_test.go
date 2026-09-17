@@ -45,6 +45,35 @@ done
 	return p
 }
 
+// flakyFFmpeg writes a script that exits 0 with a trailing "Error during
+// demuxing" line (a transient live-reload failure -> reason "demux-error") its
+// first `fails` invocations, then streams bytes like the healthy fake. A
+// counter file in dir makes the runs deterministic and sequential.
+func flakyFFmpeg(t *testing.T, dir string, fails int) string {
+	t.Helper()
+	counter := filepath.Join(dir, "flaky-runs.count")
+	body := fmt.Sprintf(`#!/bin/sh
+trap 'exit 0' INT TERM
+c=%q
+n=$(cat "$c" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$c"
+if [ "$n" -le %d ]; then
+  echo '[error] Error during demuxing: boom' >&2
+  exit 0
+fi
+while :; do
+  printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+  sleep 0.05
+done
+`, counter, fails)
+	p := filepath.Join(dir, "ffmpeg-flaky.sh")
+	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 type uploadCall struct {
 	path, key string
 	size      int64
@@ -279,6 +308,10 @@ func TestStartRecordEndUpload(t *testing.T) {
 	}
 	if got := up.calls[0].meta["duration-seconds"]; got == "" {
 		t.Fatalf("duration missing from object metadata: %v", up.calls[0].meta)
+	}
+	// A clean single run never restarted, so the exit-reasons key is omitted.
+	if got, ok := up.calls[0].meta["ffmpeg-exit-reasons"]; ok {
+		t.Fatalf("ffmpeg-exit-reasons should be absent for a clean run, got %q", got)
 	}
 	pl := up.object(wantPlaylist)
 	if !strings.HasPrefix(pl, "#EXTM3U\n") || !strings.Contains(pl, "#EXTINF:") || !strings.Contains(pl, "\n"+sid+".aac\n") ||
@@ -554,7 +587,9 @@ func TestResumeFromSidecarWithoutSchedule(t *testing.T) {
 		ID: "radio", SafeID: "radio", SessionID: "radio_20260101T000000Z", Source: "http://example.invalid/x",
 		Start: now.Add(-time.Hour), End: now.Add(time.Hour), Key: "radio/x.aac", Codec: "aac", ResolvedCodec: "aac",
 		SessionStart: now.Add(-time.Hour), State: StateRecording, Bytes: 5,
-		dir: filepath.Join(dir, "recordings", "radio"),
+		Restarts: 2, RecordLastError: "ffmpeg exited after 1s: exit status 1 | boom",
+		Exits: []RunExit{{Reason: "demux-error"}, {Reason: "exit-error"}},
+		dir:   filepath.Join(dir, "recordings", "radio"),
 	}
 	if err := s.save(); err != nil {
 		t.Fatal(err)
@@ -576,6 +611,11 @@ func TestResumeFromSidecarWithoutSchedule(t *testing.T) {
 	}
 	if !ar.recovered || ar.bytes.Load() != 5 {
 		t.Fatalf("recovered=%v bytes=%d", ar.recovered, ar.bytes.Load())
+	}
+	// Recover must reconstruct an active session with its pre-existing exit
+	// history intact (the sidecar is the record of why it flapped so far).
+	if len(ar.s.Exits) != 2 || ar.s.Exits[0].Reason != "demux-error" || ar.s.RecordLastError == "" {
+		t.Fatalf("recover lost exit history: exits=%+v recordLastError=%q", ar.s.Exits, ar.s.RecordLastError)
 	}
 	// No schedule loaded yet: the sidecar is the last known state -> resume.
 	m.Reconcile(time.Now())
@@ -754,9 +794,26 @@ func TestFFmpegFailureRestartsWithBackoff(t *testing.T) {
 	})
 	m.mu.Lock()
 	lastErr := ar.s.LastError
+	recErr := ar.s.RecordLastError
+	exits := append([]RunExit(nil), ar.s.Exits...)
 	m.mu.Unlock()
 	if !strings.Contains(lastErr, "fake ffmpeg failure") {
 		t.Fatalf("lastError = %q", lastErr)
+	}
+	// supervise must also populate the exit history and the upload-surviving
+	// RecordLastError (the whole point of A2), not just LastError.
+	if !strings.Contains(recErr, "fake ffmpeg failure") {
+		t.Fatalf("recordLastError = %q", recErr)
+	}
+	if len(exits) == 0 {
+		t.Fatal("supervise recorded no exits")
+	}
+	last := exits[len(exits)-1]
+	if last.Reason != "exit-error" {
+		t.Fatalf("last exit reason = %q, want exit-error (exit 1)", last.Reason)
+	}
+	if !strings.Contains(last.ErrorLine, "fake ffmpeg failure") {
+		t.Fatalf("last exit errorLine = %q", last.ErrorLine)
 	}
 	if m.FFmpegProcessCount() != 0 {
 		t.Fatal("no process should be counted while failing")
@@ -768,6 +825,121 @@ func TestFFmpegFailureRestartsWithBackoff(t *testing.T) {
 	views := m.Recordings()
 	if len(views) != 1 || views[0].State != StateRecording || views[0].Restarts < 3 {
 		t.Fatalf("views=%+v", views)
+	}
+	// The view exposes the classified exits for the active recording too.
+	if len(views[0].Exits) == 0 || views[0].Exits[len(views[0].Exits)-1].Reason != "exit-error" {
+		t.Fatalf("view exits = %+v", views[0].Exits)
+	}
+}
+
+// TestRestartedRecordingUploadsExitReasons covers the A2 upload wiring: a
+// recording that restarted before it settled carries its classified exit
+// history into the S3 object metadata and the API view.
+func TestRestartedRecordingUploadsExitReasons(t *testing.T) {
+	up := &fakeUploader{}
+	dir := t.TempDir()
+	ff := flakyFFmpeg(t, dir, 2) // two demux-error exits, then it streams
+	m := NewManager(testConfig(dir, ff), slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), up, "test")
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		m.Shutdown(ctx)
+	})
+	now := time.Now()
+	m.SetSchedule(sched(item("a", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("a")
+	if ar == nil {
+		t.Fatal("not started")
+	}
+	// Bytes only arrive on the third run, i.e. after both demux-error exits.
+	waitFor(t, 5*time.Second, "bytes after restarts", func() bool { return ar.bytes.Load() > 0 })
+	sid := ar.s.SessionID
+
+	m.Reconcile(now.Add(2 * time.Hour))
+	m.settle()
+	if st, _ := m.sessionState(sid); st != StateUploaded {
+		t.Fatalf("state = %s", st)
+	}
+	if up.count() != 1 {
+		t.Fatalf("upload calls: %+v", up.calls)
+	}
+	if got := up.calls[0].meta["ffmpeg-exit-reasons"]; got != "demux-error=2" {
+		t.Fatalf("ffmpeg-exit-reasons = %q, want demux-error=2 (meta=%v)", got, up.calls[0].meta)
+	}
+	// exits[] is copied into the view for finished/uploaded sessions too.
+	views := m.Recordings()
+	if len(views) != 1 || len(views[0].Exits) != 2 || views[0].Exits[0].Reason != "demux-error" {
+		t.Fatalf("view exits after upload = %+v", views)
+	}
+}
+
+// TestSpawnFailureClassifiedAsExitError covers the classification of a run that
+// never started (fork/exec failure): it is an exit-error, and the stall flag
+// must never leak in from a previous run and mislabel it "stall".
+func TestSpawnFailureClassifiedAsExitError(t *testing.T) {
+	up := &fakeUploader{}
+	dir := t.TempDir()
+	cfg := testConfig(dir, filepath.Join(dir, "no-such-ffmpeg"))
+	m := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), up, "test")
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		m.Shutdown(ctx)
+	})
+	now := time.Now()
+	m.SetSchedule(sched(item("a", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("a")
+	if ar == nil {
+		t.Fatal("not started")
+	}
+	waitFor(t, 5*time.Second, "exit recorded after spawn failure", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return len(ar.s.Exits) >= 1
+	})
+	m.mu.Lock()
+	exits := append([]RunExit(nil), ar.s.Exits...)
+	m.mu.Unlock()
+	for i, e := range exits {
+		if e.Reason != "exit-error" {
+			t.Fatalf("exit %d classified %q, want exit-error", i, e.Reason)
+		}
+	}
+	if ar.stallKilled.Load() {
+		t.Fatal("stallKilled must stay false for a spawn failure")
+	}
+}
+
+// TestRecordingsViewExposesSuppressedAndRedactsRecordError covers the remaining
+// A2 view surface: StderrSuppressed for an active recording and redaction of
+// RecordLastError.
+func TestRecordingsViewExposesSuppressedAndRedactsRecordError(t *testing.T) {
+	m, _ := newTestManager(t, &fakeUploader{})
+	now := time.Now()
+	m.SetSchedule(sched(item("a", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("a")
+	if ar == nil {
+		t.Fatal("not started")
+	}
+	// Wait until the run is under way so supervise's start-of-run resetRun() has
+	// already fired; the healthy fake never restarts, so the per-run counter is
+	// then stable for the rest of the test.
+	waitFor(t, 5*time.Second, "ffmpeg running", func() bool { return ar.running.Load() })
+	// A benign MOOV line is dropped but counted; the view surfaces the count.
+	_, _ = ar.stderr.Write([]byte("[warning] Found duplicated MOOV Atom. Skipped it\n"))
+	m.mu.Lock()
+	ar.s.RecordLastError = "ffmpeg exited: reload of https://cdn/live.m3u8?token=SECRET failed"
+	m.mu.Unlock()
+
+	views := m.Recordings()
+	if len(views) != 1 {
+		t.Fatalf("views=%d", len(views))
+	}
+	if views[0].StderrSuppressed != 1 {
+		t.Fatalf("stderrSuppressed = %d, want 1", views[0].StderrSuppressed)
+	}
+	if strings.Contains(views[0].RecordLastError, "SECRET") || views[0].RecordLastError == "" {
+		t.Fatalf("recordLastError not redacted: %q", views[0].RecordLastError)
 	}
 }
 
@@ -861,6 +1033,29 @@ func TestPollerKeepsLastKnownScheduleOnFailure(t *testing.T) {
 	m2.mu.Unlock()
 	if ok, _ := m2.Ready(); !ok {
 		t.Fatal("manager with cached schedule should be ready")
+	}
+}
+
+func TestLoadSessionOldSidecarZeroValues(t *testing.T) {
+	// A sidecar written before Chunk A has no exits/recordLastError; it must load
+	// cleanly with zero values so Recover() keeps working across upgrades.
+	dir := t.TempDir()
+	old := `{"schemaVersion":1,"id":"radio-1","safeId":"radio-1","sessionId":"radio-1_20260101T000000Z",` +
+		`"source":"https://x/live.m3u8","start":"2026-01-01T00:00:00Z","end":"2026-01-01T01:00:00Z",` +
+		`"state":"finalized","bytes":123,"restarts":2,"codec":"auto"}`
+	p := filepath.Join(dir, "radio-1_20260101T000000Z.json")
+	if err := os.WriteFile(p, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := loadSession(p)
+	if err != nil {
+		t.Fatalf("loadSession: %v", err)
+	}
+	if s.Exits != nil || s.RecordLastError != "" {
+		t.Fatalf("old sidecar should yield zero values: exits=%v recordLastError=%q", s.Exits, s.RecordLastError)
+	}
+	if s.Restarts != 2 || s.Bytes != 123 {
+		t.Fatalf("existing fields lost: %+v", s)
 	}
 }
 
