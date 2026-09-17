@@ -226,7 +226,11 @@ func (ar *activeRecording) beginRun(anchor time.Time, source string, mediaBefore
 }
 
 // openRunRecord appends the record for the run that just produced its first
-// frame. Runs that never produce audio leave no record.
+// frame. Runs that never produce audio leave no record. The record is persisted
+// immediately (not only on the next persist tick) so a crash within the first
+// persist interval keeps the run's offset and anchor durable: without it a lost
+// run 0 record would leave ScanRuns attributing the pre-crash audio to a run
+// whose offset is no longer 0, orphaning the leading segment (SPEC B5).
 func (m *Manager) openRunRecord(ar *activeRecording) {
 	ar.run.mu.Lock()
 	r := Run{
@@ -241,6 +245,7 @@ func (m *Manager) openRunRecord(ar *activeRecording) {
 	if ar.s.appendRun(r) {
 		m.log.Warn("run history reached the cap; coalescing oldest runs", "id", ar.s.ID, "session", ar.s.SessionID, "cap", maxRuns)
 	}
+	_ = ar.s.saveQuick()
 	m.mu.Unlock()
 }
 
