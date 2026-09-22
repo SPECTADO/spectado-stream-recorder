@@ -60,7 +60,23 @@ groups:
           severity: critical
         annotations:
           summary: "Free disk space below MIN_FREE_DISK"
-          description: "The recorder on {{ $labels.instance }} refuses to start new recordings because free space in DATA_DIR is below MIN_FREE_DISK."
+          description: "The recorder on {{ $labels.instance }} refuses to start new recordings because free space in DATA_DIR is below MIN_FREE_DISK. Low disk also blocks the remux/upload drain path (a remux needs room for its output, a merge also needs room for the downloaded remote object), so the upload backlog can grow while this fires."
+
+      - alert: RecordingObjectKeyRenamed
+        expr: increase(recorder_object_key_renames_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A recording was written to a second object (reason: {{ $labels.reason }})"
+          description: "{{ $value | printf \"%.0f\" }} key rename(s) in the last hour on {{ $labels.instance }} (reason={{ $labels.reason }}): part of a recording was not safe to merge into the existing object under its key and was uploaded under a -2/-3 suffixed key instead. Investigate before assuming a recording is complete under a single object."
+
+      - alert: RemuxFailures
+        expr: increase(recorder_remux_total{result="failure"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "ADTS to .m4a remux failed"
+          description: "{{ $value | printf \"%.0f\" }} remux failure(s) in the last 15 minutes on {{ $labels.instance }}. After 3 consecutive failures for the same object the recording is uploaded raw as a marked .aac fallback (recorder_upload_fallback_total) instead of being lost; check recordLastError / ffmpeg's stderr for the cause."
 
       - alert: DiskFullPredicted
         expr: predict_linear(recorder_disk_free_bytes[1h], 6 * 3600) < 0

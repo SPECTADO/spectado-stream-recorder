@@ -149,8 +149,9 @@ func walk(tail []byte, start int) (complete int, partialStart int, valid bool) {
 	q := start
 	for q < len(tail) {
 		rest := tail[q:]
-		// A well-formed ID3v2 tag continues the chain (the recorder writes tags
-		// between frames): skip it so a tag near the end does not block trimming
+		// A well-formed ID3v2 tag continues the chain (files captured before
+		// 1.1.0 may contain in-band ID3 tags; the scanner still skips them):
+		// skip it so a tag near the end does not block trimming
 		// a partial frame after it, and a file ending exactly after a tag is
 		// clean. A truncated tag at the end is itself the trailing partial.
 		if len(rest) >= 3 && rest[0] == 'I' && rest[1] == 'D' && rest[2] == '3' {

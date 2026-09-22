@@ -1,12 +1,16 @@
-// Package id3 writes and parses the minimal subset of ID3v2 the recorder needs
+// Package id3 writes and parses the minimal subset of ID3v2 the recorder used
 // to embed a wall clock in the ADTS/AAC stream between frames.
 //
-// The recorder inserts small ID3v2.4.0 tags between ADTS frames: an Apple
-// PRIV "transportStreamTimestamp" frame (what hls.js turns into basePTS) plus
-// two TXXX frames carrying the human-readable wall clock and its source. ffmpeg's
-// ADTS demuxer parses ID3 tags between frames (a metadata update event) and
-// hls.js attaches them without disturbing timing, so the tags are transparent to
-// both. The reader here is only rich enough for the tests and for skipping tags.
+// Before 1.1.0, the recorder inserted small ID3v2.4.0 tags between ADTS
+// frames: an Apple PRIV "transportStreamTimestamp" frame (what hls.js turned
+// into basePTS) plus two TXXX frames carrying the human-readable wall clock
+// and its source. These were removed in 1.1.0 because the in-band tags
+// perturbed raw-ADTS duration estimation and HLS players read the Apple PRIV
+// tag as a PTS base. TagLen/Parse remain in use: internal/adts uses them to
+// skip legacy tags in captures that were started before the upgrade and
+// resumed across it. Tag/AppleTimestamp/TXXX remain only to build
+// legacy-format fixtures in tests (internal/remux and internal/recorder tests
+// use them); do not use them for new writes.
 //
 // ID3v2 tag layout used:
 //

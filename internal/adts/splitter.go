@@ -4,9 +4,18 @@ import "github.com/spectado/stream-recorder/internal/id3"
 
 // Header describes one ADTS frame header.
 type Header struct {
-	SampleRate int // Hz
-	Blocks     int // number_of_raw_data_blocks + 1
-	Length     int // frame_length, header included
+	SampleRate      int // Hz
+	SampleRateIndex int // sampling_frequency_index (0..12)
+	Profile         int // profile_ObjectType: 0 Main, 1 LC, 2 SSR, 3 LTP
+	ChannelConfig   int // channel_configuration (0 = defined by an in-band PCE)
+	Blocks          int // number_of_raw_data_blocks + 1
+	Length          int // frame_length, header included
+}
+
+// Params returns the stream parameters carried by the header, i.e. everything
+// an MP4 sample description would have to describe.
+func (h Header) Params() Params {
+	return Params{Profile: h.Profile, SampleRateIndex: h.SampleRateIndex, SampleRate: h.SampleRate, ChannelConfig: h.ChannelConfig, Blocks: h.Blocks}
 }
 
 // Duration returns the playback time of the frame in seconds (1024 samples per
@@ -29,10 +38,16 @@ func ParseHeader(b []byte) (Header, bool) {
 	if !ok {
 		return Header{}, false
 	}
+	// Decoded by the same helper the scanners use per frame, so a Header and a
+	// Chunk can never disagree about a frame's parameters.
+	p := headerParams(b)
 	return Header{
-		SampleRate: sampleRates[(b[2]>>2)&0x0F],
-		Blocks:     int(b[6]&0x03) + 1,
-		Length:     frameLen,
+		SampleRate:      p.SampleRate,
+		SampleRateIndex: p.SampleRateIndex,
+		Profile:         p.Profile,
+		ChannelConfig:   p.ChannelConfig,
+		Blocks:          p.Blocks,
+		Length:          frameLen,
 	}, true
 }
 

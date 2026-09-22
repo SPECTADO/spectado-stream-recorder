@@ -64,6 +64,14 @@ type Metrics struct {
 	UploadOldestPendingAge prometheus.Gauge
 	UploadDuration         prometheus.Histogram
 	UploadRetriesTotal     prometheus.Counter
+	UploadMergesTotal      prometheus.Counter     // uploads that merged new audio into an existing object
+	UploadFallbackTotal    prometheus.Counter     // uploads that stored raw ADTS after repeated remux failures
+	ObjectKeyRenamesTotal  *prometheus.CounterVec // reason=conflict|out-of-order|parts-cap|no-conditional-writes|remux-failed
+
+	// Remux (ADTS -> .m4a, on the upload path and in kept mode).
+	RemuxTotal           *prometheus.CounterVec // result=success|failure|nospace
+	RemuxDuration        prometheus.Histogram
+	RemuxTranscodedTotal prometheus.Counter // remuxes that had to re-encode (stream parameters changed)
 
 	// System (host view via /proc, plus container cgroup view).
 	SysCPUPercent          prometheus.Gauge
@@ -204,6 +212,25 @@ func New(version string) *Metrics {
 	})
 	reg.MustRegister(m.UploadDuration)
 	m.UploadRetriesTotal = counter("upload_retries_total", "Upload attempts that were retried after a failure.")
+	m.UploadMergesTotal = counter("upload_merges_total", "Uploads that merged new sessions into an existing object.")
+	m.UploadFallbackTotal = counter("upload_fallback_total", "Uploads that stored the raw ADTS capture after repeated remux failures.")
+	m.ObjectKeyRenamesTotal = counterVec("object_key_renames_total", "Recordings written to a second object key, by reason.", "reason")
+	for _, r := range []string{"conflict", "out-of-order", "parts-cap", "no-conditional-writes", "remux-failed"} {
+		m.ObjectKeyRenamesTotal.WithLabelValues(r)
+	}
+
+	m.RemuxTotal = counterVec("remux_total", "ADTS-to-.m4a remuxes by result.", "result")
+	for _, r := range []string{"success", "failure", "nospace"} {
+		m.RemuxTotal.WithLabelValues(r)
+	}
+	// A 26 h capture remuxes in ~8 s on a developer machine, so the interesting
+	// range is seconds; the top buckets only have to catch a pathological host.
+	m.RemuxDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace, Name: "remux_duration_seconds", Help: "Duration of successful remuxes.",
+		Buckets: []float64{0.5, 1, 2.5, 5, 10, 20, 30, 60, 120, 300, 600},
+	})
+	reg.MustRegister(m.RemuxDuration)
+	m.RemuxTranscodedTotal = counter("remux_transcoded_total", "Remuxes that re-encoded because the stream parameters changed mid-capture.")
 
 	m.SysCPUPercent = gauge("host_cpu_percent", "Host-wide CPU utilisation percent as visible through /proc (not container-scoped).")
 	m.SysCPUCount = gauge("host_cpu_count", "Logical CPUs visible to the process.")

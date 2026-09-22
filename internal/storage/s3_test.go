@@ -1,7 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -452,60 +456,281 @@ func TestSanitizeKey(t *testing.T) {
 	}
 }
 
-// fakeBucket is a minimal S3 endpoint: PUT/GET/HEAD of whole objects under
-// /<bucket>/<key>, NoSuchKey on unknown keys and If-None-Match: * support.
+// ---------------------------------------------------------------------------
+// fakeBucket: an S3 endpoint with the pieces the recorder depends on
+// ---------------------------------------------------------------------------
+
+type fakeObject struct {
+	data        []byte
+	meta        map[string]string
+	contentType string
+	etag        string // without quotes, as ObjectInfo carries it
+}
+
+type fakeUpload struct {
+	key         string
+	meta        map[string]string
+	contentType string
+	parts       map[int][]byte
+}
+
+// fakeBucket is a small S3 endpoint under /bucket/<key>: whole-object
+// PUT/GET/HEAD/DELETE with user metadata and ETags, If-None-Match/If-Match
+// preconditions, ranged GETs (what manager.Downloader issues) and the
+// multipart trio the conditional-write probe exercises.
 type fakeBucket struct {
-	mu      sync.Mutex
-	objects map[string][]byte
-	puts    int
+	mu       sync.Mutex
+	objects  map[string]*fakeObject
+	uploads  map[string]*fakeUpload
+	puts     int // object-creating PUTs (parts do not count)
+	requests int
+	seq      int // makes every stored version's ETag unique
+
+	// ignoreIfMatch models an endpoint that accepts If-Match and silently
+	// stores the object anyway — the reason ConditionalWrites exists.
+	ignoreIfMatch bool
+	// ignoreCompleteIfMatch models the subtler half of that: preconditions
+	// work on PutObject but are dropped on CompleteMultipartUpload, which is
+	// the path every recording above UPLOAD_PART_SIZE takes.
+	ignoreCompleteIfMatch bool
 }
 
 func (b *fakeBucket) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key := strings.TrimPrefix(r.URL.Path, "/bucket/")
+	q := r.URL.Query()
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	switch r.Method {
-	case http.MethodPut:
-		if r.Header.Get("If-None-Match") == "*" {
-			if _, exists := b.objects[key]; exists {
-				w.WriteHeader(http.StatusPreconditionFailed)
-				fmt.Fprint(w, `<Error><Code>PreconditionFailed</Code><Message>exists</Message></Error>`)
-				return
-			}
+	b.requests++
+
+	switch {
+	case r.Method == http.MethodPost && q.Has("uploads"):
+		b.seq++
+		id := fmt.Sprintf("upload-%d", b.seq)
+		b.uploads[id] = &fakeUpload{
+			key: key, meta: metaHeaders(r), contentType: r.Header.Get("Content-Type"),
+			parts: map[int][]byte{},
 		}
-		data, _ := io.ReadAll(r.Body)
-		b.objects[key] = data
-		b.puts++
-		w.Header().Set("ETag", `"etag-`+key+`"`)
-		w.WriteHeader(http.StatusOK)
-	case http.MethodHead, http.MethodGet:
-		data, ok := b.objects[key]
+		writeXML(w, http.StatusOK, fmt.Sprintf(
+			`<InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>%s</Key><UploadId>%s</UploadId></InitiateMultipartUploadResult>`, key, id))
+
+	case r.Method == http.MethodPut && q.Get("uploadId") != "":
+		u, ok := b.uploads[q.Get("uploadId")]
 		if !ok {
-			w.Header().Set("Content-Type", "application/xml")
-			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprint(w, `<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>`)
+			writeS3Error(w, http.StatusNotFound, "NoSuchUpload")
 			return
 		}
-		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		n, _ := strconv.Atoi(q.Get("partNumber"))
+		data, _ := io.ReadAll(r.Body)
+		u.parts[n] = data
+		w.Header().Set("ETag", fmt.Sprintf(`"part-%d"`, n))
 		w.WriteHeader(http.StatusOK)
+
+	case r.Method == http.MethodPost && q.Get("uploadId") != "":
+		id := q.Get("uploadId")
+		u, ok := b.uploads[id]
+		if !ok {
+			writeS3Error(w, http.StatusNotFound, "NoSuchUpload")
+			return
+		}
+		_, _ = io.ReadAll(r.Body) // the part list; the parts are already here
+		if !b.ignoreCompleteIfMatch && !b.precondition(w, r, key) {
+			return // the upload stays open so the client can abort it
+		}
+		delete(b.uploads, id)
+		nums := make([]int, 0, len(u.parts))
+		for n := range u.parts {
+			nums = append(nums, n)
+		}
+		sort.Ints(nums)
+		var body []byte
+		for _, n := range nums {
+			body = append(body, u.parts[n]...)
+		}
+		obj := b.store(key, body, u.meta, u.contentType)
+		b.puts++
+		writeXML(w, http.StatusOK, fmt.Sprintf(
+			`<CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key>%s</Key><ETag>&quot;%s&quot;</ETag></CompleteMultipartUploadResult>`, key, obj.etag))
+
+	case r.Method == http.MethodDelete && q.Get("uploadId") != "":
+		delete(b.uploads, q.Get("uploadId"))
+		w.WriteHeader(http.StatusNoContent)
+
+	case r.Method == http.MethodDelete:
+		delete(b.objects, key)
+		w.WriteHeader(http.StatusNoContent)
+
+	case r.Method == http.MethodPut:
+		if !b.precondition(w, r, key) {
+			return
+		}
+		data, _ := io.ReadAll(r.Body)
+		obj := b.store(key, data, metaHeaders(r), r.Header.Get("Content-Type"))
+		b.puts++
+		w.Header().Set("ETag", `"`+obj.etag+`"`)
+		w.WriteHeader(http.StatusOK)
+
+	case r.Method == http.MethodHead, r.Method == http.MethodGet:
+		obj, ok := b.objects[key]
+		if !ok {
+			writeS3Error(w, http.StatusNotFound, "NoSuchKey")
+			return
+		}
+		if im := r.Header.Get("If-Match"); im != "" && im != `"`+obj.etag+`"` {
+			writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+			return
+		}
+		w.Header().Set("ETag", `"`+obj.etag+`"`)
+		if obj.contentType != "" {
+			w.Header().Set("Content-Type", obj.contentType)
+		}
+		for k, v := range obj.meta {
+			w.Header().Set("x-amz-meta-"+k, v)
+		}
+		data := obj.data
+		status := http.StatusOK
+		if rng := r.Header.Get("Range"); rng != "" && r.Method == http.MethodGet {
+			start, end, ok := parseByteRange(rng, len(obj.data))
+			if !ok {
+				writeS3Error(w, http.StatusRequestedRangeNotSatisfiable, "InvalidRange")
+				return
+			}
+			data = obj.data[start : end+1]
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(obj.data)))
+			status = http.StatusPartialContent
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.WriteHeader(status)
 		if r.Method == http.MethodGet {
 			_, _ = w.Write(data)
 		}
+
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
+// precondition applies If-None-Match/If-Match; it answers 412 and reports
+// false when the request must not store anything.
+func (b *fakeBucket) precondition(w http.ResponseWriter, r *http.Request, key string) bool {
+	obj, exists := b.objects[key]
+	if r.Header.Get("If-None-Match") == "*" && exists {
+		writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+		return false
+	}
+	if im := r.Header.Get("If-Match"); im != "" && !b.ignoreIfMatch {
+		if !exists || im != `"`+obj.etag+`"` {
+			writeS3Error(w, http.StatusPreconditionFailed, "PreconditionFailed")
+			return false
+		}
+	}
+	return true
+}
+
+func (b *fakeBucket) store(key string, data []byte, meta map[string]string, contentType string) *fakeObject {
+	b.seq++
+	obj := &fakeObject{data: data, meta: meta, contentType: contentType, etag: fmt.Sprintf("etag-%d", b.seq)}
+	b.objects[key] = obj
+	return obj
+}
+
+func (b *fakeBucket) object(key string) (*fakeObject, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	obj, ok := b.objects[key]
+	return obj, ok
+}
+
+func (b *fakeBucket) keys() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]string, 0, len(b.objects))
+	for k := range b.objects {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (b *fakeBucket) stats() (puts, requests, uploads int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.puts, b.requests, len(b.uploads)
+}
+
+func metaHeaders(r *http.Request) map[string]string {
+	var out map[string]string
+	for k, v := range r.Header {
+		if len(v) == 0 || !strings.HasPrefix(strings.ToLower(k), "x-amz-meta-") {
+			continue
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		out[strings.ToLower(strings.TrimPrefix(strings.ToLower(k), "x-amz-meta-"))] = v[0]
+	}
+	return out
+}
+
+// parseByteRange understands the "bytes=start-end" form the SDK's downloader
+// sends; end beyond the object is clamped, start beyond it is a 416.
+func parseByteRange(v string, size int) (start, end int, ok bool) {
+	spec, found := strings.CutPrefix(v, "bytes=")
+	if !found {
+		return 0, 0, false
+	}
+	lo, hi, found := strings.Cut(spec, "-")
+	if !found {
+		return 0, 0, false
+	}
+	start, err := strconv.Atoi(lo)
+	if err != nil || start >= size {
+		return 0, 0, false
+	}
+	end = size - 1
+	if hi != "" {
+		if end, err = strconv.Atoi(hi); err != nil {
+			return 0, 0, false
+		}
+		if end > size-1 {
+			end = size - 1
+		}
+	}
+	if end < start {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+func writeS3Error(w http.ResponseWriter, status int, code string) {
+	writeXML(w, status, fmt.Sprintf(`<Error><Code>%s</Code><Message>%s</Message></Error>`, code, code))
+}
+
+func writeXML(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(status)
+	fmt.Fprint(w, body)
+}
+
 func newTestS3(t *testing.T) (*S3, *fakeBucket) {
+	return newTestS3With(t, nil)
+}
+
+// newTestS3With lets a test shape the endpoint and the configuration before
+// the server accepts anything (nothing may race with a live handler).
+func newTestS3With(t *testing.T, setup func(*fakeBucket, *config.Config)) (*S3, *fakeBucket) {
 	t.Helper()
-	b := &fakeBucket{objects: map[string][]byte{}}
-	srv := httptest.NewServer(b)
-	t.Cleanup(srv.Close)
+	b := &fakeBucket{objects: map[string]*fakeObject{}, uploads: map[string]*fakeUpload{}}
 	cfg := &config.Config{
-		S3Endpoint: srv.URL, S3Region: "auto", S3Bucket: "bucket",
+		S3Region: "auto", S3Bucket: "bucket",
 		S3AccessKeyID: "k", S3SecretAccessKey: "s", S3ForcePathStyle: true,
 		S3ConditionalPut: true, UploadPartSize: 5 * 1024 * 1024,
 	}
+	if setup != nil {
+		setup(b, cfg)
+	}
+	srv := httptest.NewServer(b)
+	t.Cleanup(srv.Close)
+	cfg.S3Endpoint = srv.URL
 	s, err := NewS3(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -513,54 +738,326 @@ func newTestS3(t *testing.T) (*S3, *fakeBucket) {
 	return s, b
 }
 
-func TestPutGetObject(t *testing.T) {
-	s, b := newTestS3(t)
-	ctx := context.Background()
-
-	body, found, err := s.GetObject(ctx, "2026-09-03/x/index.m3u8")
-	if err != nil || found || body != nil {
-		t.Fatalf("missing object: body=%q found=%v err=%v", body, found, err)
-	}
-	if err := s.PutObject(ctx, "2026-09-03/x/index.m3u8", "application/vnd.apple.mpegurl", []byte("#EXTM3U\n")); err != nil {
+func writeFile(t *testing.T, path string, data []byte) string {
+	t.Helper()
+	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	body, found, err = s.GetObject(ctx, "2026-09-03/x/index.m3u8")
-	if err != nil || !found || string(body) != "#EXTM3U\n" {
-		t.Fatalf("after put: body=%q found=%v err=%v", body, found, err)
-	}
-	// Playlists are rewritten in place: no conditional put, no error.
-	if err := s.PutObject(ctx, "2026-09-03/x/index.m3u8", "application/vnd.apple.mpegurl", []byte("#EXTM3U\n#EXT-X-ENDLIST\n")); err != nil {
-		t.Fatal(err)
-	}
-	if got := string(b.objects["2026-09-03/x/index.m3u8"]); got != "#EXTM3U\n#EXT-X-ENDLIST\n" || b.puts != 2 {
-		t.Fatalf("stored=%q puts=%d", got, b.puts)
-	}
+	return path
 }
 
 func TestUploadVerifiesAndTreatsSameSizeConflictAsDone(t *testing.T) {
 	s, b := newTestS3(t)
 	ctx := context.Background()
-	p := filepath.Join(t.TempDir(), "a.aac")
-	if err := os.WriteFile(p, []byte("0123456789"), 0o644); err != nil {
-		t.Fatal(err)
+	p := filepath.Join(t.TempDir(), "a.m4a")
+	writeFile(t, p, []byte("0123456789"))
+
+	etag, err := s.Upload(ctx, p, "2026-09-03/x.m4a", "audio/mp4", map[string]string{"name": "x"}, "")
+	if err != nil {
+		t.Fatalf("upload: %v", err)
 	}
-	etag, err := s.Upload(ctx, p, "2026-09-03/x/a.aac", "audio/aac", map[string]string{"name": "x"})
-	if err != nil || etag != "etag-2026-09-03/x/a.aac" {
-		t.Fatalf("etag=%q err=%v", etag, err)
+	obj, ok := b.object("2026-09-03/x.m4a")
+	if !ok || etag != obj.etag || etag == "" {
+		t.Fatalf("etag=%q stored=%v", etag, ok)
 	}
 	// Second attempt (retry after a crash): the conditional put is refused,
 	// the sizes match, so the upload counts as done.
-	if _, err := s.Upload(ctx, p, "2026-09-03/x/a.aac", "audio/aac", nil); err != nil {
+	if _, err := s.Upload(ctx, p, "2026-09-03/x.m4a", "audio/mp4", nil, ""); err != nil {
 		t.Fatalf("retry with identical object: %v", err)
 	}
 	// A different object under the same key is a conflict.
-	if err := os.WriteFile(p, []byte("01234567890123"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Upload(ctx, p, "2026-09-03/x/a.aac", "audio/aac", nil); !errors.Is(err, recorder.ErrObjectExists) {
+	writeFile(t, p, []byte("01234567890123"))
+	if _, err := s.Upload(ctx, p, "2026-09-03/x.m4a", "audio/mp4", nil, ""); !errors.Is(err, recorder.ErrObjectExists) {
 		t.Fatalf("different object: err=%v, want ErrObjectExists", err)
 	}
-	if b.puts != 1 {
-		t.Fatalf("puts=%d, want 1", b.puts)
+	if puts, _, _ := b.stats(); puts != 1 {
+		t.Fatalf("puts=%d, want 1", puts)
+	}
+}
+
+func TestUploadReplaceWithIfMatch(t *testing.T) {
+	s, b := newTestS3(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	key := "2026-09-22/match-ro-jpOkle8Mp0.m4a"
+
+	first := writeFile(t, filepath.Join(dir, "first.m4a"), []byte("part-one"))
+	etag1, err := s.Upload(ctx, first, key, "audio/mp4", map[string]string{"parts": "1"}, "")
+	if err != nil {
+		t.Fatalf("first upload: %v", err)
+	}
+
+	// Merging: the second session replaces exactly the object the HEAD saw.
+	merged := writeFile(t, filepath.Join(dir, "merged.m4a"), []byte("part-one+part-two"))
+	etag2, err := s.Upload(ctx, merged, key, "audio/mp4", map[string]string{"parts": "2"}, etag1)
+	if err != nil {
+		t.Fatalf("replace with the current etag: %v", err)
+	}
+	if etag2 == "" || etag2 == etag1 {
+		t.Fatalf("etag after replace = %q (was %q)", etag2, etag1)
+	}
+	obj, _ := b.object(key)
+	if string(obj.data) != "part-one+part-two" || obj.meta["parts"] != "2" {
+		t.Fatalf("stored %q meta=%v", obj.data, obj.meta)
+	}
+
+	// A stale ETag means somebody else wrote the object in between.
+	if _, err := s.Upload(ctx, merged, key, "audio/mp4", nil, etag1); !errors.Is(err, recorder.ErrObjectChanged) {
+		t.Fatalf("stale etag: err=%v, want ErrObjectChanged", err)
+	}
+	if obj, _ := b.object(key); string(obj.data) != "part-one+part-two" {
+		t.Fatalf("a refused replace changed the object: %q", obj.data)
+	}
+
+	// A first (non-replacing) upload of a different object still reports the
+	// conflict rather than a changed object.
+	other := writeFile(t, filepath.Join(dir, "other.m4a"), []byte("something else entirely"))
+	if _, err := s.Upload(ctx, other, key, "audio/mp4", nil, ""); !errors.Is(err, recorder.ErrObjectExists) {
+		t.Fatalf("conditional put on a taken key: err=%v, want ErrObjectExists", err)
+	}
+}
+
+// TestUploadMultipartCarriesIfMatch covers the path a real recording takes:
+// above UPLOAD_PART_SIZE the SDK switches to multipart and the condition has
+// to reach CompleteMultipartUpload.
+func TestUploadMultipartCarriesIfMatch(t *testing.T) {
+	s, b := newTestS3(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	key := "2026-09-22/long.m4a"
+	big := writeFile(t, filepath.Join(dir, "big.m4a"), bytes.Repeat([]byte("a"), 6*1024*1024))
+
+	etag1, err := s.Upload(ctx, big, key, "audio/mp4", map[string]string{"parts": "1"}, "")
+	if err != nil {
+		t.Fatalf("multipart upload: %v", err)
+	}
+	bigger := writeFile(t, filepath.Join(dir, "bigger.m4a"), bytes.Repeat([]byte("b"), 7*1024*1024))
+	if _, err := s.Upload(ctx, bigger, key, "audio/mp4", nil, "etag-does-not-match"); !errors.Is(err, recorder.ErrObjectChanged) {
+		t.Fatalf("multipart replace with a stale etag: err=%v, want ErrObjectChanged", err)
+	}
+	if obj, _ := b.object(key); len(obj.data) != 6*1024*1024 {
+		t.Fatalf("refused multipart replace stored %d bytes", len(obj.data))
+	}
+	if _, _, uploads := b.stats(); uploads != 0 {
+		t.Fatalf("%d multipart uploads left dangling", uploads)
+	}
+	if _, err := s.Upload(ctx, bigger, key, "audio/mp4", nil, etag1); err != nil {
+		t.Fatalf("multipart replace with the current etag: %v", err)
+	}
+	if obj, _ := b.object(key); len(obj.data) != 7*1024*1024 {
+		t.Fatalf("after replace: %d bytes", len(obj.data))
+	}
+}
+
+func TestHeadAndDownload(t *testing.T) {
+	s, b := newTestS3(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	key := "2026-09-22/match-ro-jpOkle8Mp0.m4a"
+
+	if _, found, err := s.Head(ctx, key); found || err != nil {
+		t.Fatalf("head of a missing object: found=%v err=%v", found, err)
+	}
+
+	payload := bytes.Repeat([]byte("m4a"), 5000) // 15000 bytes, one ranged GET
+	src := writeFile(t, filepath.Join(dir, "src.m4a"), payload)
+	etag, err := s.Upload(ctx, src, key, "audio/mp4", map[string]string{
+		"recording-id": "match-ro-jpOkle8Mp0",
+		"sessions":     "a1b2c3d4,e5f60718",
+		"parts":        "2",
+		"name":         "Ranní show",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, found, err := s.Head(ctx, key)
+	if err != nil || !found {
+		t.Fatalf("head: found=%v err=%v", found, err)
+	}
+	if info.Size != int64(len(payload)) || info.ETag != etag || strings.Contains(info.ETag, `"`) {
+		t.Fatalf("head = %+v, want size %d etag %q unquoted", info, len(payload), etag)
+	}
+	if info.Metadata["recording-id"] != "match-ro-jpOkle8Mp0" || info.Metadata["sessions"] != "a1b2c3d4,e5f60718" ||
+		info.Metadata["parts"] != "2" {
+		t.Fatalf("metadata = %v", info.Metadata)
+	}
+	name, err := new(mime.WordDecoder).DecodeHeader(info.Metadata["name"])
+	if err != nil || name != "Ranní show" {
+		t.Fatalf("name = %q -> %q (%v)", info.Metadata["name"], name, err)
+	}
+
+	out := filepath.Join(dir, "got.m4a")
+	if err := s.Download(ctx, key, info.ETag, out); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("downloaded %d bytes (err %v), want %d", len(got), err, len(payload))
+	}
+	if _, err := os.Stat(out + ".part"); !os.IsNotExist(err) {
+		t.Fatalf("partial file left behind: %v", err)
+	}
+
+	// The object changed since the HEAD that classified it: the merge must not
+	// be built on it.
+	stale := filepath.Join(dir, "stale.m4a")
+	if err := s.Download(ctx, key, "etag-from-yesterday", stale); !errors.Is(err, recorder.ErrObjectChanged) {
+		t.Fatalf("stale If-Match: err=%v, want ErrObjectChanged", err)
+	}
+	for _, p := range []string{stale, stale + ".part"} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s exists after a failed download", p)
+		}
+	}
+
+	// A missing object is an ordinary error: the caller re-reads the state.
+	missing := filepath.Join(dir, "missing.m4a")
+	err = s.Download(ctx, "2026-09-22/gone.m4a", "", missing)
+	if err == nil || errors.Is(err, recorder.ErrObjectChanged) || isPermanent(err) {
+		t.Fatalf("download of a missing object: %v", err)
+	}
+	if _, err := os.Stat(missing + ".part"); !os.IsNotExist(err) {
+		t.Fatalf("partial file left behind for a missing object")
+	}
+	if keys := b.keys(); len(keys) != 1 || keys[0] != key {
+		t.Fatalf("bucket holds %v", keys)
+	}
+}
+
+func TestConditionalWritesProbe(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("enforcing endpoint", func(t *testing.T) {
+		s, b := newTestS3(t)
+		ok, err := s.ConditionalWrites(ctx)
+		if err != nil || !ok {
+			t.Fatalf("ConditionalWrites = %v, %v; want true", ok, err)
+		}
+		if keys := b.keys(); len(keys) != 0 {
+			t.Fatalf("probe objects left behind: %v", keys)
+		}
+		if _, _, uploads := b.stats(); uploads != 0 {
+			t.Fatalf("%d multipart uploads left behind", uploads)
+		}
+		// The answer is cached: no second probe, no second probe object.
+		_, requests, _ := b.stats()
+		ok, err = s.ConditionalWrites(ctx)
+		if err != nil || !ok {
+			t.Fatalf("cached ConditionalWrites = %v, %v", ok, err)
+		}
+		if _, again, _ := b.stats(); again != requests {
+			t.Fatalf("cached call made %d extra requests", again-requests)
+		}
+	})
+
+	t.Run("endpoint that ignores If-Match", func(t *testing.T) {
+		s, b := newTestS3With(t, func(b *fakeBucket, _ *config.Config) { b.ignoreIfMatch = true })
+		ok, err := s.ConditionalWrites(ctx)
+		if err != nil || ok {
+			t.Fatalf("ConditionalWrites = %v, %v; want false", ok, err)
+		}
+		if keys := b.keys(); len(keys) != 0 {
+			t.Fatalf("probe objects left behind: %v", keys)
+		}
+	})
+
+	t.Run("endpoint that enforces only on PutObject", func(t *testing.T) {
+		s, b := newTestS3With(t, func(b *fakeBucket, _ *config.Config) { b.ignoreCompleteIfMatch = true })
+		ok, err := s.ConditionalWrites(ctx)
+		if err != nil || ok {
+			t.Fatalf("ConditionalWrites = %v, %v; want false (multipart leg not enforced)", ok, err)
+		}
+		if keys := b.keys(); len(keys) != 0 {
+			t.Fatalf("probe objects left behind: %v", keys)
+		}
+		if _, _, uploads := b.stats(); uploads != 0 {
+			t.Fatalf("%d multipart uploads left behind", uploads)
+		}
+	})
+
+	t.Run("conditional puts disabled", func(t *testing.T) {
+		s, b := newTestS3With(t, func(_ *fakeBucket, cfg *config.Config) { cfg.S3ConditionalPut = false })
+		ok, err := s.ConditionalWrites(ctx)
+		if err != nil || ok {
+			t.Fatalf("ConditionalWrites = %v, %v; want false", ok, err)
+		}
+		if _, requests, _ := b.stats(); requests != 0 {
+			t.Fatalf("probed the endpoint %d times although conditional puts are off", requests)
+		}
+	})
+}
+
+// TestSanitizeMetadataReservedKeys pins the invariant the merge depends on: a
+// long name or source must never cost the manifest that says which sessions
+// the object already holds.
+func TestSanitizeMetadataReservedKeys(t *testing.T) {
+	digests := make([]string, 0, 30)
+	for i := 0; i < 30; i++ {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("sess-%02d-20260922", i)))
+		digests = append(digests, hex.EncodeToString(sum[:])[:8])
+	}
+	sessions := strings.Join(digests, ",") // 30*8 + 29 = 269 bytes
+	reserved := map[string]string{
+		"recording-id":       "match-ro-jpOkle8Mp0",
+		"sessions":           sessions,
+		"parts":              "30",
+		"last-session-start": "2026-09-22T23:45:07Z",
+	}
+	in := map[string]string{
+		"name":   strings.Repeat("A", 300),
+		"source": "https://origin.example/live/" + strings.Repeat("segment/", 60) + "master.m3u8",
+	}
+	for k, v := range reserved {
+		in[k] = v
+	}
+	// Enough other metadata to exhaust the 1800 byte budget several times over.
+	// The keys sort after "name"/"source" so those two show the ordinary caps
+	// rather than being the ones the budget happens to drop.
+	for i := 0; i < 12; i++ {
+		in[fmt.Sprintf("zfiller-%02d", i)] = strings.Repeat("f", 250)
+	}
+
+	got := SanitizeMetadata(in)
+	for k, want := range reserved {
+		if got[k] != want {
+			t.Errorf("%s = %q, want the value verbatim (%q)", k, got[k], want)
+		}
+	}
+	if len(got["sessions"]) != 269 {
+		t.Errorf("sessions is %d bytes, want 269", len(got["sessions"]))
+	}
+	if len(got["name"]) != 256 {
+		t.Errorf("name is %d bytes, want the ordinary 256 byte cap", len(got["name"]))
+	}
+	dropped := 0
+	for i := 0; i < 12; i++ {
+		if _, ok := got[fmt.Sprintf("zfiller-%02d", i)]; !ok {
+			dropped++
+		}
+	}
+	if dropped == 0 {
+		t.Errorf("no filler entry was dropped: the size cap never applied, so the test proves nothing")
+	}
+	total := 0
+	for k, v := range got {
+		total += len(k) + len(v)
+	}
+	if total > 1800+len(sessions) {
+		t.Errorf("total metadata size %d is larger than the budget plus the reserved manifest", total)
+	}
+}
+
+func TestQuoteETag(t *testing.T) {
+	cases := map[string]string{
+		"abc":   `"abc"`,
+		`"abc"`: `"abc"`,
+		"":      `""`,
+		`"`:     `"""`, // a lone quote is not a quoted ETag
+	}
+	for in, want := range cases {
+		if got := quoteETag(in); got != want {
+			t.Errorf("quoteETag(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

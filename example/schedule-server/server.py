@@ -36,9 +36,10 @@ WWW_ROOT = Path(os.environ.get("WWW_ROOT", "/www")).resolve()
 SERVER_START = datetime.now(timezone.utc).replace(microsecond=0)
 
 CONTENT_TYPES = {
-    ".m3u8": "application/vnd.apple.mpegurl",
+    ".m3u8": "application/vnd.apple.mpegurl",  # the HLS test stream this server generates (its own source, not the recorder's output)
     ".ts": "video/mp2t",
     ".aac": "audio/aac",
+    ".m4a": "audio/mp4",  # recorder output is served this way if ever placed under WWW_ROOT for inspection
     ".json": "application/json",
     ".txt": "text/plain; charset=utf-8",
 }

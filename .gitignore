@@ -5,6 +5,8 @@
 .env.local
 *.aac
 !example/**/*.aac
+*.m4a
+!example/**/*.m4a
 .DS_Store
 .idea/
 .vscode/

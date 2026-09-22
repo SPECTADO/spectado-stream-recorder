@@ -15,7 +15,7 @@
     },
     "startEarly": "15s",
     "stopLate": "45s",
-    "_comment": "All fields except id, type, source, start and end are optional. Unknown fields (like this _comment) are ignored by the recorder."
+    "_comment": "All fields except id, type, source, start and end are optional. Unknown fields (like this _comment) are ignored by the recorder. 'key' names the uploaded object directly (S3_PREFIX is still prepended): this recording is uploaded as radio-one/2026-09-01/morning-show.m4a (the .m4a suffix is appended automatically, not duplicated if already present)."
   },
   {
     "id": "jazz-fm-evening",

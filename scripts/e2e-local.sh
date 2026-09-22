@@ -2,9 +2,10 @@
 # Local end-to-end smoke test with the real ffmpeg (no Docker, no R2):
 #   1. generates a live HLS test tone and serves it with python's http.server
 #   2. serves a schedule whose window is [now-5s, now+50s]
-#   3. runs the recorder with uploads disabled
+#   3. runs the recorder with uploads disabled (kept mode: remuxed to .m4a)
 #   4. sends SIGTERM mid-recording and restarts it (suspend / resume)
-#   5. waits for the end, validates the .aac with ffprobe and a full decode
+#   5. waits for the end, waits for the kept remux, validates the .m4a with
+#      ffprobe and a full decode, and checks the source .aac was deleted
 #
 # Requirements: go, ffmpeg/ffprobe, python3, curl. Optional: EXTERNAL_STREAM=<url>
 # adds a second (public) stream, e.g. https://ice1.somafm.com/groovesalad-128-aac
@@ -60,6 +61,7 @@ api() { curl -sf "http://127.0.0.1:$RPORT$1"; }
 bytes_of() { api /api/recordings | python3 -c "import json,sys; print(sum(r['bytes'] for r in json.load(sys.stdin) if r['id']=='$1'))"; }
 
 say "run 1"
+REC1_START=$(date +%s)
 run_recorder; sleep 15
 api /healthz | grep -q '"status": "ok"' || fail "healthz"
 api /readyz | grep -q ready || fail "readyz"
@@ -83,17 +85,42 @@ import json,sys
 for r in json.load(sys.stdin): print(f\"  {r['id']}: state={r['state']} reason={r.get('finishReason')} bytes={r['bytes']} restarts={r['restarts']}\")"
 grep -q "recording finished" "$WORK/recorder.log" || fail "not finished"
 
+say "wait for the kept remux (.m4a)"
+# Kept mode (UPLOAD_DISABLED=true) remuxes each finished session to
+# <session>.m4a next to its sidecar and deletes the source .aac only once the
+# remux succeeded and the sidecar says so; poll up to 90s for that to land.
+DEADLINE=$(( $(date +%s) + 90 ))
+M4A=""
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  M4A=$(ls "$DATA"/recordings/*/*.m4a 2>/dev/null | head -1 || true)
+  [ -n "$M4A" ] && break
+  sleep 2
+done
+[ -n "$M4A" ] || fail "no .m4a appeared for test-hls within 90s"
+
 say "validate with ffprobe"
-for f in "$DATA"/recordings/*/*.aac; do
+EXPECTED_DURATION=$(( END_EPOCH - REC1_START ))
+for f in "$DATA"/recordings/*/*.m4a; do
   echo "--- $f"
-  ffprobe -v error -show_entries format=format_name,duration:stream=codec_name,profile,sample_rate,channels -of default=nw=1 "$f" || fail "ffprobe"
+  FORMAT=$(ffprobe -v error -show_entries format=format_name -of default=nw=1:nk=1 "$f") || fail "ffprobe format"
+  echo "format_name: $FORMAT"
+  case "$FORMAT" in *mp4*|*m4a*|*ipod*) ;; *) fail "unexpected format_name $FORMAT in $f" ;; esac
+  CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$f") || fail "ffprobe codec"
+  [ "$CODEC" = "aac" ] || fail "expected codec aac, got $CODEC in $f"
+  DURATION=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$f") || fail "ffprobe duration"
+  echo "duration: $DURATION (expected ~$EXPECTED_DURATION = END_EPOCH($END_EPOCH) - recorder first start($REC1_START), +/- 8s)"
+  python3 -c "
+import sys
+d, exp = float('$DURATION'), float('$EXPECTED_DURATION')
+sys.exit(0 if abs(d - exp) <= 8 else 1)
+" || fail "duration $DURATION outside +/-8s of expected $EXPECTED_DURATION in $f"
   ERRS=$(ffmpeg -v error -i "$f" -f null - 2>&1 | wc -l | tr -d ' ')
   echo "decode errors: $ERRS"; [ "$ERRS" -eq 0 ] || fail "decode errors in $f"
-  # In-band wall clock: ffprobe reads the first ID3 tag, and the file should hold
-  # several tags (one per run start plus every CLOCK_ID3_INTERVAL of media time).
-  ffprobe -v error -show_format "$f" | grep -q "TAG:WALLCLOCK=" || fail "no WALLCLOCK ID3 tag in $f"
-  NTAGS=$(python3 -c "import sys;print(open('$f','rb').read().count(b'ID3'))")
-  echo "ID3 tags: $NTAGS"; [ "$NTAGS" -ge 3 ] || fail "expected >= 3 ID3 tags in $f (got $NTAGS)"
+  # Wall clock now lives in MP4 metadata, not in-band ID3 tags.
+  ffprobe -v error -show_format "$f" | grep -q "TAG:creation_time=" || fail "no creation_time tag in $f"
+  ffprobe -v error -show_format "$f" | grep -q "TAG:title=" || fail "no title tag in $f"
+  AAC="${f%.m4a}.aac"
+  [ -e "$AAC" ] && fail "source .aac still present after successful remux: $AAC"
 done
 kill -TERM $REC; wait $REC
 echo; echo "E2E OK"

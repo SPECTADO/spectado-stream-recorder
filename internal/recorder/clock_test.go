@@ -1,7 +1,9 @@
 package recorder
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,7 +17,6 @@ import (
 
 	"github.com/spectado/stream-recorder/internal/adts"
 	"github.com/spectado/stream-recorder/internal/config"
-	"github.com/spectado/stream-recorder/internal/id3"
 	"github.com/spectado/stream-recorder/internal/metrics"
 )
 
@@ -37,18 +38,30 @@ func adtsFrame(payload int) []byte {
 	return out
 }
 
+// adtsStream is n structurally valid ADTS frames in a row.
+func adtsStream(n int) []byte {
+	var out []byte
+	for i := 0; i < n; i++ {
+		out = append(out, adtsFrame(200)...)
+	}
+	return out
+}
+
+// adtsFramesFile writes the block of frames the fake ffmpegs stream.
+func adtsFramesFile(t *testing.T, dir string) string {
+	t.Helper()
+	framesPath := filepath.Join(dir, "frames.bin")
+	if err := os.WriteFile(framesPath, adtsStream(60), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return framesPath
+}
+
 // fakeFFmpegADTS writes a fake ffmpeg that streams real ADTS frames: a frames
 // file is cat'd on a loop until SIGINT/SIGTERM.
 func fakeFFmpegADTS(t *testing.T, dir string) string {
 	t.Helper()
-	var block []byte
-	for i := 0; i < 60; i++ {
-		block = append(block, adtsFrame(200)...)
-	}
-	framesPath := filepath.Join(dir, "frames.bin")
-	if err := os.WriteFile(framesPath, block, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	framesPath := adtsFramesFile(t, dir)
 	body := fmt.Sprintf(`#!/bin/sh
 trap 'exit 0' INT TERM
 while :; do
@@ -63,18 +76,19 @@ done
 	return p
 }
 
-// TestRunRecordsAndByterangePlaylist exercises the frame-aware writer end to
-// end: a real ADTS stream produces a run record, in-band ID3 tags, and the
-// upload publishes a VERSION 4 byterange playlist with a program-date-time plus
-// the clock object metadata.
-func TestRunRecordsAndByterangePlaylist(t *testing.T) {
+// TestRunRecordsFeedMetadata exercises the frame-aware writer end to end: a
+// real ADTS stream produces a run record, and the upload turns that record into
+// the object's clock metadata and the JSON run table embedded in the .m4a (what
+// replaced the playlist's #EXT-X-PROGRAM-DATE-TIME).
+func TestRunRecordsFeedMetadata(t *testing.T) {
 	up := &fakeUploader{}
 	dir := t.TempDir()
 	ff := fakeFFmpegADTS(t, dir)
 	cfg := testConfig(dir, ff)
-	cfg.ClockID3Interval = 50 * time.Millisecond // media-time cadence: a tag every few frames
-	cfg.ClockPDTLookup = false                   // no source playlist in this test: wallclock anchor
+	cfg.ClockPDTLookup = false // no source playlist in this test: wallclock anchor
 	m := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), up, "test")
+	rx := newFakeRemuxer()
+	m.SetRemuxer(rx)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -133,27 +147,50 @@ func TestRunRecordsAndByterangePlaylist(t *testing.T) {
 		t.Fatalf("clock metadata = %v", meta)
 	}
 
-	// The published playlist is a VERSION 4 byterange playlist with a PDT.
-	pl := up.object(playlistKey(ar.s.Key))
-	for _, want := range []string{"#EXT-X-VERSION:4\n", "#EXT-X-BYTERANGE:", "#EXT-X-PROGRAM-DATE-TIME:", "\n" + sid + ".aac\n"} {
-		if !strings.Contains(pl, want) {
-			t.Fatalf("playlist lacks %q:\n%s", want, pl)
-		}
+	// The container metadata carries the position -> wall-clock map.
+	mm, ok := rx.lastMeta()
+	if !ok {
+		t.Fatal("the remuxer was never asked to build anything")
+	}
+	if mm.CreationTime.IsZero() || !mm.CreationTime.Equal(r.Anchor) {
+		t.Fatalf("creation time = %v, want the first sample's anchor %v", mm.CreationTime, r.Anchor)
+	}
+	if mm.Title != "Test a" || mm.Date != ar.s.Start.UTC().Format("2006-01-02") {
+		t.Fatalf("title = %q date = %q", mm.Title, mm.Date)
+	}
+	if !strings.Contains(mm.Comment, "id=a") || !strings.Contains(mm.Comment, "spectado-stream-recorder") {
+		t.Fatalf("comment = %q", mm.Comment)
+	}
+	var table []struct {
+		SID string  `json:"sid"`
+		T   string  `json:"t"`
+		Src string  `json:"src"`
+		Off float64 `json:"off"`
+		Dur float64 `json:"dur"`
+	}
+	if err := json.Unmarshal([]byte(mm.Description), &table); err != nil {
+		t.Fatalf("run table %q: %v", mm.Description, err)
+	}
+	if len(table) != 1 || table[0].SID != sid || table[0].Src != "wallclock" || table[0].Off != 0 || table[0].Dur <= 0 {
+		t.Fatalf("run table = %+v", table)
+	}
+	if _, err := time.Parse(time.RFC3339, table[0].T); err != nil {
+		t.Fatalf("run table timestamp %q: %v", table[0].T, err)
 	}
 }
 
-// TestWriterInsertsID3Tags checks the writer inserts ID3 wall-clock tags between
-// frames and that the file remains a faithful, decodable ADTS concatenation
-// (frame count via ScanRuns, tags counted separately from junk).
-func TestWriterInsertsID3Tags(t *testing.T) {
+// TestWriterPassesFramesThroughUnchanged checks that the frame-aware writer is
+// a faithful copy of ffmpeg's output: since 1.1.0 nothing is inserted between
+// the frames (the in-band ID3 wall-clock tags are gone), so the file is exactly
+// the bytes that arrived and scans back without any tags.
+func TestWriterPassesFramesThroughUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir, "ffmpeg")
-	cfg.ClockID3Interval = 40 * time.Millisecond
 	m := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), nil, "test")
 
 	s := &Session{
 		ID: "w", SafeID: "w", SessionID: "w_20260101T000000Z", Source: "http://x/live.m3u8",
-		Key: "w/w_20260101T000000Z.aac", State: StateRecording, Codec: "aac",
+		Key: "2026-01-01/w.m4a", State: StateRecording, Codec: "aac",
 		dir: filepath.Join(dir, "recordings", "w"),
 	}
 	m.mu.Lock()
@@ -166,7 +203,7 @@ func TestWriterInsertsID3Tags(t *testing.T) {
 	defer ar.file.Close()
 
 	anchor := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
-	ar.beginRun(anchor, "hls-pdt", 0)
+	ar.beginRun(anchor, "hls-pdt")
 	w := &captureWriter{ar: ar, m: m}
 
 	const nframes = 100
@@ -195,30 +232,27 @@ func TestWriterInsertsID3Tags(t *testing.T) {
 		t.Fatalf("run = %+v", runs)
 	}
 
-	// The file scans back to the same frame count, with the inserted tags counted
-	// as tags (not junk).
+	// Byte-for-byte what ffmpeg produced.
+	data, err := os.ReadFile(s.FilePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, stream) {
+		t.Fatalf("file is %d bytes, ffmpeg wrote %d: the writer must not add or drop anything", len(data), len(stream))
+	}
 	info, err := adts.Scan(s.FilePath())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The last frame may be flushed as junk (never confirmed), so allow one less.
-	if info.Frames < nframes-1 || info.Junk != 0 {
-		t.Fatalf("scan = %+v, want ~%d frames and no junk", info, nframes)
-	}
-	if info.Tags == 0 {
-		t.Fatal("no ID3 tags were inserted")
-	}
-	// The first tag is at the very start of the run (frame 0).
-	data, _ := os.ReadFile(s.FilePath())
-	if n, ok := id3.TagLen(data); !ok || n <= 0 {
-		t.Fatalf("file does not start with an ID3 tag: %v", data[:min(16, len(data))])
+	if info.Frames != nframes || info.Junk != 0 || info.Tags != 0 {
+		t.Fatalf("scan = %+v, want %d frames, no junk and no tags", info, nframes)
 	}
 	// ScanRuns attributes everything to the single run.
 	rinfos, total, err := adts.ScanRuns(s.FilePath(), []int64{0})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rinfos) != 1 || rinfos[0].Frames != info.Frames || total.Tags != info.Tags {
+	if len(rinfos) != 1 || rinfos[0].Frames != info.Frames || total.Frames != info.Frames {
 		t.Fatalf("scanRuns = %+v total = %+v vs scan %+v", rinfos, total, info)
 	}
 }
@@ -229,12 +263,11 @@ func TestWriterInsertsID3Tags(t *testing.T) {
 func TestMultiRunContiguousByteRanges(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir, "ffmpeg")
-	cfg.ClockID3Interval = 0 // keep byte arithmetic exact (no inserted tags)
 	m := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), nil, "test")
 
 	s := &Session{
 		ID: "m", SafeID: "m", SessionID: "m_20260101T000000Z", Source: "http://x/live.m3u8",
-		Key: "m/m_20260101T000000Z.aac", State: StateRecording, Codec: "aac",
+		Key: "2026-01-01/m.m4a", State: StateRecording, Codec: "aac",
 		dir: filepath.Join(dir, "recordings", "m"),
 	}
 	m.mu.Lock()
@@ -257,7 +290,7 @@ func TestMultiRunContiguousByteRanges(t *testing.T) {
 	}
 
 	// Run 0: 10 complete frames plus a 50-byte partial frame.
-	ar.beginRun(time.Unix(1000, 0), "wallclock", 0)
+	ar.beginRun(time.Unix(1000, 0), "wallclock")
 	w0 := &captureWriter{ar: ar, m: m}
 	if _, err := w0.Write(append(full(10), frame[:50]...)); err != nil {
 		t.Fatal(err)
@@ -266,7 +299,7 @@ func TestMultiRunContiguousByteRanges(t *testing.T) {
 	m.trimTail(ar) // supervise trims the flushed partial before the next run
 
 	// Run 1: 8 complete frames.
-	ar.beginRun(time.Unix(2000, 0), "wallclock", 0)
+	ar.beginRun(time.Unix(2000, 0), "wallclock")
 	w1 := &captureWriter{ar: ar, m: m}
 	if _, err := w1.Write(full(8)); err != nil {
 		t.Fatal(err)

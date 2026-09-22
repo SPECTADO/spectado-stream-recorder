@@ -20,7 +20,7 @@ var envKeys = []string{
 	"FFMPEG_PATH", "FFPROBE_PATH", "FFPROBE_TIMEOUT", "PROBE_CONCURRENCY", "AUDIO_CODEC", "AUDIO_BITRATE",
 	"FFMPEG_USER_AGENT", "FFMPEG_RW_TIMEOUT", "FFMPEG_STALL_TIMEOUT", "FFMPEG_RESTART_BACKOFF_MIN",
 	"FFMPEG_RESTART_BACKOFF_MAX", "FFMPEG_STOP_GRACE", "FFMPEG_STDERR_LOG", "FFMPEG_TLS_VERIFY",
-	"CLOCK_ID3_INTERVAL", "CLOCK_PDT_LOOKUP",
+	"KEY_DATE_TZ", "CLOCK_ID3_INTERVAL", "CLOCK_PDT_LOOKUP",
 	"SHUTDOWN_TIMEOUT", "SYSMON_INTERVAL", "LOG_LEVEL", "LOG_FORMAT",
 }
 
@@ -136,7 +136,7 @@ func TestLoad_Defaults(t *testing.T) {
 		{"FFmpegStopGrace", c.FFmpegStopGrace, 5 * time.Second},
 		{"FFmpegStderrLog", c.FFmpegStderrLog, "warn"},
 		{"FFmpegTLSVerify", c.FFmpegTLSVerify, false},
-		{"ClockID3Interval", c.ClockID3Interval, 10 * time.Second},
+		{"KeyDateTZ", c.KeyDateTZ, "UTC"},
 		{"ClockPDTLookup", c.ClockPDTLookup, true},
 		{"ShutdownTimeout", c.ShutdownTimeout, 45 * time.Second},
 		{"SysmonInterval", c.SysmonInterval, 10 * time.Second},
@@ -272,8 +272,7 @@ func TestLoad_InvalidValues(t *testing.T) {
 		{"FFMPEG_STOP_GRACE", "0", "FFMPEG_STOP_GRACE must be at least 1s"},
 		{"FFMPEG_RESTART_BACKOFF_MIN", "0", "FFMPEG_RESTART_BACKOFF_MIN/MAX must be positive and MIN <= MAX"},
 		{"FFMPEG_RESTART_BACKOFF_MAX", "500ms", "FFMPEG_RESTART_BACKOFF_MIN/MAX must be positive and MIN <= MAX"},
-		{"CLOCK_ID3_INTERVAL", "500ms", "CLOCK_ID3_INTERVAL must be 0 (disabled) or at least 1s"},
-		{"CLOCK_ID3_INTERVAL", "nope", `CLOCK_ID3_INTERVAL: invalid duration "nope"`},
+		{"KEY_DATE_TZ", "Mars/Olympus", `KEY_DATE_TZ: unknown time zone "Mars/Olympus"`},
 		{"CLOCK_PDT_LOOKUP", "maybe", `CLOCK_PDT_LOOKUP: invalid boolean "maybe"`},
 		{"PROBE_CONCURRENCY", "0", "PROBE_CONCURRENCY must be >= 1"},
 		{"RECORD_START_EARLY", "-5s", "RECORD_START_EARLY and RECORD_STOP_LATE must not be negative"},
@@ -386,17 +385,51 @@ func TestLoad_ValuesAndNormalization(t *testing.T) {
 }
 
 func TestLoad_ClockKeys(t *testing.T) {
-	setEnv(t, localEnv(map[string]string{"CLOCK_ID3_INTERVAL": "0", "CLOCK_PDT_LOOKUP": "false"}))
-	c := mustLoad(t)
-	if c.ClockID3Interval != 0 {
-		t.Errorf("ClockID3Interval = %v, want 0 (disabled)", c.ClockID3Interval)
-	}
-	if c.ClockPDTLookup {
+	setEnv(t, localEnv(map[string]string{"CLOCK_PDT_LOOKUP": "false"}))
+	if c := mustLoad(t); c.ClockPDTLookup {
 		t.Error("ClockPDTLookup = true, want false")
 	}
-	setEnv(t, localEnv(map[string]string{"CLOCK_ID3_INTERVAL": "30s"}))
-	if c := mustLoad(t); c.ClockID3Interval != 30*time.Second || !c.ClockPDTLookup {
-		t.Errorf("ClockID3Interval = %v ClockPDTLookup = %v", c.ClockID3Interval, c.ClockPDTLookup)
+	setEnv(t, localEnv(nil))
+	if c := mustLoad(t); !c.ClockPDTLookup {
+		t.Error("ClockPDTLookup = false, want true by default")
+	}
+}
+
+// TestLoad_RemovedClockID3IntervalWarns covers the 1.1.0 removal: the variable
+// no longer exists, so a deployment that still sets it must start and be told
+// once that it is ignored (never fail, never silently change behaviour).
+func TestLoad_RemovedClockID3IntervalWarns(t *testing.T) {
+	setEnv(t, localEnv(nil))
+	if w := mustLoad(t).Warnings; len(w) != 0 {
+		t.Fatalf("unset CLOCK_ID3_INTERVAL must not warn, got %v", w)
+	}
+	// Even a value the old validation rejected must only warn now.
+	for _, v := range []string{"30s", "0", "500ms", "nope"} {
+		setEnv(t, localEnv(map[string]string{"CLOCK_ID3_INTERVAL": v}))
+		c := mustLoad(t)
+		if len(c.Warnings) != 1 || !strings.Contains(c.Warnings[0], "CLOCK_ID3_INTERVAL") ||
+			!strings.Contains(c.Warnings[0], "ignored") {
+			t.Fatalf("CLOCK_ID3_INTERVAL=%q warnings = %v", v, c.Warnings)
+		}
+	}
+}
+
+// TestLoad_KeyDateTZ covers the zone that decides the date folder of an object
+// key: it is resolved to a *time.Location so the recorder never parses it again.
+func TestLoad_KeyDateTZ(t *testing.T) {
+	setEnv(t, localEnv(nil))
+	if c := mustLoad(t); c.KeyDateLocation == nil || c.KeyDateLocation.String() != "UTC" {
+		t.Fatalf("default KeyDateLocation = %v, want UTC", mustLoad(t).KeyDateLocation)
+	}
+	setEnv(t, localEnv(map[string]string{"KEY_DATE_TZ": "Europe/Prague"}))
+	c := mustLoad(t)
+	if c.KeyDateTZ != "Europe/Prague" || c.KeyDateLocation == nil || c.KeyDateLocation.String() != "Europe/Prague" {
+		t.Fatalf("KeyDateTZ = %q location = %v", c.KeyDateTZ, c.KeyDateLocation)
+	}
+	// A recording that starts at 23:30 UTC belongs to the next day in Prague.
+	at := time.Date(2026, 9, 22, 23, 30, 0, 0, time.UTC)
+	if got := at.In(c.KeyDateLocation).Format("2006-01-02"); got != "2026-09-23" {
+		t.Fatalf("date folder = %q, want 2026-09-23", got)
 	}
 }
 

@@ -31,6 +31,8 @@ type Config struct {
 	MetricsRequireAuth bool   // also protect /metrics with APIToken
 
 	// S3 / R2.
+	KeyDateTZ           string         // IANA zone used for the date folder of an object key
+	KeyDateLocation     *time.Location // resolved KeyDateTZ
 	S3Endpoint          string
 	S3Region            string
 	S3Bucket            string
@@ -67,14 +69,19 @@ type Config struct {
 	FFmpegTLSVerify         bool   // verify TLS certificates of stream sources
 
 	// Real-world clock embedding.
-	ClockID3Interval time.Duration // in-band ID3 wall-clock tag cadence (0 disables)
-	ClockPDTLookup   bool          // read the source playlist's PDT to anchor each run
+	ClockPDTLookup bool // read the source playlist's PDT to anchor each run
 
 	// Lifecycle / monitoring / logging.
 	ShutdownTimeout time.Duration
 	SysmonInterval  time.Duration
 	LogLevel        string
 	LogFormat       string // json | text
+
+	// Warnings are non-fatal configuration problems (a removed variable that is
+	// still set, ...). Load returns them instead of writing them itself so the
+	// caller can log them through the configured logger; main.go does that once
+	// at startup.
+	Warnings []string
 }
 
 // Load reads configuration from the environment and validates it.
@@ -96,6 +103,7 @@ func Load() (*Config, error) {
 	c.APIToken = os.Getenv("API_TOKEN")
 	c.MetricsRequireAuth = envBool(&errs, "METRICS_REQUIRE_AUTH", false)
 
+	c.KeyDateTZ = envString("KEY_DATE_TZ", "UTC")
 	c.S3Endpoint = strings.TrimSpace(os.Getenv("S3_ENDPOINT"))
 	c.S3Region = envString("S3_REGION", "auto")
 	c.S3Bucket = strings.TrimSpace(os.Getenv("S3_BUCKET"))
@@ -130,8 +138,16 @@ func Load() (*Config, error) {
 	c.FFmpegStderrLog = strings.ToLower(envString("FFMPEG_STDERR_LOG", "warn"))
 	c.FFmpegTLSVerify = envBool(&errs, "FFMPEG_TLS_VERIFY", false)
 
-	c.ClockID3Interval = envDuration(&errs, "CLOCK_ID3_INTERVAL", 10*time.Second)
 	c.ClockPDTLookup = envBool(&errs, "CLOCK_PDT_LOOKUP", true)
+	// CLOCK_ID3_INTERVAL controlled the in-band ID3 wall-clock tags that 1.1.0
+	// removed (they perturbed the bytes-per-second ratio of the raw ADTS and
+	// HLS-aware players read the Apple PRIV tag as a PTS base). A deployment
+	// that still sets it must learn that it does nothing, but must not fail to
+	// start over a leftover variable.
+	if v, ok := os.LookupEnv("CLOCK_ID3_INTERVAL"); ok && strings.TrimSpace(v) != "" {
+		c.Warnings = append(c.Warnings,
+			"CLOCK_ID3_INTERVAL is set but no longer supported (in-band ID3 tags were removed in 1.1.0); it is ignored")
+	}
 
 	c.ShutdownTimeout = envDuration(&errs, "SHUTDOWN_TIMEOUT", 45*time.Second)
 	c.SysmonInterval = envDuration(&errs, "SYSMON_INTERVAL", 10*time.Second)
@@ -151,6 +167,11 @@ func Load() (*Config, error) {
 		errs = append(errs, fmt.Errorf("SCHEDULE_DEFAULT_TZ: unknown time zone %q", c.ScheduleDefaultTZ))
 	} else {
 		c.ScheduleLocation = loc
+	}
+	if loc, err := time.LoadLocation(c.KeyDateTZ); err != nil {
+		errs = append(errs, fmt.Errorf("KEY_DATE_TZ: unknown time zone %q", c.KeyDateTZ))
+	} else {
+		c.KeyDateLocation = loc
 	}
 	switch c.AudioCodec {
 	case "auto", "aac", "copy":
@@ -184,9 +205,6 @@ func Load() (*Config, error) {
 	}
 	if c.FFmpegStopGrace < time.Second {
 		errs = append(errs, errors.New("FFMPEG_STOP_GRACE must be at least 1s"))
-	}
-	if c.ClockID3Interval != 0 && c.ClockID3Interval < time.Second {
-		errs = append(errs, errors.New("CLOCK_ID3_INTERVAL must be 0 (disabled) or at least 1s"))
 	}
 	if c.ProbeConcurrency < 1 {
 		errs = append(errs, errors.New("PROBE_CONCURRENCY must be >= 1"))

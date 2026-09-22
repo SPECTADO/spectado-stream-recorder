@@ -15,10 +15,10 @@ import (
 
 func TestWithSuffix(t *testing.T) {
 	cases := map[[2]string]string{
-		{"a/b.aac", "_x"}:       "a/b_x.aac",
+		{"a/b.m4a", "-2"}:       "a/b-2.m4a",
 		{"a/b", "_x"}:           "a/b_x",
 		{"a.b/c", "-2"}:         "a.b/c-2",
-		{"show.part1.aac", "1"}: "show.part11.aac",
+		{"show.part1.m4a", "1"}: "show.part11.m4a",
 	}
 	for in, want := range cases {
 		if got := withSuffix(in[0], in[1]); got != want {
@@ -28,22 +28,21 @@ func TestWithSuffix(t *testing.T) {
 }
 
 func TestDefaultKeys(t *testing.T) {
+	// The date folder follows the SCHEDULED start in KEY_DATE_TZ, not the
+	// session start: a show that starts at 23:30 CEST is a 21:30Z recording and
+	// belongs to that day in UTC.
 	s := &Session{SafeID: "radio-1", SessionID: "radio-1_20260829T212950Z",
 		Start:        time.Date(2026, 8, 29, 23, 30, 0, 0, time.FixedZone("CEST", 2*3600)), // 21:30Z
 		SessionStart: time.Date(2026, 8, 29, 21, 29, 50, 0, time.UTC)}
-	folder := defaultFolder("archive/", s)
-	if want := "archive/2026-08-29/radio-1/"; folder != want {
-		t.Fatalf("folder = %q want %q", folder, want)
+	if got, want := objectKey("archive/", time.UTC, s), "archive/2026-08-29/radio-1.m4a"; got != want {
+		t.Fatalf("object key = %q want %q", got, want)
 	}
-	key := mediaKey(folder, s)
-	if want := "archive/2026-08-29/radio-1/radio-1_20260829T212950Z.aac"; key != want {
-		t.Fatalf("media key = %q want %q", key, want)
+	if got, want := objectKey("", time.UTC, s), "2026-08-29/radio-1.m4a"; got != want {
+		t.Fatalf("object key without prefix = %q want %q", got, want)
 	}
-	if got, want := playlistKey(key), "archive/2026-08-29/radio-1/index.m3u8"; got != want {
-		t.Fatalf("playlist key = %q want %q", got, want)
-	}
-	if got, want := mediaKey(defaultFolder("", s), s), "2026-08-29/radio-1/radio-1_20260829T212950Z.aac"; got != want {
-		t.Fatalf("media key without prefix = %q want %q", got, want)
+	// A nil location must never panic; it means UTC.
+	if got, want := objectKey("", nil, s), "2026-08-29/radio-1.m4a"; got != want {
+		t.Fatalf("object key without location = %q want %q", got, want)
 	}
 }
 

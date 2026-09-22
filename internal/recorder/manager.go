@@ -20,33 +20,59 @@ import (
 	"github.com/spectado/stream-recorder/internal/adts"
 	"github.com/spectado/stream-recorder/internal/config"
 	"github.com/spectado/stream-recorder/internal/metrics"
+	"github.com/spectado/stream-recorder/internal/remux"
 	"github.com/spectado/stream-recorder/internal/schedule"
 	"github.com/spectado/stream-recorder/internal/sysmon"
 )
 
-// Uploader stores finished recordings and the playlists next to them.
+// Uploader stores finished recordings — one object per recording — and gives
+// the recorder back what it needs to extend an object it wrote earlier.
 // Implementations must only return nil from Upload once the object is durably
 // stored and verified.
 type Uploader interface {
-	// Upload stores the file at path under key without overwriting a
-	// different existing object (see ErrObjectExists).
-	Upload(ctx context.Context, path, key, contentType string, metadata map[string]string) (etag string, err error)
-	// PutObject stores a small object under key, replacing any existing one.
-	PutObject(ctx context.Context, key, contentType string, body []byte) error
-	// GetObject returns the content of key; found is false when there is no
-	// such object.
-	GetObject(ctx context.Context, key string) (body []byte, found bool, err error)
+	// Upload stores the file at path under key. With an empty replaceETag it
+	// must not overwrite a different existing object (see ErrObjectExists);
+	// with one it must replace exactly the object that has that ETag and
+	// return ErrObjectChanged otherwise.
+	Upload(ctx context.Context, path, key, contentType string, metadata map[string]string, replaceETag string) (etag string, err error)
+	// Head reports size, ETag and user metadata of key; found is false when
+	// there is no such object.
+	Head(ctx context.Context, key string) (info ObjectInfo, found bool, err error)
+	// Download writes the object at key to path, failing with ErrObjectChanged
+	// when ifMatchETag is given and no longer matches.
+	Download(ctx context.Context, key, ifMatchETag, path string) error
+	// ConditionalWrites reports whether the endpoint enforces
+	// If-None-Match/If-Match on single-part AND multipart uploads (probed once
+	// with a tiny object; cached). Merging several sessions into one object is
+	// only safe when it does.
+	ConditionalWrites(ctx context.Context) (bool, error)
 }
 
-// Verifier is optionally implemented by an Uploader: it reports whether an
-// object with exactly the given size already exists under key.
-type Verifier interface {
-	Exists(ctx context.Context, key string, size int64) (bool, error)
+// Remuxer turns raw ADTS captures into the .m4a that is stored, and back. It is
+// the subset of *remux.Remuxer the manager uses, as an interface so the upload
+// path can be tested without ffmpeg.
+type Remuxer interface {
+	Build(ctx context.Context, parts []string, out string, expect remux.Expect, meta remux.Metadata) (remux.Result, error)
+	BuildTranscode(ctx context.Context, chunks []remux.Chunk, out string, expectedDuration time.Duration, bitrate string, meta remux.Metadata) (remux.Result, error)
+	Extract(ctx context.Context, in, out string) error
+	Probe(ctx context.Context, path string) (remux.Result, error)
 }
 
 // ErrObjectExists is returned by an Uploader when the key is already taken by
 // a different object (conditional put failed). The manager picks a new key.
 var ErrObjectExists = errors.New("object already exists with different content")
+
+// ErrObjectChanged is returned by an Uploader when a replacing upload
+// (If-Match on the ETag read earlier) finds the object was modified in between.
+// The manager re-reads the object and merges again.
+var ErrObjectChanged = errors.New("object changed since it was read")
+
+// ObjectInfo describes a stored object as reported by a HEAD request.
+type ObjectInfo struct {
+	Size     int64
+	ETag     string            // without surrounding quotes
+	Metadata map[string]string // user metadata (x-amz-meta-*), keys lower-case
+}
 
 // PermanentError marks upload failures that will not go away by retrying
 // quickly (bad credentials, missing bucket, rejected request). The manager
@@ -91,6 +117,7 @@ type Manager struct {
 	uploadSem     chan struct{}
 
 	mu            sync.Mutex
+	rx            Remuxer
 	sched         *schedule.Schedule
 	info          ScheduleInfo
 	active        map[string]*activeRecording // item id -> capture in progress
@@ -98,17 +125,23 @@ type Manager struct {
 	uploadLoops   map[string]bool             // session id -> upload goroutine alive
 	skipLogged    map[string]time.Time
 	loggedInvalid map[string]struct{}
+	remuxFailures map[string]int       // object key -> consecutive remux failures
+	nospaceLogged map[string]time.Time // object key -> last "no disk" warning
+	warnedSafeID  map[string]struct{}  // recording ids whose object name differs
+	warnedKeys    map[string]struct{}  // explicit schedule keys already explained
+	mergeProbed   bool                 // ConditionalWrites has been asked
+	mergeAllowed  bool                 // ... and said yes
 	shuttingDown  atomic.Bool
 	schedLoaded   atomic.Bool
 	activeCount   atomic.Int64
 	diskLow       atomic.Bool
 	diskFree      func() (free uint64, ok bool)
 
-	uploadCtx     context.Context
-	uploadCancel  context.CancelFunc
-	uploadWG      sync.WaitGroup
-	stopWG        sync.WaitGroup
-	playlistLocks keyedLocks // serialises rewrites of the same index.m3u8
+	uploadCtx    context.Context
+	uploadCancel context.CancelFunc
+	uploadWG     sync.WaitGroup
+	stopWG       sync.WaitGroup
+	keyLocks     keyedLocks // serialises everything that touches one object key
 }
 
 // NewManager creates a Manager. up may be nil to keep recordings locally.
@@ -129,12 +162,42 @@ func NewManager(cfg *config.Config, log *slog.Logger, met *metrics.Metrics, up U
 		uploadLoops:   map[string]bool{},
 		skipLogged:    map[string]time.Time{},
 		loggedInvalid: map[string]struct{}{},
+		remuxFailures: map[string]int{},
+		nospaceLogged: map[string]time.Time{},
+		warnedSafeID:  map[string]struct{}{},
+		warnedKeys:    map[string]struct{}{},
 		diskFree:      func() (uint64, bool) { return 0, false },
 		uploadCtx:     uctx,
 		uploadCancel:  ucancel,
 	}
+	// The remuxer runs the same ffmpeg/ffprobe binaries as the capture; the
+	// transfer throughput assumption doubles as the remux throughput floor.
+	m.rx = &remux.Remuxer{
+		FFmpegPath:    cfg.FFmpegPath,
+		FFprobePath:   cfg.FFprobePath,
+		MinThroughput: cfg.UploadMinThroughput,
+		Log:           m.log.With("component", "remux"),
+	}
 	m.info.PollInterval = cfg.SchedulePollInterval.String()
 	return m
+}
+
+// SetRemuxer replaces the ffmpeg-backed remuxer (tests inject a fake so the
+// upload path can run without ffmpeg).
+func (m *Manager) SetRemuxer(r Remuxer) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r != nil {
+		m.rx = r
+	}
+}
+
+// remuxer returns the installed remuxer (read under the lock so SetRemuxer can
+// be called while goroutines are already running).
+func (m *Manager) remuxer() Remuxer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rx
 }
 
 // SetFFmpegCapabilities installs the detected ffmpeg capabilities.
@@ -443,6 +506,61 @@ func (m *Manager) openActive(s *Session, resume bool) (*activeRecording, error) 
 	return ar, nil
 }
 
+// keyForLocked returns the object key a session must use.
+//
+// Key pinning: a session whose recording id is already known keeps that
+// recording's object as long as the earlier session's scheduled end is less
+// than keyPinWindow in the past — an extension after the end, a re-added item,
+// a rotation or a start moved across midnight must all land in the SAME object,
+// not in a second one named after a different day. The newest such session
+// wins. Only keys that name an .m4a are inherited: a 1.0.x key and the raw-ADTS
+// fallback key are dead ends nothing may be appended to.
+func (m *Manager) keyForLocked(s *Session) (key string, inherited bool) {
+	var best *Session
+	for _, o := range m.sessions {
+		if o == s || o.ID != s.ID || !strings.HasSuffix(strings.ToLower(o.Key), objectExt) {
+			continue
+		}
+		if !o.End.Add(keyPinWindow).After(s.Start) {
+			continue
+		}
+		if best == nil || o.SessionStart.After(best.SessionStart) {
+			best = o
+		}
+	}
+	if best != nil {
+		// The rename counter travels with the key: the group must agree on how
+		// often it has already been moved aside.
+		s.KeyRenames = best.KeyRenames
+		return best.Key, true
+	}
+	if s.KeyTemplate != "" {
+		return explicitObjectKey(m.cfg.S3Prefix, s.KeyTemplate), false
+	}
+	return objectKey(m.cfg.S3Prefix, m.cfg.KeyDateLocation, s), false
+}
+
+// warnAboutKeyLocked says once per recording id (and once per explicit key)
+// what the object will actually be called: since 1.1.0 the key IS the file
+// someone downloads, so a sanitised id or a key that used to name a folder
+// changes what the operator finds in the bucket.
+func (m *Manager) warnAboutKeyLocked(s *Session) {
+	if s.SafeID != s.ID {
+		if _, done := m.warnedSafeID[s.ID]; !done {
+			m.warnedSafeID[s.ID] = struct{}{}
+			m.log.Warn("recording id is not usable as an object name; the object is named after a sanitised id",
+				"id", s.ID, "safeId", s.SafeID, "key", s.Key)
+		}
+	}
+	if s.KeyTemplate != "" {
+		if _, done := m.warnedKeys[s.KeyTemplate]; !done {
+			m.warnedKeys[s.KeyTemplate] = struct{}{}
+			m.log.Warn("the schedule item's key now names a single object, not a folder",
+				"id", s.ID, "itemKey", s.KeyTemplate, "key", s.Key)
+		}
+	}
+}
+
 func (m *Manager) startSessionLocked(it schedule.Item, now time.Time) error {
 	safe := schedule.SafeID(it.ID)
 	stamp := now.UTC().Format("20060102T150405Z")
@@ -472,16 +590,18 @@ func (m *Manager) startSessionLocked(it schedule.Item, now time.Time) error {
 			}
 		}
 	}
-	// Every session gets its own file inside the recording's folder; later
-	// parts of the same show (rotation, extension after the end) land next to
-	// the first one and are added to the folder's index.m3u8.
-	folder := defaultFolder(m.cfg.S3Prefix, s)
+	// One object per recording: every session of this show (rotation, extension
+	// after the end, a re-added item) is merged into the same object, so the
+	// key is pinned to whatever an earlier session of the same id already uses.
 	if it.Key != "" {
-		// An explicit key names the folder.
 		s.KeyTemplate = it.Key
-		folder = m.cfg.S3Prefix + strings.Trim(it.Key, "/") + "/"
 	}
-	s.Key = mediaKey(folder, s)
+	key, inherited := m.keyForLocked(s)
+	s.setKey(key)
+	if inherited {
+		m.log.Info("object key inherited from an earlier session of this recording", "id", it.ID, "session", sid, "key", key)
+	}
+	m.warnAboutKeyLocked(s)
 
 	// Sidecar first: a crash between the two steps leaves metadata without a
 	// file (harmless) rather than an orphan file without metadata. No fsync
@@ -597,6 +717,7 @@ func (m *Manager) Recover() {
 
 	m.mu.Lock()
 	for _, s := range sessions {
+		m.migrateKeyLocked(s)
 		m.sessions[s.SessionID] = s
 		switch s.State {
 		case StateRecording:
@@ -640,9 +761,23 @@ func (m *Manager) Recover() {
 		case StateUploaded:
 			if _, err := os.Stat(s.FilePath()); err == nil {
 				// Crash between "uploaded" and the local delete: re-run the upload;
-				// the conditional put + size check converges without a second copy.
+				// the object's session manifest tells the attempt that this
+				// session is already stored, so nothing is uploaded twice.
 				m.log.Warn("uploaded recording still has its local file; re-verifying", "id", s.ID, "session", s.SessionID)
 				s.State = StateFinalized
+				toUpload = append(toUpload, s)
+			}
+		case StateKept:
+			// Kept mode: a capture that still has no .m4a never finished its
+			// remux (crash, or the process stopped before the worker ran).
+			if m.up != nil {
+				continue
+			}
+			if _, err := os.Stat(s.FilePath()); err != nil {
+				continue
+			}
+			if _, err := os.Stat(s.OutputPath()); errors.Is(err, os.ErrNotExist) {
+				m.log.Info("kept recording has no remuxed file yet; remuxing again", "id", s.ID, "session", s.SessionID)
 				toUpload = append(toUpload, s)
 			}
 		default:
@@ -659,7 +794,27 @@ func (m *Manager) Recover() {
 	}
 }
 
-// warnOrphans logs audio files that have no sidecar (nothing is deleted).
+// migrateKeyLocked upgrades a sidecar written by 1.0.x, whose Key names a
+// per-session .aac inside a folder, to the 1.1.0 layout where the key names the
+// one object of the recording. Terminal sessions are left alone: their .aac
+// object exists in the bucket and renaming them would only lose the record of
+// where it is.
+func (m *Manager) migrateKeyLocked(s *Session) {
+	if s.IsTerminal() || strings.HasSuffix(strings.ToLower(s.Key), objectExt) {
+		return
+	}
+	old := s.Key
+	key, _ := m.keyForLocked(s)
+	s.setKey(key)
+	if err := s.save(); err != nil {
+		m.log.Warn("save sidecar", "id", s.ID, "session", s.SessionID, "error", err)
+	}
+	m.log.Info("migrated recording to the 1.1.0 single-object layout", "id", s.ID, "session", s.SessionID,
+		"oldKey", old, "newKey", s.Key)
+}
+
+// warnOrphans logs audio files that have no sidecar (nothing is deleted). A
+// kept .m4a next to its .json is not an orphan, so both extensions count.
 func (m *Manager) warnOrphans() {
 	entries, err := os.ReadDir(m.root)
 	if err != nil {
@@ -674,387 +829,17 @@ func (m *Manager) warnOrphans() {
 			continue
 		}
 		for _, f := range files {
-			if strings.HasSuffix(f.Name(), ".aac") {
-				sidecar := filepath.Join(m.root, e.Name(), strings.TrimSuffix(f.Name(), ".aac")+".json")
-				if _, err := os.Stat(sidecar); err != nil {
-					m.log.Warn("orphan recording without metadata (left untouched)", "file", filepath.Join(m.root, e.Name(), f.Name()))
-				}
-			}
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Upload
-// ---------------------------------------------------------------------------
-
-func (m *Manager) enqueueUpload(s *Session) {
-	m.mu.Lock()
-	if m.shuttingDown.Load() || m.uploadLoops[s.SessionID] {
-		m.mu.Unlock()
-		return
-	}
-	if m.up == nil {
-		s.State = StateKept
-		_ = s.save()
-		m.mu.Unlock()
-		m.log.Info("uploads disabled, recording kept locally", "id", s.ID, "file", s.FilePath())
-		return
-	}
-	m.uploadLoops[s.SessionID] = true
-	m.uploadWG.Add(1)
-	m.mu.Unlock()
-	go m.uploadLoop(s)
-}
-
-var blockedRetryInterval = 15 * time.Minute // var so tests can shorten it
-
-func (m *Manager) uploadLoop(s *Session) {
-	defer m.uploadWG.Done()
-	ctx := m.uploadCtx
-	backoff := 5 * time.Second
-	log := m.log.With("id", s.ID, "session", s.SessionID)
-
-	finish := func() {
-		m.mu.Lock()
-		delete(m.uploadLoops, s.SessionID)
-		m.mu.Unlock()
-	}
-	for {
-		select {
-		case m.uploadSem <- struct{}{}:
-		case <-ctx.Done():
-			finish()
-			return
-		}
-		m.met.UploadsInProgress.Inc()
-		err := m.uploadOnce(ctx, s)
-		m.met.UploadsInProgress.Dec()
-		<-m.uploadSem
-
-		if err == nil {
-			finish()
-			return
-		}
-		if ctx.Err() != nil {
-			m.mu.Lock()
-			if s.State == StateUploading {
-				s.State = StateFinalized
-				_ = s.save()
-			}
-			m.mu.Unlock()
-			finish()
-			return
-		}
-		if errors.Is(err, ErrObjectExists) {
-			m.mu.Lock()
-			if s.KeyRenames < 3 {
-				old := s.Key
-				s.KeyRenames++
-				s.Key = withSuffix(s.Key, "-"+strconv.Itoa(s.KeyRenames+1))
-				s.UploadAttempts++
-				s.State = StateFinalized
-				_ = s.save()
-				m.mu.Unlock()
-				log.Warn("object key already taken by a different object; using a new key", "oldKey", old, "newKey", s.Key)
+			name := f.Name()
+			ext := filepath.Ext(name)
+			if ext != ".aac" && ext != objectExt {
 				continue
 			}
-			renames := s.KeyRenames
-			m.mu.Unlock()
-			err = &PermanentError{Err: fmt.Errorf("object key still conflicts after %d renames: %w", renames, err)}
-		}
-
-		var perm *PermanentError
-		blocked := errors.As(err, &perm)
-		wait := backoff
-		if blocked {
-			wait = blockedRetryInterval
-		}
-		next := time.Now().Add(wait)
-		m.mu.Lock()
-		s.State = StateFinalized
-		s.LastError = "upload: " + err.Error()
-		s.UploadAttempts++
-		s.UploadBlocked = blocked
-		s.NextUploadAt = &next
-		attempts := s.UploadAttempts
-		_ = s.save()
-		m.mu.Unlock()
-		m.met.UploadsTotal.WithLabelValues("failure").Inc()
-		m.met.UploadRetriesTotal.Inc()
-		if blocked {
-			log.Error("upload failed with a permanent-looking error (credentials/bucket/request); will retry slowly",
-				"error", err, "attempt", attempts, "retryIn", wait.String())
-		} else {
-			log.Warn("upload failed, will retry", "error", err, "attempt", attempts, "retryIn", wait.String())
-		}
-
-		select {
-		case <-ctx.Done():
-			finish()
-			return
-		case <-time.After(wait):
-		}
-		if !blocked {
-			backoff *= 2
-			if backoff > m.cfg.UploadBackoffMax {
-				backoff = m.cfg.UploadBackoffMax
+			sidecar := filepath.Join(m.root, e.Name(), strings.TrimSuffix(name, ext)+".json")
+			if _, err := os.Stat(sidecar); err != nil {
+				m.log.Warn("orphan recording without metadata (left untouched)", "file", filepath.Join(m.root, e.Name(), name))
 			}
 		}
 	}
-}
-
-// uploadOnce performs one upload attempt: the audio file (skipped when an
-// earlier attempt already stored it), then the folder's index.m3u8. A nil
-// return means the session reached a terminal state (uploaded, or failed for
-// a non-retryable reason).
-func (m *Manager) uploadOnce(ctx context.Context, s *Session) error {
-	m.mu.Lock()
-	path, key := s.FilePath(), s.Key
-	st, err := os.Stat(path)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			m.mu.Unlock()
-			return err
-		}
-		size, stored := s.Size, s.MediaUploaded
-		m.mu.Unlock()
-		// The file may be gone because a previous run uploaded it and crashed
-		// before recording that; ask the store before declaring data lost.
-		if !stored {
-			if v, ok := m.up.(Verifier); ok && key != "" && size > 0 {
-				exists, verr := v.Exists(ctx, key, size)
-				if verr != nil {
-					return fmt.Errorf("recording file missing; could not verify remote object: %w", verr)
-				}
-				stored = exists
-			}
-		}
-		if !stored {
-			m.mu.Lock()
-			s.State = StateFailed
-			s.LastError = "recording file missing"
-			_ = s.save()
-			m.mu.Unlock()
-			m.log.Error("recording file missing, cannot upload", "id", s.ID, "file", path)
-			return nil
-		}
-		m.mu.Lock()
-		if !s.MediaUploaded {
-			m.log.Warn("recording file missing locally but the object exists remotely", "id", s.ID, "key", key)
-			s.MediaUploaded = true
-		}
-		s.State = StateUploading
-		_ = s.save()
-		m.mu.Unlock()
-		return m.completeUpload(ctx, s)
-	}
-	if st.Size() == 0 {
-		s.State = StateFailed
-		s.LastError = "empty recording (no data captured)"
-		_ = s.save()
-		m.mu.Unlock()
-		m.log.Error("empty recording, nothing to upload", "id", s.ID, "session", s.SessionID)
-		return nil
-	}
-	size := st.Size()
-	s.State = StateUploading
-	s.Bytes = size
-	s.Size = size
-	_ = s.save()
-	if s.MediaUploaded {
-		// Stored by an earlier attempt; only the playlist is left to do.
-		m.mu.Unlock()
-		return m.completeUpload(ctx, s)
-	}
-	m.mu.Unlock()
-
-	// The playlist needs the exact playback time, which only the ADTS frame
-	// headers can tell (one sequential read of the file). The scan must never
-	// stop an upload: on any problem the wall-clock length is used instead. When
-	// the session has run records, ScanRuns gives every byte range its
-	// authoritative frame count and duration for the per-run playlist segments.
-	m.mu.Lock()
-	runOffsets := make([]int64, len(s.Runs))
-	for i := range s.Runs {
-		runOffsets[i] = s.Runs[i].Offset
-	}
-	m.mu.Unlock()
-
-	var (
-		info     adts.Info
-		runInfos []adts.Info
-	)
-	if len(runOffsets) > 0 {
-		var rerr error
-		runInfos, info, rerr = scanRunsRecording(path, runOffsets)
-		if rerr != nil {
-			m.log.Warn("could not measure recording runs; falling back to a whole-file scan",
-				"id", s.ID, "session", s.SessionID, "error", rerr)
-			runInfos = nil
-			info, rerr = scanRecording(path)
-			if rerr != nil {
-				m.log.Warn("could not measure recording; using the session length", "id", s.ID, "session", s.SessionID, "error", rerr)
-			}
-		}
-	} else {
-		var serr error
-		info, serr = scanRecording(path)
-		if serr != nil {
-			m.log.Warn("could not measure recording; using the session length", "id", s.ID, "session", s.SessionID, "error", serr)
-		}
-	}
-	if info.Junk > 0 {
-		m.log.Warn("recording contains bytes outside ADTS frames", "id", s.ID, "session", s.SessionID,
-			"bytes", info.Junk, "frames", info.Frames, "tags", info.Tags)
-	}
-
-	m.mu.Lock()
-	if runInfos != nil {
-		for i := range s.Runs {
-			if i < len(runInfos) {
-				s.Runs[i].Frames = runInfos[i].Frames
-				s.Runs[i].DurationSeconds = runInfos[i].Duration.Seconds()
-			}
-		}
-		// Sanity: reconcile the last run's byte length with the real file size
-		// (the sidecar counter can lag the on-disk file by a persist interval).
-		if n := len(s.Runs); n > 0 {
-			last := &s.Runs[n-1]
-			if last.Offset+last.Bytes != size {
-				m.log.Debug("adjusting last run byte length to file size", "id", s.ID, "session", s.SessionID,
-					"was", last.Bytes, "now", size-last.Offset)
-				last.Bytes = size - last.Offset
-			}
-		}
-	}
-	s.DurationSeconds = info.Duration.Seconds()
-	if info.Frames == 0 && s.SessionEnd != nil {
-		// Not recognisable as ADTS: fall back to the wall-clock length.
-		s.DurationSeconds = s.SessionEnd.Sub(s.SessionStart).Seconds()
-	}
-	meta := map[string]string{
-		"recording-id":     s.ID,
-		"session-id":       s.SessionID,
-		"name":             s.Name,
-		"source":           RedactURL(s.Source),
-		"scheduled-start":  s.Start.UTC().Format(time.RFC3339),
-		"scheduled-end":    s.End.UTC().Format(time.RFC3339),
-		"session-start":    s.SessionStart.UTC().Format(time.RFC3339),
-		"duration-seconds": strconv.FormatFloat(s.DurationSeconds, 'f', 3, 64),
-		"codec":            s.ResolvedCodec,
-		"ffmpeg-restarts":  strconv.Itoa(s.Restarts),
-		"finish-reason":    s.FinishReason,
-		"recorder-version": m.version,
-	}
-	if s.SessionEnd != nil {
-		meta["session-end"] = s.SessionEnd.UTC().Format(time.RFC3339)
-	}
-	// Why the runs restarted, e.g. "demux-error=3,stream-ended=1" (kept small:
-	// bounded set of reasons, omitted when there were no exits).
-	if reasons := exitReasonsSummary(s.Exits); reasons != "" {
-		meta["ffmpeg-exit-reasons"] = reasons
-	}
-	// Clock provenance of the recording (omitted for old sidecars without runs).
-	if len(s.Runs) > 0 {
-		meta["ffmpeg-runs"] = strconv.Itoa(len(s.Runs))
-		meta["first-sample-time"] = s.Runs[0].Anchor.UTC().Format("2006-01-02T15:04:05.000Z07:00")
-		meta["clock-source"] = s.Runs[0].AnchorSource
-	}
-	m.mu.Unlock()
-
-	// Per-attempt deadline: 10 minutes plus the transfer time at the assumed
-	// minimum throughput (UPLOAD_MIN_THROUGHPUT). Stalls are bounded separately
-	// by the HTTP client's response-header timeout.
-	minRate := m.cfg.UploadMinThroughput
-	if minRate <= 0 {
-		minRate = 128 * 1024
-	}
-	attempt := 10*time.Minute + time.Duration(size/minRate)*time.Second
-	uctx, cancel := context.WithTimeout(ctx, attempt)
-	defer cancel()
-
-	m.log.Info("upload started", "id", s.ID, "session", s.SessionID, "key", key, "bytes", size,
-		"duration", info.Duration.Truncate(time.Millisecond).String())
-	t0 := time.Now()
-	etag, err := m.up.Upload(uctx, path, key, "audio/aac", meta)
-	if err != nil {
-		return err
-	}
-	dur := time.Since(t0)
-
-	// Remember the stored object BEFORE touching the playlist so a retry never
-	// uploads the audio twice. If the sidecar write fails the in-memory flag
-	// still skips the re-upload; after a crash the conditional put + size
-	// check converge on the same result.
-	m.mu.Lock()
-	s.MediaUploaded = true
-	s.UploadETag = etag
-	if err := s.save(); err != nil {
-		m.log.Warn("record upload in sidecar", "id", s.ID, "session", s.SessionID, "error", err)
-	}
-	m.mu.Unlock()
-	m.met.UploadBytesTotal.Add(float64(size))
-	m.met.UploadDuration.Observe(dur.Seconds())
-	m.log.Info("audio uploaded", "id", s.ID, "session", s.SessionID, "key", key, "bytes", size,
-		"duration", dur.Truncate(time.Millisecond).String(), "etag", etag)
-	return m.completeUpload(ctx, s)
-}
-
-// scanRecording measures the file with adts.Scan, converting a panic in the
-// parser into an error: a malformed recording must never crash the process
-// (and with it every live recording) in an upload retry loop.
-func scanRecording(path string) (info adts.Info, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			info, err = adts.Info{}, fmt.Errorf("adts scan panicked: %v", r)
-		}
-	}()
-	return adts.Scan(path)
-}
-
-// scanRunsRecording is scanRecording for the per-run byte ranges, with the same
-// panic-to-error guard.
-func scanRunsRecording(path string, offsets []int64) (runs []adts.Info, total adts.Info, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			runs, total, err = nil, adts.Info{}, fmt.Errorf("adts scanRuns panicked: %v", r)
-		}
-	}()
-	return adts.ScanRuns(path, offsets)
-}
-
-// completeUpload publishes the folder's playlist, marks the session uploaded
-// and removes the local file (in that order: the file is only deleted once
-// the sidecar durably says "uploaded").
-func (m *Manager) completeUpload(ctx context.Context, s *Session) error {
-	if err := m.publishPlaylist(ctx, s); err != nil {
-		return err
-	}
-	now := time.Now()
-	m.mu.Lock()
-	path := s.FilePath()
-	s.State = StateUploaded
-	s.UploadedAt = &now
-	s.UploadAttempts++
-	s.UploadBlocked = false
-	s.LastError = ""
-	s.NextUploadAt = nil
-	if err := s.save(); err != nil {
-		// Never delete the file while the sidecar still says "uploading".
-		s.State = StateFinalized
-		m.mu.Unlock()
-		return fmt.Errorf("record upload in sidecar: %w", err)
-	}
-	key, size := s.Key, s.Size
-	m.mu.Unlock()
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		m.log.Warn("remove uploaded file (will be retried on next start)", "file", path, "error", err)
-	}
-
-	m.met.UploadsTotal.WithLabelValues("success").Inc()
-	m.log.Info("upload finished", "id", s.ID, "session", s.SessionID, "key", key, "playlist", playlistKey(key), "bytes", size)
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,14 +1096,16 @@ type RecordingView struct {
 	StderrSuppressed int        `json:"stderrSuppressed,omitempty"` // benign lines dropped this run (active only)
 	ScheduleNote     string     `json:"scheduleNote,omitempty"`
 	LastStderr       []string   `json:"lastStderr,omitempty"`
-	Key              string     `json:"key"`
-	Playlist         string     `json:"playlist,omitempty"`
+	Key              string     `json:"key"` // the single object this recording is stored as
 	DurationSeconds  float64    `json:"durationSeconds,omitempty"`
 	UploadAttempts   int        `json:"uploadAttempts"`
 	UploadBlocked    bool       `json:"uploadBlocked,omitempty"`
 	UploadedAt       *time.Time `json:"uploadedAt,omitempty"`
 	NextUploadAt     *time.Time `json:"nextUploadAt,omitempty"`
-	File             string     `json:"file,omitempty"`
+	File             string     `json:"file,omitempty"`       // local capture, while it exists
+	OutputFile       string     `json:"outputFile,omitempty"` // kept mode: the local .m4a
+	RemuxFailures    int        `json:"remuxFailures,omitempty"`
+	Transcoded       bool       `json:"transcoded,omitempty"` // the object had to be re-encoded
 }
 
 // UploadStats summarises upload queue state.
@@ -1346,7 +1133,8 @@ func (m *Manager) Recordings() []RecordingView {
 			ScheduleNote: s.ScheduleNote, Key: s.Key,
 			DurationSeconds: s.DurationSeconds,
 			UploadAttempts:  s.UploadAttempts, UploadBlocked: s.UploadBlocked, UploadedAt: s.UploadedAt,
-			NextUploadAt: s.NextUploadAt, File: s.FilePath(),
+			NextUploadAt: s.NextUploadAt, File: s.FilePath(), OutputFile: s.OutputFile,
+			RemuxFailures: s.RemuxFailures, Transcoded: s.Transcoded,
 		}
 		// exits[] and runs[] are shown for ALL states so finished/uploaded items
 		// still reveal why they restarted and where each run's clock sits; copy
@@ -1357,10 +1145,11 @@ func (m *Manager) Recordings() []RecordingView {
 		if len(s.Runs) > 0 {
 			v.Runs = append([]Run(nil), s.Runs...)
 		}
-		if s.Key != "" {
-			v.Playlist = playlistKey(s.Key)
-		}
 		if s.State == StateUploaded {
+			v.File = ""
+		}
+		if s.State == StateKept && s.OutputFile != "" {
+			// The capture is gone once the remux succeeded; the .m4a is the file.
 			v.File = ""
 		}
 		if ar, ok := m.active[s.ID]; ok && ar.s == s {

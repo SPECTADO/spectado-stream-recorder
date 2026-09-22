@@ -1,10 +1,11 @@
 # spectado-stream-recorder
 
 Records many live audio streams (HLS or Icecast/HTTP) in parallel — one `ffmpeg`
-per stream — into a single `.aac` file per scheduled show, then uploads it to
-Cloudflare R2 (or any S3-compatible bucket) into a folder per recording together
-with an HLS playlist (`index.m3u8`). Designed to run ~100 concurrent recordings in
-one container.
+per stream — into a raw ADTS/AAC file per recording session, then remuxes it into
+a single `.m4a` (AAC in an MP4/M4A container) and uploads it to Cloudflare R2 (or
+any S3-compatible bucket) as **one object per recording**:
+`/YYYY-MM-DD/{streamId}.m4a`. Designed to run ~100 concurrent recordings in one
+container.
 
 * Schedule is a JSON document fetched periodically from a URL (default every 60 s).
   A failed fetch never changes anything: the last known good schedule stays in force.
@@ -14,6 +15,36 @@ one container.
   finished ones are uploaded, nothing is deleted before the upload is verified.
 * Heartbeat, readiness, JSON state API and Prometheus metrics (recorder + system
   + container cgroup + per-stream ffmpeg CPU/RSS).
+
+## Breaking changes in 1.1.0
+
+* **Output format is `.m4a`, not `.aac`.** Recording on disk is still raw ADTS
+  (crash-safe append, resume, tail trimming), but the object uploaded to the
+  bucket is remuxed AAC-in-MP4 (`ffmpeg -c:a copy`, `-f ipod`, `+faststart`).
+  Raw ADTS carries no duration/index, so players and ffprobe had to *estimate*
+  length from bit rate × size — every ID3 tag, VBR frame or restart overlap
+  perturbed that estimate. The MP4 sample table gives an exact duration and
+  sample-accurate seeking instead. See "Output files and object keys" below.
+* **One object per recording, no playlist.** The bucket layout is now
+  `{S3_PREFIX}{YYYY-MM-DD of the scheduled start in KEY_DATE_TZ}/{safeId}.m4a`
+  (example: `2026-09-22/match-ro-jpOkle8Mp0.m4a`). There is no more
+  `index.m3u8`, no folder-per-recording and no byte-range segments; multiple
+  sessions of the same recording (rotation, an extension after the end, a
+  removed-and-re-added item) are merged into that single object instead of
+  being listed as separate playlist entries.
+* **Explicit schedule `key` now names the object itself**, not a folder:
+  `{S3_PREFIX}{trim(key,"/")}.m4a` (the `.m4a` suffix is not duplicated if the
+  key already ends with it, case-insensitively).
+* **In-band ID3 wall-clock tags are gone.** `CLOCK_ID3_INTERVAL` is removed
+  (setting it now only logs a startup warning); the wall clock is carried in
+  MP4 metadata instead (`creation_time`, and a machine-readable `description`
+  JSON table — see below). `CLOCK_PDT_LOOKUP` is unchanged and still anchors
+  each run's wall clock.
+* The `playlist` field is gone from `/api/state` / `/api/recordings`; new
+  fields `outputFile`, `remuxFailures` and `transcoded` were added.
+* Upgrading in place: sessions left over from 1.0.x with a `.aac` key are
+  recomputed to the new `.m4a` key and continue normally; the old-layout `.aac`
+  object, if one was already uploaded, stays in the bucket untouched.
 
 ---
 
@@ -42,7 +73,9 @@ one container.
                           │   sidecar <session>.json     ├─ supervisor goroutine
                           │   (state, bytes, key, …)     │    └─ ffmpeg … -f adts pipe:1 ──▶ append <session>.aac
                           │                              │       (restart with backoff, stall watchdog)
-                          └─ finalize ─▶ upload queue ──▶ S3/R2 (multipart, verified) ─▶ index.m3u8 ─▶ delete local file
+                          └─ finalize ─▶ upload queue ──▶ remux (ffmpeg -c:a copy → .m4a) ──▶ S3/R2 (conditional
+                                                            (transcode fallback if the           write, verified) ─▶
+                                                             stream params changed mid-file)      delete local file
 ```
 
 * **One process per stream.** `ffmpeg` reads the source (HLS or Icecast) and writes
@@ -55,19 +88,26 @@ one container.
 * **Sidecar per session.** Every recording session is described by a small JSON
   file next to the audio (`/data/recordings/<id>/<session>.json`). It is the
   source of truth after a restart: unfinished sessions resume, finished ones upload.
-* **Upload after the end.** When the window closes the file is fsynced, closed,
-  uploaded with the AWS SDK multipart uploader, verified with `HeadObject`
-  (size must match), listed in the folder's `index.m3u8` and only then deleted
-  locally. Failures retry forever with backoff; permanent-looking errors
-  (credentials, bucket) retry slowly and are flagged as *blocked*.
+* **Remux, then upload.** When the window closes the ADTS file is fsynced and
+  closed, then remuxed with `ffmpeg -c:a copy` (no re-encode) into a `.m4a` whose
+  MP4 sample table carries the exact duration and sample-accurate seeking. The
+  result is uploaded with the AWS SDK, verified with `HeadObject` (size and ETag
+  must match) and only then is the local `.aac` deleted. Several sessions of the
+  same recording are merged into one object (locally, or by downloading and
+  re-remuxing the existing object) rather than becoming separate files. Failures
+  retry forever with backoff; permanent-looking errors (credentials, bucket)
+  retry slowly and are flagged as *blocked*; a stream whose AAC parameters change
+  mid-recording is transcoded instead of copied; an object that fails to remux
+  three times in a row is uploaded raw as a marked `.aac` fallback so audio is
+  never silently lost.
 
 State machine per session:
 
 ```
-recording ─▶ finalized ─▶ uploading ─▶ uploaded          (local file deleted)
+recording ─▶ finalized ─▶ uploading ─▶ uploaded          (local file deleted, .m4a in the bucket)
     │            │                          
-    │            └────────────────────────▶ kept          (UPLOAD_DISABLED=true)
-    │                                       failed        (empty file / file missing)
+    │            └────────────────────────▶ kept          (UPLOAD_DISABLED=true: remuxed to <session>.m4a locally)
+    │                                       failed        (empty file / file missing / no ADTS frames)
     └── shutdown: stays "recording" with suspendedAt, resumed on next start
 ```
 
@@ -139,7 +179,7 @@ are ignored.
 | `source` / `url` | yes | `http(s)` URL of an HLS playlist or an Icecast/HTTP stream. Prefer *media* playlists over master playlists. |
 | `type` | no | `hls`, `icecast` or `auto` (default). Only used to pick HLS-specific ffmpeg options; `.m3u8` URLs are detected automatically. |
 | `start`, `end` | yes | RFC 3339 (`2026-08-30T06:00:00+02:00`, fractional seconds allowed) or unix seconds (number or numeric string; > 1e11 is treated as milliseconds). Timestamps **without an offset** are interpreted in `SCHEDULE_DEFAULT_TZ` (default UTC). `end` must be after `start`. Aliases: `startTime`, `start_time`, `from`; `endTime`, `end_time`, `to`. |
-| `key` / `objectKey` | no | Explicit folder in the bucket for this recording (`S3_PREFIX` is still prepended); it receives the audio file(s) and `index.m3u8`. Without it the default folder is used (see below). |
+| `key` / `objectKey` | no | Explicit object name for this recording's `.m4a` in the bucket (`S3_PREFIX` is still prepended, `.m4a` appended unless already present). Without it the default `{date}/{safeId}.m4a` key is used (see below). |
 | `codec` | no | `auto` (default, probe and copy AAC sources), `copy`, or `aac` (always transcode). |
 | `bitrate` | no | Transcode bitrate (`"128k"` or a number in bit/s). Default `AUDIO_BITRATE`. |
 | `headers` | no | Extra HTTP headers sent by ffmpeg (auth tokens, referer …). Never exposed by the API. |
@@ -170,8 +210,12 @@ Duplicate `id`s: the first wins. Duplicate explicit `key`s: the second is invali
   logged and counted; the last known schedule stays in force. On startup the last
   good schedule is also loaded from `DATA_DIR/schedule.cache.json`.
 * **Extension after the end**: if `end` is moved later after the session already
-  finished, a new session (a second file in the same folder, added to its
-  `index.m3u8`) records the extension. A removed and re-added item records again.
+  finished, a new session (a second part of the same recording) captures the
+  extension and is merged into the same `.m4a` object. A removed and re-added
+  item records again and merges the same way. A new session started while an
+  earlier session of the same recording id and key is still uploading inherits
+  that session's key ("key pinning") instead of recomputing one, so extensions,
+  re-added items and midnight rollovers all land in the same object.
 * **Restart / crash**: unfinished sessions found in `DATA_DIR` are resumed from
   their sidecar (no schedule needed), appending to the same file after trimming a
   possibly partial trailing ADTS frame. Finished sessions are queued for upload.
@@ -185,88 +229,141 @@ Duplicate `id`s: the first wins. Duplicate explicit `key`s: the second is invali
   If ffmpeg rejects one of the optional tuning options (older build, unusual
   source) the session automatically falls back to a minimal command line.
 * **Optional rotation**: `MAX_SESSION_DURATION=6h` splits very long windows into
-  parts that are uploaded as they complete (all listed in the same `index.m3u8`).
+  parts. The upload of a finished part is deferred while a sibling session of the
+  same recording is still recording, so rotation merges all parts into the one
+  object, in order, once the whole recording has finished — rotation no longer
+  bounds how much has to fit on local disk at once ahead of the merge.
 * **Disk protection**: below `MIN_FREE_DISK` no new recordings start
   (`recorder_disk_low=1`, `/readyz` → 503); running ones continue. A write error
-  (disk full) pauses the affected recording and retries every minute.
+  (disk full) pauses the affected recording and retries every minute. Low disk
+  also blocks the remux/upload drain path (a remux needs working space for the
+  output file, and a merge needs room for the downloaded remote object too), so
+  a sustained `DiskLow` grows the upload backlog, not just stops new starts.
 
 ## Output files and object keys
 
-* Local: `DATA_DIR/recordings/<safeId>/<safeId>_<sessionStartUTC>.aac` + `.json`.
-* Bucket: **one folder per recording** holding the audio file(s) and an HLS playlist:
-
+* Local: `DATA_DIR/recordings/<safeId>/<safeId>_<sessionStartUTC>.aac` + `.json`
+  (raw ADTS while recording; unchanged from 1.0.x — this is still the crash-safe
+  append target). `SafeID` turns an arbitrary `id` into a filesystem/object-safe
+  name: strings using only `[A-Za-z0-9._-]` up to 64 chars pass through unchanged
+  (`match-ro-jpOkle8Mp0` stays as is); anything else is truncated to 48 chars and
+  gets an `-<8 hex>` suffix so distinct raw ids never collide.
+* Bucket: **one object per recording**, named `{S3_PREFIX}{YYYY-MM-DD of the
+  scheduled start in KEY_DATE_TZ}/{safeId}.m4a` — e.g.
+  `2026-09-22/match-ro-jpOkle8Mp0.m4a`. There is no folder, no `index.m3u8` and
+  no per-session file: every session of the same recording id that shares that
+  key is merged into this single object.
+* **Explicit `key`** names the object directly:
+  `{S3_PREFIX}{strings.Trim(key, "/")}` + `.m4a` (the suffix is not duplicated
+  if `key` already ends in `.m4a`, case-insensitively).
+* **Key pinning.** When a session starts, if a known session with the same
+  recording id already exists whose scheduled end + 1 h is still after the new
+  session's start (an extension after the end, a removed-and-re-added item, a
+  start that crosses midnight, or a `MAX_SESSION_DURATION` rotation), the new
+  session inherits that session's key verbatim instead of recomputing one from
+  today's date — otherwise every part of one continuous recording would land in
+  a different day's object. The key of a recording, once assigned, only ever
+  changes if the object turns out to be foreign (see below).
+* **Merging.** Sessions that share the same object key *and* the same recording
+  id are a *group*; the group's sessions are uploaded together as one attempt:
+    * If they are **all still on local disk**, they are combined and remuxed in
+      one pass (the upload of an earlier-finished session is deferred 30 s at a
+      time while a sibling of the same key is still recording, so rotation
+      merges once, in order, at the very end).
+    * If the object **already exists** in the bucket (an earlier session of this
+      recording already uploaded), the group merges with it: the existing object
+      is downloaded, its AAC is extracted, the new sessions' ADTS is appended,
+      the whole thing is remuxed again, and the object is replaced with a
+      conditional write (`If-Match` on the ETag just read) so a concurrent
+      writer can never be silently overwritten — a changed ETag simply restarts
+      the merge from a fresh `HEAD`.
+    * Merging is only attempted when the bucket has been proven — at startup,
+      once the bucket check succeeds — to enforce conditional writes (see
+      `ConditionalWrites` under Deployment
+      notes); otherwise, or if the object turns out not to be this recording's
+      (no `recording-id` metadata, a different `recording-id`, an inconsistent
+      manifest, an out-of-order part, or more than 20 parts already merged), the
+      new sessions are **never appended blindly** — they get a `-2`, `-3` … key
+      suffix instead (capped at `-4`, then a permanent error) and
+      `recorder_object_key_renames_total{reason}` fires so the split is visible.
+    * A manifest that names more sessions than the object's declared part count
+      is treated as inconsistent and blocks that key entirely (fail closed,
+      logged as an error) rather than risk corrupting a merge.
+* **Remux, not concatenation.** The object is built with
+  `ffmpeg -c:a copy -movflags +faststart -f ipod` (stream copy, no re-encode):
+  raw ADTS has no duration/index, so bare byte concatenation plus an estimated
+  duration is exactly the bug this format change fixes (see the intro). A
+  stream copy is only correct when every part shares the same AAC parameters
+  (profile, sample rate, channel config, raw-data-blocks); if a recording's
+  parameters changed mid-way (source swap, codec fallback) the affected chunks
+  are re-encoded once through ffmpeg's `concat` filter instead, and the object's
+  metadata gets `transcoded=true`. HE-AAC (implicit SBR) keeps its ADTS base
+  sample rate in the `.m4a` and is treated as uniform.
+* **Remux fallback.** After three consecutive remux failures for a key, the
+  affected sessions are uploaded as raw ADTS instead, so audio is never
+  permanently stuck out of the bucket: key `…-without-the-.m4a-suffix.aac`,
+  content type `audio/aac`, metadata `remux-failed=true`. This never merges with
+  an existing `.m4a` object (a foreign-looking mix of formats under one key is
+  avoided by renaming the group first); it is meant to be remuxed by hand.
+* **MP4 metadata** (`ffmpeg -metadata …`, second precision, UTF-8, iTunes
+  `ilst` for title/date/comment): `creation_time` = the first run's wall-clock
+  anchor (falls back to the first session's scheduled start; omitted if still
+  zero), `title` = the recording's name (or id), `date` = the scheduled start
+  date (`YYYY-MM-DD`, `KEY_DATE_TZ`), `comment` = recorder version, id, scheduled
+  window and redacted source. `description` is a single-line JSON array, one
+  entry per ffmpeg run across every merged part, in file order — the
+  machine-readable position → wall-clock map that replaces the playlist's
+  `#EXT-X-PROGRAM-DATE-TIME`:
+  ```json
+  [{"sid":"<sessionId>","t":"<anchor RFC3339 ms UTC>","src":"hls-pdt","off":0.000,"dur":3600.240}, …]
   ```
-  {S3_PREFIX}{YYYY-MM-DD of scheduled start, UTC}/{safeId}/
-  ├── index.m3u8                                     lists every audio file of the folder
-  └── {safeId}_{sessionStart YYYYMMDDTHHMMSSZ}.aac   one per session — normally exactly one
-  ```
-
-  Example: `2026-09-03/match-fr-V946ydgjnx/index.m3u8` and
-  `2026-09-03/match-fr-V946ydgjnx/match-fr-V946ydgjnx_20260903T184400Z.aac`.
-* Explicit `key`: names the folder instead (`{S3_PREFIX}{key}/`); the file names inside
-  are the same.
-* Several sessions of one show (rotation via `MAX_SESSION_DURATION`, an extension after
-  the end, a removed and re-added item) become several files in the same folder. After
-  each audio upload `index.m3u8` is rewritten as the union of what it already lists and
-  the files the recorder knows about, in chronological order and separated by
-  `#EXT-X-DISCONTINUITY`. Order of operations: audio uploaded and verified → sidecar
-  remembers it → playlist written → sidecar says *uploaded* → local file deleted. A
-  failure in the playlist step retries without re-uploading the audio.
-* `index.m3u8` is a VOD "packed audio" playlist: `#EXT-X-PLAYLIST-TYPE:VOD`,
-  `#EXT-X-ENDLIST`; content type `application/vnd.apple.mpegurl`. Each ffmpeg run of a
-  file is one segment: `#EXT-X-PROGRAM-DATE-TIME` (the wall-clock time of the run's first
-  sample), `#EXTINF` with the exact duration counted from the ADTS frames, and
-  `#EXT-X-BYTERANGE:<length>@<offset>` into the file. Restarts and resumes therefore show
-  up as several byte-range segments of the same `.aac`, each separated by
-  `#EXT-X-DISCONTINUITY` and carrying its own program-date-time. The playlist is
-  `#EXT-X-VERSION:4` as soon as any segment carries a byte range; a legacy folder written
-  before this feature (one whole-file segment, no byte range) still renders as
-  `#EXT-X-VERSION:3` and both merge losslessly.
-* The wall clock is also embedded **in band**. Every run starts with, and then every
-  `CLOCK_ID3_INTERVAL` of media time carries, a small ID3v2.4 tag between ADTS frames
-  holding: an Apple `PRIV` `com.apple.streaming.transportStreamTimestamp` frame (a 33-bit
-  90 kHz PTS — what hls.js turns into `basePTS`), a `TXXX WALLCLOCK` frame with the
-  RFC 3339 wall clock in milliseconds UTC, and a `TXXX WALLCLOCK-SOURCE` frame
-  (`hls-pdt` or `wallclock`). Set `CLOCK_ID3_INTERVAL=0` to disable the in-band tags.
-* **Consuming the clock.** In hls.js the per-segment time is on `frag.programDateTime`
-  and `hls.playingDate` maps playback position to wall time; the in-band tags arrive as
-  `Hls.Events.FRAG_PARSING_METADATA` samples (decode the ID3 with `id3.js` or hls.js's own
-  `Hls.utils` demuxer). `ffprobe -show_format file.aac` prints the first tag as
-  `TAG:WALLCLOCK=…`; ffmpeg's ADTS demuxer raises a metadata-update event for each later
-  tag. The `PRIV` timestamp makes the file acceptable to native Apple packed-audio players
-  as well.
+  `off`/`dur` are the run's position and duration (seconds) inside the merged
+  file; restart overlaps and gaps are **not** trimmed, so consumers map wall
+  time through this table rather than assuming a constant rate. When merging
+  with a remote object its table is kept verbatim in front. Capped at 500
+  entries (older runs coalesced one-per-session).
+* **Consuming the clock.** `ffprobe -show_format file.m4a` prints
+  `TAG:creation_time=…`, `TAG:title=…` and `TAG:description=[…]`; any MP4-aware
+  player gets correct duration and seeking natively from the sample table — no
+  in-band metadata parsing is needed any more.
 * **Accuracy** (target "a few seconds"). When the source playlist has
   `#EXT-X-PROGRAM-DATE-TIME` and `CLOCK_PDT_LOOKUP` is on, a run is anchored to the PDT of
   the segment ffmpeg will start with (`hls-pdt`); the residual error is at most one segment
   (the race between the recorder's playlist read and ffmpeg's own, ~5 s). Without a PDT (or
   with the lookup off) the anchor is the recorder's receipt time (`wallclock`), late by the
   live latency (~3 segments on a fresh start). Because a restart re-captures ~one segment
-  (fact: a gap is worse than a small overlap), a later run's program-date-time can step
-  slightly back from the previous run's end.
-* Audio uploads use `If-None-Match: *` so an existing object is never overwritten
-  silently (a different object under the same key makes the recorder pick `-2`, `-3`, …).
-  The playlist is the one object that is rewritten in place.
-* Object metadata (`x-amz-meta-*`) on the audio file: `recording-id`, `session-id`,
-  `name` (RFC 2047 encoded when non-ASCII), `source` (credentials redacted),
-  `scheduled-start`, `scheduled-end`, `session-start`, `session-end`,
-  `duration-seconds`, `codec`, `ffmpeg-restarts`, `ffmpeg-exit-reasons`,
-  `finish-reason`, `recorder-version`, and — when the session has run records —
-  `ffmpeg-runs` (number of byte-range segments), `first-sample-time` (the first
-  run's wall-clock anchor, RFC 3339 ms) and `clock-source` (`hls-pdt` or
-  `wallclock`). Content type `audio/aac`.
-  `ffmpeg-exit-reasons` is a compact, sorted `reason=count` summary of why the
-  runs ended (e.g. `demux-error=3,stream-ended=1`); it is omitted when there were
-  no exits. It stays small (S3/R2 user metadata is capped at ~2 KB total). It
-  summarises only the last 20 exits kept in `exits[]`, so for a session that
-  flapped more than 20 times its counts sum to less than `ffmpeg-restarts`
-  (the cumulative restart count); the unbounded per-reason totals live in the
-  `recorder_ffmpeg_exits_total{reason}` metric.
-* Format: raw ADTS (`.aac`). Every frame is self-describing, so a file made of
-  several ffmpeg runs (restarts, resume) plays in any decoder. Notes for consumers:
-  live HLS is delivered a few segments behind real time — the first run starts
-  ~3 segments back (natural pre-roll, why `RECORD_STOP_LATE` defaults to 30 s), and
-  restarts start at the live edge, so a restart may leave a small gap or, for
-  Icecast burst-on-connect, a few seconds of overlap.
+  (fact: a gap is worse than a small overlap), a later run's anchor can step
+  slightly back from the previous run's end — reflected verbatim in the `description` table.
+* Uploads that are not merging use `If-None-Match: *` so an existing foreign
+  object is never overwritten silently; merges use `If-Match` on the object's
+  current ETag instead. After every write the object is `HeadObject`-verified
+  (size and ETag).
+* Object metadata (`x-amz-meta-*`) on the `.m4a`: merge-critical keys
+  `recording-id`, `sessions` (comma list of an 8-hex-char digest per merged
+  session, in order), `parts` (count) and `last-session-start` are sanitised
+  first with a larger cap and never dropped, because merging depends on them.
+  Also `name` (RFC 2047 encoded when non-ASCII), `source` (credentials
+  redacted), `scheduled-start`/`scheduled-end` (earliest/latest),
+  `session-start`/`session-end` (earliest/latest), `duration-seconds` (probed
+  duration of the *whole* object — the API's per-session `durationSeconds`
+  stays per session), `frames`, `codec`, `profile` (`LC`/`HE-AAC`/… of the first
+  chunk), `sample-rate`, `channels`, `ffmpeg-restarts`, `ffmpeg-exit-reasons`,
+  `finish-reason`, `recorder-version`, `ffmpeg-runs`, `first-sample-time`,
+  `clock-source`, and — only when true — `transcoded`, `stream-params-changed`,
+  `remux-failed`. When merging with a remote object, `recording-id`, `name`,
+  `scheduled-start`, `session-start`, `first-sample-time`, `clock-source`,
+  `sessions` and `parts` are taken from the remote as the base and extended.
+  `ffmpeg-exit-reasons` is a compact, sorted `reason=count` summary (e.g.
+  `demux-error=3,stream-ended=1`), omitted when there were no exits, summarising
+  only the last 20 exits kept in `exits[]` (the unbounded per-reason totals live
+  in the `recorder_ffmpeg_exits_total{reason}` metric). Content type
+  `audio/mp4`.
+* Notes for consumers: live HLS is delivered a few segments behind real time —
+  the first run starts ~3 segments back (natural pre-roll, why
+  `RECORD_STOP_LATE` defaults to 30 s), and restarts start at the live edge, so
+  a restart may leave a small gap or, for Icecast burst-on-connect, a few
+  seconds of overlap — visible in the `description` table's `off`/`dur` pairs,
+  not trimmed.
 
 ## Configuration
 
@@ -291,7 +388,7 @@ Durations accept Go syntax (`90s`, `5m`, `1h30m`) or plain seconds; sizes accept
 | `DATA_DIR` | `/data` | Recordings, sidecars, schedule cache, lock file. |
 | `S3_ENDPOINT` | *required*¹ | `https://<ACCOUNT_ID>.r2.cloudflarestorage.com` |
 | `S3_REGION` | `auto` | R2 uses `auto`. |
-| `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | *required*¹ | R2 API token with *Object Read & Write* on the bucket (read is needed to merge `index.m3u8`). |
+| `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | *required*¹ | R2 API token with *Object Read & Write* on the bucket (read is needed to download and merge an existing `.m4a`). |
 | `S3_PREFIX` | – | Key prefix (`recordings/`); normalised to end with `/`. |
 | `S3_FORCE_PATH_STYLE` | `true` | Path-style URLs (works for every bucket name on R2). |
 | `S3_CHECKSUM_ALGORITHM` | `none` | `none`, `crc32` or `crc32c`. Checksums are only sent when required (R2 compatibility); size is always verified with `HeadObject`. |
@@ -324,8 +421,8 @@ Durations accept Go syntax (`90s`, `5m`, `1h30m`) or plain seconds; sizes accept
 | `FFMPEG_STOP_GRACE` | `5s` | Time between SIGINT and SIGKILL when stopping ffmpeg. |
 | `FFMPEG_STDERR_LOG` | `warn` | `warn` (warnings/errors, rate-limited 10/min per stream), `debug`, `off`. The last 20 lines are always kept in the API. |
 | `FFMPEG_TLS_VERIFY` | `false` | Verify TLS certificates of `https` sources (ffmpeg's default is off; only the initial request is covered for HLS, ffmpeg does not pass TLS options to segment downloads). |
-| `CLOCK_ID3_INTERVAL` | `10s` | Cadence of in-band ID3 wall-clock tags between ADTS frames (plus one at every run start). `0` disables in-band tags; otherwise ≥ 1 s. |
-| `CLOCK_PDT_LOOKUP` | `true` | Read the source playlist's `#EXT-X-PROGRAM-DATE-TIME` to anchor each run to the broadcaster's clock; when off (or no PDT) each run is anchored to the recorder's receipt time. Best effort, 3 s timeout, HLS sources only. |
+| `CLOCK_PDT_LOOKUP` | `true` | Read the source playlist's `#EXT-X-PROGRAM-DATE-TIME` to anchor each run's wall clock (fed into the `.m4a`'s `creation_time` and `description` metadata, see "Output files and object keys"); when off (or no PDT) each run is anchored to the recorder's receipt time. Best effort, 3 s timeout, HLS sources only. |
+| `KEY_DATE_TZ` | `UTC` | IANA time zone used to compute the date component of the default object key (`{date}/{safeId}.m4a`); validated with `time.LoadLocation` at startup. |
 
 **HTTP / monitoring / lifecycle**
 
@@ -366,7 +463,7 @@ Example (abridged):
     "items": [
       { "id": "radio1-morning", "state": "recording", "resolvedCodec": "copy", "bytes": 48213904,
         "ffmpegRunning": true, "pid": 4711, "restarts": 1, "lastDataAt": "…",
-        "key": "2026-08-30/radio1-morning/radio1-morning_20260830T035950Z.aac", "playlist": "2026-08-30/radio1-morning/index.m3u8" }
+        "key": "2026-08-30/radio1-morning.m4a", "outputFile": "", "remuxFailures": 0, "transcoded": false }
     ]
   },
   "system": { "container": { "memoryUsage": 1932735283, "memoryLimit": 4294967296, "cpuUsageCores": 1.4 }, "…": "…" }
@@ -390,11 +487,18 @@ Per-recording diagnostic fields (in each `recordings.items[]` entry):
   dropped during the current run (see `recorder_ffmpeg_stderr_suppressed_total`).
 * `runs[]` — one entry per ffmpeg run that produced audio, present in every state.
   Each has `startedAt`, `endedAt`, `anchor` (wall clock of the run's first sample),
-  `anchorSource` (`hls-pdt` or `wallclock`), `offset`/`bytes` (its `#EXT-X-BYTERANGE`
-  into the file), `frames` and `durationSeconds`. These are the segments the folder's
-  `index.m3u8` lists.
+  `anchorSource` (`hls-pdt` or `wallclock`), `offset`/`bytes` (its byte range into
+  the local file), `frames` and `durationSeconds`. These feed the `.m4a`'s
+  `description` metadata (position → wall-clock map) once uploaded.
 * `clockAnchor` / `clockSource` — for active recordings, the wall-clock anchor and
   its source (`hls-pdt` | `wallclock`) of the run currently being captured.
+* `outputFile` — local path of the kept `.m4a` once `UPLOAD_DISABLED=true` has
+  remuxed it (empty otherwise).
+* `remuxFailures` — consecutive remux failures for this recording's object key;
+  reaching 3 triggers the raw-`.aac` upload fallback (see "Output files and
+  object keys").
+* `transcoded` — `true` when the uploaded object was built by re-encoding
+  (heterogeneous AAC parameters across parts) rather than a stream copy.
 
 ## Prometheus metrics
 
@@ -413,6 +517,8 @@ documented list):
 | `ffmpeg_stderr_suppressed_total{reason}` | counter | Benign ffmpeg stderr lines dropped before logging (`reason="duplicate_moov"`; see Troubleshooting). |
 | `ffmpeg_cpu_seconds_total{id}`, `ffmpeg_memory_rss_bytes{id}` | per stream | Resource use of the ffmpeg children |
 | `uploads_total{result}`, `upload_bytes_total`, `upload_duration_seconds` (histogram 1 s – 1 h), `uploads_pending`, `upload_pending_bytes`, `uploads_in_progress`, `uploads_blocked`, `upload_oldest_pending_age_seconds`, `recordings_failed` | | Upload pipeline |
+| `remux_total{result}` (`success`\|`failure`\|`nospace`), `remux_duration_seconds` (histogram 0.5 s – 600 s), `remux_transcoded_total` | | ADTS → `.m4a` remux (the copy-vs-transcode decision and how long it takes) |
+| `upload_merges_total`, `upload_fallback_total`, `object_key_renames_total{reason}` (`conflict`\|`out-of-order`\|`parts-cap`\|`no-conditional-writes`\|`remux-failed`) | counter | One-object-per-recording bookkeeping: how often parts merged into an existing object, fell back to a raw `.aac` upload, or a key had to be renamed because the object under it wasn't safe to merge into |
 | `recordings_on_disk_bytes`, `disk_free_bytes{path}`, `disk_used_percent{path}`, `disk_low` | gauge | Local storage |
 | `host_cpu_percent`, `host_load1/5/15`, `host_memory_*`, `system_processes` | gauge | Host as seen through `/proc` |
 | `cgroup_memory_usage_bytes` (incl. page cache), `cgroup_memory_working_set_bytes` (what OOM acts on), `cgroup_memory_limit_bytes`, `cgroup_cpu_usage_seconds_total`, `cgroup_cpu_usage_cores`, `cgroup_cpu_quota_cores`, `cgroup_cpu_throttled_seconds_total`, `cgroup_pids_current`, `cgroup_oom_kills_total` | | Container (what the limits actually apply to) |
@@ -427,20 +533,37 @@ Ready-made alert rules and a Grafana dashboard are in `example/alerts.yml` and
 ## Deployment notes
 
 **Cloudflare R2.** Create a bucket, then an R2 API token with *Object Read & Write*
-limited to that bucket. `S3_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com`,
+limited to that bucket — **read** is now required, not just write, because
+merging a recording's later sessions into an existing object downloads it first.
+`S3_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com`,
 `S3_REGION=auto`, access key / secret from the token. Add a lifecycle rule
 *"Abort incomplete multipart uploads after 1 day"* to the bucket (the recorder also
 aborts its own interrupted uploads and cleans stale ones older than 1 h at startup).
+At startup, as soon as the bucket check succeeds, the recorder probes whether
+the endpoint actually enforces conditional writes (`If-None-Match`/`If-Match` on
+both single-part and multipart uploads); merging across sessions is only enabled
+when that probe succeeds, and the result is logged once. If the probe itself
+cannot run (endpoint unreachable at that moment) it is retried before the first
+merge. The shipped ffmpeg build's `ipod`
+(MP4/M4A) muxer is what the remux step relies on — a custom `FFMPEG_PATH` must
+support `-f ipod` and `-movflags +faststart`.
 
 **Sizing for ~100 streams.**
-* CPU: stream copy ≈ 0; transcoding ≈ 1–3 % of a core per stream → 1–3 cores.
+* CPU: stream copy ≈ 0; transcoding ≈ 1–3 % of a core per stream → 1–3 cores;
+  remuxing is a short burst of CPU per finished recording, not sustained load.
 * Memory: ~20–50 MB RSS per ffmpeg → plan 2 GiB (copy) to 4 GiB (transcode) for the
-  container; Go itself stays well under `GOMEMLIMIT`.
+  container; Go itself stays well under `GOMEMLIMIT`. The remux step's ffmpeg
+  process additionally uses ≈ 14 MB RSS per hour of 48 kHz audio being remuxed
+  (one in-memory sample-table entry per frame) — a multi-hour recording's remux
+  is measurably heavier than its steady-state capture.
 * Threads: ffmpeg keeps several threads even with `-threads 1`; set `pids_limit`
   (or the Kubernetes pod pids limit) to ≥ 8192.
 * Disk: 128 kbit/s ≈ 58 MB/h per stream → 100 streams ≈ 5.8 GB/h. Files stay on disk
   until the upload is confirmed, so size the volume for the longest R2 outage you
   want to survive (plus the longest show). Watch `recorder_upload_pending_bytes`.
+  A plain remux+upload needs transient headroom of roughly 2× the object size
+  (input ADTS + output `.m4a`); a merge needs roughly 4× (also the downloaded
+  remote object and its re-extracted ADTS).
 * Network: 100 × 128 kbit/s ≈ 13 Mbit/s inbound.
 
 **Volume permissions.** The image runs as uid/gid `10001`. A named volume inherits
@@ -494,7 +617,7 @@ access in the package settings.
 ```bash
 go build ./... && go test ./... -race          # unit tests (fake ffmpeg, no network)
 make e2e                                       # scripts/e2e-local.sh: real ffmpeg, local HLS tone,
-                                               # SIGTERM suspend/resume, ffprobe validation (~90 s)
+                                               # SIGTERM suspend/resume, remux + .m4a validation (~90 s)
 go run ./cmd/recorder                          # needs SCHEDULE_URL etc. in the environment
 
 # run against a local test stream without Docker (or simply `make e2e`)
@@ -511,7 +634,9 @@ SCHEDULE_URL=http://127.0.0.1:8081/schedule.json UPLOAD_DISABLED=true DATA_DIR=/
 Layout: `cmd/recorder` (main, subcommands) · `internal/config` (env) ·
 `internal/schedule` (fetch/parse/cache) · `internal/recorder` (state machine, ffmpeg
 supervisor, sidecars, upload queue, API views) · `internal/storage` (S3/R2) ·
-`internal/adts` (tail trimming) · `internal/sysmon` (system/cgroup sampling) ·
+`internal/adts` (ADTS parsing, tail trimming, run scanning, homogeneous-chunk
+detection) · `internal/remux` (ADTS → `.m4a` via ffmpeg: copy path, transcode
+fallback, probe, extract) · `internal/sysmon` (system/cgroup sampling) ·
 `internal/metrics` · `internal/httpapi` · `example/` (compose assets, schedule
 server, Prometheus rules, Grafana dashboard).
 
@@ -527,3 +652,7 @@ server, Prometheus rules, Grafana dashboard).
 | `/readyz` 503 | No schedule loaded yet (URL unreachable and no cache), disk below `MIN_FREE_DISK`, or shutting down. |
 | Recording stopped unexpectedly | `finishReason`: `ended` (end passed — check `end`/`stopLate`), `removed` (item absent from a successful fetch), `rotated` (`MAX_SESSION_DURATION`). |
 | `another recorder instance is already using DATA_DIR` | Two containers share the volume — run one per data directory. |
+| `remuxFailures` climbing, `recorder_remux_total{result="failure"}` | ffmpeg rejected the input (corrupt tail, unsupported parameters) — check the recording's `lastError` for ffmpeg's last stderr line. After 3 consecutive failures the recording is uploaded raw as a `.aac` fallback (`remux-failed=true` metadata, `recorder_upload_fallback_total`) so it is not lost; remux it by hand once the cause is fixed. |
+| `recorder_remux_total{result="nospace"}` rising, uploads not progressing | Not enough free disk for the remux/merge temp files (`MIN_FREE_DISK` protects new recordings, not necessarily a remux mid-backlog) — free space or grow the volume; this is retried without counting as a remux failure. |
+| "recording written to a second object" in the logs, `recorder_object_key_renames_total{reason}` | The object under this recording's key was not safe to merge into (`conflict`: foreign or mismatched object; `out-of-order`: an earlier part arrived after a later one was already uploaded; `parts-cap`: 20-part merge limit hit; `no-conditional-writes`: the bucket doesn't enforce `If-Match`/`If-None-Match`; `remux-failed`: the fallback path never merges) — the recording continues under a `-2`/`-3` suffixed key instead of risking data loss; both objects belong to the same recording. |
+| `object manifest inconsistent; refusing to merge` | The object's `sessions`/`parts` metadata doesn't agree with itself (hand-edited object, corrupted metadata) — merging is blocked entirely for that key rather than guessing; the local `.aac` is kept so nothing is lost while you investigate. |

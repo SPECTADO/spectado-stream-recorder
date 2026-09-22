@@ -16,9 +16,31 @@ import (
 // deterministic payload bytes. Payload bytes are kept in 0x10..0xEF so they
 // can never form an accidental sync word.
 func frame(payloadLen int, crc bool) []byte {
+	return frameWith(payloadLen, frameOpts{crc: crc, profile: 1, sfi: 4, chanCfg: 2, blocks: 1})
+}
+
+// frameOpts carries the header fields frameWith varies. profile, sfi and
+// chanCfg are written verbatim (0 is a legal value for each); blocks is
+// number_of_raw_data_blocks + 1 and is never 0, so 0 means 1.
+type frameOpts struct {
+	crc     bool
+	profile int // profile_ObjectType: 0 Main, 1 LC, 2 SSR, 3 LTP
+	sfi     int // sampling_frequency_index
+	chanCfg int // channel_configuration
+	blocks  int // number_of_raw_data_blocks + 1
+}
+
+// frameWith builds a valid ADTS frame with the given header parameters; see
+// frame for the payload rules. It is the parameterised form used to build files
+// whose stream parameters change mid-file (see package remux: those cannot be
+// stream-copied into one MP4 track).
+func frameWith(payloadLen int, o frameOpts) []byte {
+	if o.blocks == 0 {
+		o.blocks = 1
+	}
 	hdr := minHeader
 	b1 := byte(0xF1)
-	if crc {
+	if o.crc {
 		hdr = crcHeader
 		b1 = 0xF0
 	}
@@ -30,17 +52,26 @@ func frame(payloadLen int, crc bool) []byte {
 	out = append(out,
 		0xFF,
 		b1,
-		0x50,                   // profile LC(1)<<6 | sfi 4<<2 | channel_config(2)>>2
-		0x80|byte(fl>>11)&0x03, // channel_config(2)&3 <<6 | frame_length>>11
-		byte(fl>>3),            // frame_length>>3
-		byte(fl&0x07)<<5|0x1F,  // frame_length<<5 | buffer_fullness(0x7FF)>>6
-		0xFC,                   // buffer_fullness<<2 | raw_data_blocks 0
+		byte(o.profile)<<6|byte(o.sfi)<<2|byte(o.chanCfg>>2), // profile | sfi | channel_config>>2
+		byte(o.chanCfg&0x03)<<6|byte(fl>>11)&0x03,            // channel_config&3 | frame_length>>11
+		byte(fl>>3),                // frame_length>>3
+		byte(fl&0x07)<<5|0x1F,      // frame_length<<5 | buffer_fullness(0x7FF)>>6
+		0xFC|byte(o.blocks-1)&0x03, // buffer_fullness<<2 | number_of_raw_data_blocks
 	)
-	if crc {
+	if o.crc {
 		out = append(out, 0xAB, 0xCD)
 	}
 	for i := 0; i < payloadLen; i++ {
 		out = append(out, byte(0x10+i%0xE0))
+	}
+	return out
+}
+
+// framesWith concatenates n identical frames built by frameWith.
+func framesWith(n, payloadLen int, o frameOpts) []byte {
+	var out []byte
+	for i := 0; i < n; i++ {
+		out = append(out, frameWith(payloadLen, o)...)
 	}
 	return out
 }

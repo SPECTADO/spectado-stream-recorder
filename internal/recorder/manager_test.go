@@ -1,7 +1,10 @@
 package recorder
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -15,8 +18,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spectado/stream-recorder/internal/adts"
 	"github.com/spectado/stream-recorder/internal/config"
 	"github.com/spectado/stream-recorder/internal/metrics"
+	"github.com/spectado/stream-recorder/internal/remux"
 	"github.com/spectado/stream-recorder/internal/schedule"
 )
 
@@ -52,6 +57,7 @@ done
 func flakyFFmpeg(t *testing.T, dir string, fails int) string {
 	t.Helper()
 	counter := filepath.Join(dir, "flaky-runs.count")
+	frames := adtsFramesFile(t, dir)
 	body := fmt.Sprintf(`#!/bin/sh
 trap 'exit 0' INT TERM
 c=%q
@@ -63,10 +69,10 @@ if [ "$n" -le %d ]; then
   exit 0
 fi
 while :; do
-  printf 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+  cat %q || exit 0
   sleep 0.05
 done
-`, counter, fails)
+`, counter, fails, frames)
 	p := filepath.Join(dir, "ffmpeg-flaky.sh")
 	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
@@ -75,66 +81,46 @@ done
 }
 
 type uploadCall struct {
-	path, key string
-	size      int64
-	meta      map[string]string
+	path, key, contentType string
+	size                   int64
+	meta                   map[string]string
+	replace                string // ETag the upload replaced ("" for a new object)
 }
 
-// fakeUploader records calls and returns queued errors first. Small objects
-// written with PutObject (the playlists) are kept in memory.
+// fakeObject is one stored object: bytes, user metadata and an ETag that
+// changes on every write (so conditional replaces can be exercised).
+type fakeObject struct {
+	body  []byte
+	meta  map[string]string
+	etag  string
+	ctype string
+}
+
+// fakeUploader is an in-memory object store with the semantics the recorder
+// relies on: conditional create, conditional replace, HEAD with metadata and
+// download.
 type fakeUploader struct {
-	mu      sync.Mutex
-	calls   []uploadCall
-	errs    []error
-	putErrs []error
-	block   chan struct{} // when non-nil, Upload blocks until closed or ctx done
-	objects map[string][]byte
+	mu        sync.Mutex
+	calls     []uploadCall
+	errs      []error
+	block     chan struct{} // when non-nil, Upload blocks until closed or ctx done
+	objects   map[string]*fakeObject
+	heads     int
+	downloads int
+	noCond    bool // endpoint does NOT enforce conditional writes
+	condErr   error
+	etagSeq   int
 }
 
-func (f *fakeUploader) PutObject(ctx context.Context, key, contentType string, body []byte) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.putErrs) > 0 {
-		var err error
-		err, f.putErrs = f.putErrs[0], f.putErrs[1:]
-		if err != nil {
-			return err
-		}
+func copyMeta(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
 	}
-	if contentType != "application/vnd.apple.mpegurl" {
-		return fmt.Errorf("unexpected content type %q for %s", contentType, key)
-	}
-	if f.objects == nil {
-		f.objects = map[string][]byte{}
-	}
-	f.objects[key] = append([]byte(nil), body...)
-	return nil
+	return out
 }
 
-func (f *fakeUploader) GetObject(ctx context.Context, key string) ([]byte, bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	b, ok := f.objects[key]
-	return b, ok, nil
-}
-
-// object returns a stored small object as text ("" when absent).
-func (f *fakeUploader) object(key string) string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return string(f.objects[key])
-}
-
-func (f *fakeUploader) seed(key, body string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.objects == nil {
-		f.objects = map[string][]byte{}
-	}
-	f.objects[key] = []byte(body)
-}
-
-func (f *fakeUploader) Upload(ctx context.Context, path, key, contentType string, meta map[string]string) (string, error) {
+func (f *fakeUploader) Upload(ctx context.Context, path, key, contentType string, meta map[string]string, replaceETag string) (string, error) {
 	f.mu.Lock()
 	var err error
 	if len(f.errs) > 0 {
@@ -152,14 +138,87 @@ func (f *fakeUploader) Upload(ctx context.Context, path, key, contentType string
 	if err != nil {
 		return "", err
 	}
-	st, serr := os.Stat(path)
-	if serr != nil {
-		return "", serr
+	body, rerr := os.ReadFile(path)
+	if rerr != nil {
+		return "", rerr
 	}
+
 	f.mu.Lock()
-	f.calls = append(f.calls, uploadCall{path: path, key: key, size: st.Size(), meta: meta})
+	defer f.mu.Unlock()
+	if f.objects == nil {
+		f.objects = map[string]*fakeObject{}
+	}
+	cur := f.objects[key]
+	if replaceETag == "" {
+		if cur != nil && !bytes.Equal(cur.body, body) {
+			return "", ErrObjectExists
+		}
+	} else if cur == nil || cur.etag != replaceETag {
+		return "", ErrObjectChanged
+	}
+	f.etagSeq++
+	etag := fmt.Sprintf("etag-%d", f.etagSeq)
+	f.objects[key] = &fakeObject{body: body, meta: copyMeta(meta), etag: etag, ctype: contentType}
+	f.calls = append(f.calls, uploadCall{path: path, key: key, contentType: contentType,
+		size: int64(len(body)), meta: copyMeta(meta), replace: replaceETag})
+	return etag, nil
+}
+
+func (f *fakeUploader) Head(ctx context.Context, key string) (ObjectInfo, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.heads++
+	o := f.objects[key]
+	if o == nil {
+		return ObjectInfo{}, false, nil
+	}
+	return ObjectInfo{Size: int64(len(o.body)), ETag: o.etag, Metadata: copyMeta(o.meta)}, true, nil
+}
+
+func (f *fakeUploader) Download(ctx context.Context, key, ifMatchETag, path string) error {
+	f.mu.Lock()
+	f.downloads++
+	o := f.objects[key]
 	f.mu.Unlock()
-	return "etag-" + key, nil
+	if o == nil {
+		return fmt.Errorf("no such object %q", key)
+	}
+	if ifMatchETag != "" && ifMatchETag != o.etag {
+		return ErrObjectChanged
+	}
+	return os.WriteFile(path, o.body, 0o644)
+}
+
+func (f *fakeUploader) ConditionalWrites(ctx context.Context) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.noCond, f.condErr
+}
+
+// seed stores an object as if a previous run had uploaded it.
+func (f *fakeUploader) seed(key string, body []byte, meta map[string]string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.objects == nil {
+		f.objects = map[string]*fakeObject{}
+	}
+	f.etagSeq++
+	f.objects[key] = &fakeObject{body: append([]byte(nil), body...), meta: copyMeta(meta),
+		etag: fmt.Sprintf("seed-%d", f.etagSeq), ctype: "audio/mp4"}
+}
+
+func (f *fakeUploader) object(key string) *fakeObject {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.objects[key]
+}
+
+// headCount is the locked read of the HEAD counter: tests that inspect a loop
+// while it is still running cannot touch the field directly.
+func (f *fakeUploader) headCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.heads
 }
 
 func (f *fakeUploader) count() int {
@@ -168,10 +227,208 @@ func (f *fakeUploader) count() int {
 	return len(f.calls)
 }
 
+func (f *fakeUploader) lastCall() uploadCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.calls) == 0 {
+		return uploadCall{}
+	}
+	return f.calls[len(f.calls)-1]
+}
+
 func (f *fakeUploader) setErrs(errs ...error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.errs = errs
+}
+
+// fakeRemuxer stands in for ffmpeg: "remuxing" is byte concatenation of the
+// ADTS parts (which is exactly what the real remux does to the audio, minus
+// the container), so the produced file scans back to the summed frames and
+// duration and an Extract of it is the identity. Format tags are remembered per
+// file content, which survives the round trip through the fake store.
+type fakeRemuxer struct {
+	mu         sync.Mutex
+	builds     int
+	transcodes int
+	extracts   int
+	errs       []error
+	metas      []remux.Metadata
+	expects    []remux.Expect
+	tags       map[string]map[string]string
+}
+
+func newFakeRemuxer() *fakeRemuxer { return &fakeRemuxer{tags: map[string]map[string]string{}} }
+
+func (f *fakeRemuxer) setErrs(errs ...error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errs = errs
+}
+
+func (f *fakeRemuxer) lastMeta() (remux.Metadata, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.metas) == 0 {
+		return remux.Metadata{}, false
+	}
+	return f.metas[len(f.metas)-1], true
+}
+
+func (f *fakeRemuxer) nextErr() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.errs) == 0 {
+		return nil
+	}
+	var err error
+	err, f.errs = f.errs[0], f.errs[1:]
+	return err
+}
+
+func (f *fakeRemuxer) Build(ctx context.Context, parts []string, out string, expect remux.Expect, meta remux.Metadata) (remux.Result, error) {
+	f.mu.Lock()
+	f.builds++
+	f.mu.Unlock()
+	if err := f.nextErr(); err != nil {
+		return remux.Result{}, err
+	}
+	if _, err := remux.Concat(parts, out); err != nil {
+		return remux.Result{}, err
+	}
+	res, err := f.Probe(ctx, out)
+	if err != nil {
+		return remux.Result{}, err
+	}
+	// The real Build refuses to report success when the sample table does not
+	// match the source; a wrong expectation must fail the test, not pass.
+	if expect.Frames > 0 && res.Frames != expect.Frames {
+		return remux.Result{}, fmt.Errorf("fake remux: %d frames produced, %d expected", res.Frames, expect.Frames)
+	}
+	f.remember(out, meta, expect)
+	return res, nil
+}
+
+func (f *fakeRemuxer) BuildTranscode(ctx context.Context, chunks []remux.Chunk, out string, expectedDuration time.Duration, bitrate string, meta remux.Metadata) (remux.Result, error) {
+	f.mu.Lock()
+	f.transcodes++
+	f.mu.Unlock()
+	if err := f.nextErr(); err != nil {
+		return remux.Result{}, err
+	}
+	paths := make([]string, len(chunks))
+	for i, c := range chunks {
+		paths[i] = c.Path
+	}
+	if _, err := remux.Concat(paths, out); err != nil {
+		return remux.Result{}, err
+	}
+	res, err := f.Probe(ctx, out)
+	if err != nil {
+		return remux.Result{}, err
+	}
+	f.remember(out, meta, remux.Expect{Duration: expectedDuration})
+	return res, nil
+}
+
+func (f *fakeRemuxer) Extract(ctx context.Context, in, out string) error {
+	f.mu.Lock()
+	f.extracts++
+	f.mu.Unlock()
+	data, err := os.ReadFile(in)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(out, data, 0o644)
+}
+
+func (f *fakeRemuxer) Probe(ctx context.Context, path string) (remux.Result, error) {
+	info, err := adts.Scan(path)
+	if err != nil {
+		return remux.Result{}, err
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return remux.Result{}, err
+	}
+	res := remux.Result{
+		Path: path, Size: st.Size(), Duration: info.Duration, Frames: info.Frames,
+		Format: "mov,mp4,m4a,3gp,3g2,mj2", Codec: "aac", Profile: info.Params.ProfileName(),
+		SampleRate: info.Params.SampleRate, Channels: info.Params.Channels(),
+	}
+	f.mu.Lock()
+	res.Tags = f.tags[fileDigest(path)]
+	f.mu.Unlock()
+	return res, nil
+}
+
+// remember keys the format tags by the file's content so the same bytes, read
+// back from the store, probe with the same tags.
+func (f *fakeRemuxer) remember(out string, meta remux.Metadata, expect remux.Expect) {
+	tags := map[string]string{}
+	if meta.Description != "" {
+		tags["description"] = meta.Description
+	}
+	if meta.Title != "" {
+		tags["title"] = meta.Title
+	}
+	if meta.Comment != "" {
+		tags["comment"] = meta.Comment
+	}
+	if meta.Date != "" {
+		tags["date"] = meta.Date
+	}
+	if !meta.CreationTime.IsZero() {
+		tags["creation_time"] = meta.CreationTime.UTC().Format(time.RFC3339)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.metas = append(f.metas, meta)
+	f.expects = append(f.expects, expect)
+	f.tags[fileDigest(out)] = tags
+}
+
+func fileDigest(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "missing:" + path
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// counterValue reads one Prometheus counter (optionally one label set) out of
+// the manager's registry.
+func counterValue(t *testing.T, m *Manager, name string, labels map[string]string) float64 {
+	t.Helper()
+	fams, err := m.met.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var total float64
+	for _, fam := range fams {
+		if fam.GetName() != name {
+			continue
+		}
+		for _, metric := range fam.GetMetric() {
+			match := true
+			for k, v := range labels {
+				found := false
+				for _, l := range metric.GetLabel() {
+					if l.GetName() == k && l.GetValue() == v {
+						found = true
+					}
+				}
+				if !found {
+					match = false
+				}
+			}
+			if match {
+				total += metric.GetCounter().GetValue()
+			}
+		}
+	}
+	return total
 }
 
 func testConfig(dir, ffmpeg string) *config.Config {
@@ -203,17 +460,29 @@ func testConfig(dir, ffmpeg string) *config.Config {
 	}
 }
 
+// newTestManager builds a manager whose fake ffmpeg streams real ADTS frames
+// and whose remuxer needs no ffmpeg: the upload path measures what it captured,
+// so a capture of junk bytes would (correctly) be refused as "no ADTS frames".
 func newTestManager(t *testing.T, up Uploader) (*Manager, string) {
 	t.Helper()
+	m, dir, _ := newTestManagerRx(t, up)
+	return m, dir
+}
+
+func newTestManagerRx(t *testing.T, up Uploader) (*Manager, string, *fakeRemuxer) {
+	t.Helper()
 	dir := t.TempDir()
-	ff := fakeFFmpeg(t, dir, false)
+	ff := fakeFFmpegADTS(t, dir)
 	m := NewManager(testConfig(dir, ff), slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), up, "test")
+	m.SetRemuxer(newFakeRemuxer())
+	rx := newFakeRemuxer()
+	m.SetRemuxer(rx)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		m.Shutdown(ctx)
 	})
-	return m, dir
+	return m, dir, rx
 }
 
 func waitFor(t *testing.T, timeout time.Duration, msg string, cond func() bool) {
@@ -287,11 +556,11 @@ func TestStartRecordEndUpload(t *testing.T) {
 		t.Fatalf("process count = %d", m.FFmpegProcessCount())
 	}
 	sid := ar.s.SessionID
-	wantKey := fmt.Sprintf("%s/a/a_%s.aac", now.UTC().Format("2006-01-02"), now.UTC().Format("20060102T150405Z"))
+	// One object per recording, named after the scheduled start date and the id.
+	wantKey := it.Start.UTC().Format("2006-01-02") + "/a.m4a"
 	if ar.s.Key != wantKey {
 		t.Fatalf("key = %q, want %q", ar.s.Key, wantKey)
 	}
-	wantPlaylist := now.UTC().Format("2006-01-02") + "/a/index.m3u8"
 
 	// End reached (even though wall clock has not moved): stop + upload.
 	m.Reconcile(now.Add(2 * time.Hour))
@@ -306,23 +575,40 @@ func TestStartRecordEndUpload(t *testing.T) {
 	if up.count() != 1 || up.calls[0].key != wantKey || up.calls[0].size == 0 {
 		t.Fatalf("upload calls: %+v", up.calls)
 	}
-	if got := up.calls[0].meta["duration-seconds"]; got == "" {
-		t.Fatalf("duration missing from object metadata: %v", up.calls[0].meta)
+	call := up.calls[0]
+	if call.contentType != "audio/mp4" {
+		t.Fatalf("content type = %q, want audio/mp4", call.contentType)
+	}
+	if call.replace != "" {
+		t.Fatalf("a first upload must not replace anything, replace=%q", call.replace)
+	}
+	// The manifest the next session of this recording reads back.
+	if call.meta["recording-id"] != "a" || call.meta["parts"] != "1" ||
+		call.meta["sessions"] != sessionDigest(sid) || call.meta["last-session-start"] == "" {
+		t.Fatalf("object manifest = %v", call.meta)
+	}
+	if got := call.meta["duration-seconds"]; got == "" || got == "0.000" {
+		t.Fatalf("duration missing from object metadata: %v", call.meta)
+	}
+	if call.meta["frames"] == "" || call.meta["codec"] != "aac" {
+		t.Fatalf("probe metadata missing: %v", call.meta)
 	}
 	// A clean single run never restarted, so the exit-reasons key is omitted.
-	if got, ok := up.calls[0].meta["ffmpeg-exit-reasons"]; ok {
+	if got, ok := call.meta["ffmpeg-exit-reasons"]; ok {
 		t.Fatalf("ffmpeg-exit-reasons should be absent for a clean run, got %q", got)
 	}
-	pl := up.object(wantPlaylist)
-	if !strings.HasPrefix(pl, "#EXTM3U\n") || !strings.Contains(pl, "#EXTINF:") || !strings.Contains(pl, "\n"+sid+".aac\n") ||
-		!strings.HasSuffix(pl, "#EXT-X-ENDLIST\n") {
-		t.Fatalf("playlist %s = %q", wantPlaylist, pl)
-	}
 	if _, err := os.Stat(filepath.Join(dir, "recordings", "a", sid+".aac")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("audio file should be deleted after upload, stat err=%v", err)
+		t.Fatalf("capture should be deleted after upload, stat err=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "recordings", "a", sid+".json")); err != nil {
 		t.Fatalf("sidecar should remain: %v", err)
+	}
+	// No leftovers of the remux.
+	entries, _ := os.ReadDir(filepath.Join(dir, "recordings", "a"))
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp-") {
+			t.Fatalf("temporary file left behind: %s", e.Name())
+		}
 	}
 	if m.FFmpegProcessCount() != 0 {
 		t.Fatalf("process count after stop = %d", m.FFmpegProcessCount())
@@ -428,18 +714,22 @@ func TestExtensionAfterEndStartsNewPart(t *testing.T) {
 	if first == nil {
 		t.Fatal("not started")
 	}
-	if first.s.Key != "shows/morning/"+first.s.SessionID+".aac" {
-		t.Fatalf("explicit key must name the folder: %q", first.s.Key)
+	// An explicit key now names the OBJECT, not a folder.
+	if first.s.Key != "shows/morning.m4a" {
+		t.Fatalf("explicit key must name the object: %q", first.s.Key)
 	}
 	waitFor(t, 5*time.Second, "bytes", func() bool { return first.bytes.Load() > 0 })
 	m.Reconcile(now.Add(90 * time.Minute)) // ended
 	m.settle()
+	if up.count() != 1 {
+		t.Fatalf("uploads after the first part = %d", up.count())
+	}
 
-	// The producer extends the show after it already ended: new session, new key.
+	// The producer extends the show after it already ended: a new session, the
+	// same object — the second part is merged into what is already stored.
 	it.End = now.Add(3 * time.Hour)
 	m.SetSchedule(sched(it))
-	later := now.Add(91 * time.Minute)
-	m.Reconcile(later)
+	m.Reconcile(now.Add(91 * time.Minute))
 	second := m.activeFor("a")
 	if second == nil {
 		t.Fatal("extension after end should start a new session")
@@ -447,67 +737,55 @@ func TestExtensionAfterEndStartsNewPart(t *testing.T) {
 	if second.s.SessionID == first.s.SessionID {
 		t.Fatal("new session expected")
 	}
-	if second.s.Key != "shows/morning/"+second.s.SessionID+".aac" || second.s.Key == first.s.Key {
-		t.Fatalf("second part key = %q (first %q)", second.s.Key, first.s.Key)
+	if second.s.Key != first.s.Key {
+		t.Fatalf("second part key = %q, want the pinned %q", second.s.Key, first.s.Key)
 	}
 	waitFor(t, 5*time.Second, "bytes", func() bool { return second.bytes.Load() > 0 })
 	m.Reconcile(now.Add(4 * time.Hour))
 	m.settle()
 
-	// Both parts are listed, in order, in the folder's single playlist.
-	pl := up.object("shows/morning/index.m3u8")
-	i, j := strings.Index(pl, "\n"+first.s.SessionID+".aac\n"), strings.Index(pl, "\n"+second.s.SessionID+".aac\n")
-	if i < 0 || j < 0 || i > j || strings.Count(pl, "#EXTINF:") != 2 || strings.Count(pl, "#EXT-X-DISCONTINUITY") != 1 {
-		t.Fatalf("playlist after two parts:\n%s", pl)
-	}
 	if up.count() != 2 {
-		t.Fatalf("uploads = %d, want 2", up.count())
+		t.Fatalf("uploads = %d, want 2 (one per part, the second replacing)", up.count())
+	}
+	merge := up.calls[1]
+	if merge.key != "shows/morning.m4a" || merge.replace == "" {
+		t.Fatalf("second upload must replace the stored object: %+v", merge)
+	}
+	if merge.meta["parts"] != "2" {
+		t.Fatalf("parts = %q, want 2 (meta=%v)", merge.meta["parts"], merge.meta)
+	}
+	wantSessions := sessionDigest(first.s.SessionID) + "," + sessionDigest(second.s.SessionID)
+	if merge.meta["sessions"] != wantSessions {
+		t.Fatalf("sessions = %q, want %q", merge.meta["sessions"], wantSessions)
+	}
+	if up.downloads != 1 || up.heads < 2 {
+		t.Fatalf("merging must HEAD and download the stored object: heads=%d downloads=%d", up.heads, up.downloads)
+	}
+	// The merged object really holds both captures.
+	obj := up.object("shows/morning.m4a")
+	if obj == nil || int64(len(obj.body)) <= up.calls[0].size {
+		t.Fatalf("merged object did not grow: %d <= %d", len(obj.body), up.calls[0].size)
+	}
+	if st, _ := m.sessionState(first.s.SessionID); st != StateUploaded {
+		t.Fatalf("first session state = %s", st)
+	}
+	if st, _ := m.sessionState(second.s.SessionID); st != StateUploaded {
+		t.Fatalf("second session state = %s", st)
 	}
 }
 
-func TestPlaylistFailureRetriesWithoutReupload(t *testing.T) {
-	up := &fakeUploader{putErrs: []error{errors.New("r2 hiccup")}}
-	m, dir := newTestManager(t, up)
-	now := time.Now()
-	m.SetSchedule(sched(item("a", now.Add(-time.Second), now.Add(time.Hour))))
-	ar := m.activeFor("a")
-	if ar == nil {
-		t.Fatal("not started")
-	}
-	waitFor(t, 5*time.Second, "bytes", func() bool { return ar.bytes.Load() > 0 })
-	m.Reconcile(now.Add(2 * time.Hour))
-	m.settle()
-
-	st, _ := m.sessionState(ar.s.SessionID)
-	if st != StateUploaded {
-		t.Fatalf("state=%s", st)
-	}
-	if up.count() != 1 {
-		t.Fatalf("audio uploaded %d times, want exactly once", up.count())
-	}
-	m.mu.Lock()
-	s := m.sessions[ar.s.SessionID]
-	attempts, media := s.UploadAttempts, s.MediaUploaded
-	m.mu.Unlock()
-	if attempts != 2 || !media {
-		t.Fatalf("attempts=%d mediaUploaded=%v", attempts, media)
-	}
-	if pl := up.object(playlistKey(ar.s.Key)); !strings.Contains(pl, ar.s.SessionID+".aac") {
-		t.Fatalf("playlist = %q", pl)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "recordings", "a", ar.s.SessionID+".aac")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("audio file should be deleted after the playlist is published, stat err=%v", err)
-	}
-}
-
-func TestPlaylistMergesExistingEntries(t *testing.T) {
+// TestForeignObjectIsNeverOverwritten covers HEAD case (a): an object under our
+// key that this recorder did not write is left untouched and the recording goes
+// to a second key, loudly.
+func TestForeignObjectIsNeverOverwritten(t *testing.T) {
 	up := &fakeUploader{}
 	m, _ := newTestManager(t, up)
 	now := time.Now()
-	day := now.UTC().Format("2006-01-02")
-	// An older part uploaded by a previous run whose sidecar is long gone.
-	up.seed(day+"/a/index.m3u8", "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:100.000,\na_20000101T000000Z.aac\n#EXT-X-ENDLIST\n")
-	m.SetSchedule(sched(item("a", now.Add(-time.Second), now.Add(time.Hour))))
+	it := item("a", now.Add(-time.Second), now.Add(time.Hour))
+	day := it.Start.UTC().Format("2006-01-02")
+	up.seed(day+"/a.m4a", []byte("someone else's audio"), map[string]string{"foo": "bar"})
+
+	m.SetSchedule(sched(it))
 	ar := m.activeFor("a")
 	if ar == nil {
 		t.Fatal("not started")
@@ -516,22 +794,52 @@ func TestPlaylistMergesExistingEntries(t *testing.T) {
 	m.Reconcile(now.Add(2 * time.Hour))
 	m.settle()
 
-	pl := up.object(day + "/a/index.m3u8")
-	i, j := strings.Index(pl, "\na_20000101T000000Z.aac\n"), strings.Index(pl, "\n"+ar.s.SessionID+".aac\n")
-	if i < 0 || j < 0 || i > j || !strings.Contains(pl, "#EXTINF:100.000,") {
-		t.Fatalf("merged playlist:\n%s", pl)
+	if st, _ := m.sessionState(ar.s.SessionID); st != StateUploaded {
+		t.Fatalf("state = %s", st)
+	}
+	if got := string(up.object(day + "/a.m4a").body); got != "someone else's audio" {
+		t.Fatalf("foreign object was modified: %q", got)
+	}
+	want := day + "/a-2.m4a"
+	if up.count() != 1 || up.calls[0].key != want {
+		t.Fatalf("calls = %+v, want a single upload to %s", up.calls, want)
+	}
+	if n := counterValue(t, m, "recorder_object_key_renames_total", map[string]string{"reason": "conflict"}); n != 1 {
+		t.Fatalf("rename metric = %v, want 1", n)
 	}
 }
 
-func TestPlaylistKey(t *testing.T) {
+func TestObjectKey(t *testing.T) {
+	start := time.Date(2026, 9, 22, 23, 30, 0, 0, time.UTC)
+	s := &Session{ID: "match-ro-jpOkle8Mp0", SafeID: "match-ro-jpOkle8Mp0", Start: start}
+	if got := objectKey("", time.UTC, s); got != "2026-09-22/match-ro-jpOkle8Mp0.m4a" {
+		t.Errorf("objectKey = %q", got)
+	}
+	if got := objectKey("recordings/", time.UTC, s); got != "recordings/2026-09-22/match-ro-jpOkle8Mp0.m4a" {
+		t.Errorf("prefixed objectKey = %q", got)
+	}
+	// KEY_DATE_TZ decides which day a late-evening show belongs to.
+	prague, err := time.LoadLocation("Europe/Prague")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := objectKey("", prague, s); got != "2026-09-23/match-ro-jpOkle8Mp0.m4a" {
+		t.Errorf("objectKey in Europe/Prague = %q", got)
+	}
+
 	for in, want := range map[string]string{
-		"2026-09-03/match/match_20260903T184400Z.aac": "2026-09-03/match/index.m3u8",
-		"p/2026-09-03/match/x.aac":                    "p/2026-09-03/match/index.m3u8",
-		"x.aac":                                       "index.m3u8",
+		"/shows/morning/":   "shows/morning.m4a",
+		"shows/morning":     "shows/morning.m4a",
+		"shows/morning.m4a": "shows/morning.m4a",
+		"shows/morning.M4A": "shows/morning.M4A",
+		"  /a/b/c.m4a  ":    "a/b/c.m4a",
 	} {
-		if got := playlistKey(in); got != want {
-			t.Errorf("playlistKey(%q) = %q, want %q", in, got, want)
+		if got := explicitObjectKey("", in); got != want {
+			t.Errorf("explicitObjectKey(%q) = %q, want %q", in, got, want)
 		}
+	}
+	if got := explicitObjectKey("p/", "shows/x"); got != "p/shows/x.m4a" {
+		t.Errorf("prefixed explicit key = %q", got)
 	}
 }
 
@@ -549,7 +857,9 @@ func TestMaxSessionDurationRotates(t *testing.T) {
 	if second == nil || second == first {
 		t.Fatal("rotation should stop the first session and start a second one in the same tick")
 	}
-	m.settle()
+	// Only the finalize goroutine is waited for: the first part's upload stays
+	// deferred while the second part records (see TestRotationDefersAndMergesLocally).
+	m.stopWG.Wait()
 	_, reason := m.sessionState(first.s.SessionID)
 	if reason != ReasonRotated {
 		t.Fatalf("first session reason = %q", reason)
@@ -577,7 +887,7 @@ func TestDiskLowRefusesNewRecordings(t *testing.T) {
 func TestResumeFromSidecarWithoutSchedule(t *testing.T) {
 	up := &fakeUploader{}
 	dir := t.TempDir()
-	ff := fakeFFmpeg(t, dir, false)
+	ff := fakeFFmpegADTS(t, dir)
 	cfg := testConfig(dir, ff)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -586,7 +896,7 @@ func TestResumeFromSidecarWithoutSchedule(t *testing.T) {
 	s := &Session{
 		ID: "radio", SafeID: "radio", SessionID: "radio_20260101T000000Z", Source: "http://example.invalid/x",
 		Start: now.Add(-time.Hour), End: now.Add(time.Hour), Key: "radio/x.aac", Codec: "aac", ResolvedCodec: "aac",
-		SessionStart: now.Add(-time.Hour), State: StateRecording, Bytes: 5,
+		SessionStart: now.Add(-time.Hour), State: StateRecording, Bytes: int64(len(adtsFrame(100))),
 		Restarts: 2, RecordLastError: "ffmpeg exited after 1s: exit status 1 | boom",
 		Exits: []RunExit{{Reason: "demux-error"}, {Reason: "exit-error"}},
 		dir:   filepath.Join(dir, "recordings", "radio"),
@@ -594,11 +904,13 @@ func TestResumeFromSidecarWithoutSchedule(t *testing.T) {
 	if err := s.save(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(s.FilePath(), []byte("hello"), 0o644); err != nil {
+	head := adtsFrame(100)
+	if err := os.WriteFile(s.FilePath(), head, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	m := NewManager(cfg, log, metrics.New("test"), up, "test")
+	m.SetRemuxer(newFakeRemuxer())
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -609,8 +921,17 @@ func TestResumeFromSidecarWithoutSchedule(t *testing.T) {
 	if ar == nil {
 		t.Fatal("unfinished session not recovered")
 	}
-	if !ar.recovered || ar.bytes.Load() != 5 {
+	if !ar.recovered || ar.bytes.Load() != int64(len(head)) {
 		t.Fatalf("recovered=%v bytes=%d", ar.recovered, ar.bytes.Load())
+	}
+	// A 1.0.x sidecar (key ends in .aac, one object per session) is migrated to
+	// the single-object layout before anything else happens to it.
+	wantKey := s.Start.UTC().Format("2006-01-02") + "/radio.m4a"
+	m.mu.Lock()
+	gotKey := ar.s.Key
+	m.mu.Unlock()
+	if gotKey != wantKey {
+		t.Fatalf("migrated key = %q, want %q", gotKey, wantKey)
 	}
 	// Recover must reconstruct an active session with its pre-existing exit
 	// history intact (the sidecar is the record of why it flapped so far).
@@ -619,9 +940,9 @@ func TestResumeFromSidecarWithoutSchedule(t *testing.T) {
 	}
 	// No schedule loaded yet: the sidecar is the last known state -> resume.
 	m.Reconcile(time.Now())
-	waitFor(t, 5*time.Second, "appended bytes", func() bool { return ar.bytes.Load() > 5 })
+	waitFor(t, 5*time.Second, "appended bytes", func() bool { return ar.bytes.Load() > int64(len(head)) })
 	data, _ := os.ReadFile(s.FilePath())
-	if !strings.HasPrefix(string(data), "hello") {
+	if !bytes.HasPrefix(data, head) {
 		t.Fatal("resume must append, not overwrite")
 	}
 	// Its own end passes -> finalize and upload.
@@ -631,7 +952,7 @@ func TestResumeFromSidecarWithoutSchedule(t *testing.T) {
 	if st != StateUploaded || reason != ReasonEnded {
 		t.Fatalf("state=%s reason=%s", st, reason)
 	}
-	if up.count() != 1 || up.calls[0].key != "radio/x.aac" {
+	if up.count() != 1 || up.calls[0].key != wantKey {
 		t.Fatalf("calls=%+v", up.calls)
 	}
 }
@@ -650,15 +971,21 @@ func TestRecoverFinalizedSessionUploads(t *testing.T) {
 	if err := s.save(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(s.FilePath(), []byte("data"), 0o644); err != nil {
+	if err := os.WriteFile(s.FilePath(), adtsStream(20), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	m := NewManager(testConfig(dir, ff), slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), up, "test")
+	m.SetRemuxer(newFakeRemuxer())
 	m.Recover()
 	m.settle()
 	st, _ := m.sessionState(s.SessionID)
 	if st != StateUploaded || up.count() != 1 {
 		t.Fatalf("state=%s uploads=%d", st, up.count())
+	}
+	// The 1.0.x key was recomputed into the single-object layout.
+	want := s.Start.UTC().Format("2006-01-02") + "/r.m4a"
+	if up.calls[0].key != want {
+		t.Fatalf("key = %q, want %q", up.calls[0].key, want)
 	}
 }
 
@@ -680,11 +1007,18 @@ func TestEmptyRecordingIsFailedNotUploaded(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := NewManager(testConfig(dir, ff), slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), up, "test")
+	m.SetRemuxer(newFakeRemuxer())
 	m.Recover()
 	m.settle()
 	st, _ := m.sessionState(s.SessionID)
 	if st != StateFailed || up.count() != 0 {
 		t.Fatalf("state=%s uploads=%d", st, up.count())
+	}
+	m.mu.Lock()
+	key := m.sessions[s.SessionID].Key
+	m.mu.Unlock()
+	if want := s.Start.UTC().Format("2006-01-02") + "/e.m4a"; key != want {
+		t.Fatalf("key = %q, want the recomputed %q", key, want)
 	}
 }
 
@@ -718,10 +1052,12 @@ func TestUploadRetryPermanentAndObjectExists(t *testing.T) {
 	if blocked {
 		t.Fatal("blocked flag must be cleared after success")
 	}
-	if attempts < 4 {
+	if attempts < 3 {
 		t.Fatalf("attempts = %d", attempts)
 	}
-	if key == origKey || !strings.HasSuffix(key, ".aac") || !strings.Contains(key, "-") {
+	// ErrObjectExists no longer renames blindly: the next attempt HEADs the key
+	// and finds nothing there, so the recording keeps its own object.
+	if key != origKey || !strings.HasSuffix(key, ".m4a") {
 		t.Fatalf("key after ErrObjectExists = %q (orig %q)", key, origKey)
 	}
 	if up.count() != 1 || up.calls[0].key != key {
@@ -734,6 +1070,7 @@ func TestShutdownSuspendsRecordings(t *testing.T) {
 	dir := t.TempDir()
 	ff := fakeFFmpeg(t, dir, false)
 	m := NewManager(testConfig(dir, ff), slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), up, "test")
+	m.SetRemuxer(newFakeRemuxer())
 	now := time.Now()
 	m.SetSchedule(sched(item("a", now.Add(-time.Second), now.Add(time.Hour))))
 	ar := m.activeFor("a")
@@ -776,6 +1113,7 @@ func TestFFmpegFailureRestartsWithBackoff(t *testing.T) {
 	dir := t.TempDir()
 	ff := fakeFFmpeg(t, dir, true)
 	m := NewManager(testConfig(dir, ff), slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), up, "test")
+	m.SetRemuxer(newFakeRemuxer())
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -840,6 +1178,7 @@ func TestRestartedRecordingUploadsExitReasons(t *testing.T) {
 	dir := t.TempDir()
 	ff := flakyFFmpeg(t, dir, 2) // two demux-error exits, then it streams
 	m := NewManager(testConfig(dir, ff), slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), up, "test")
+	m.SetRemuxer(newFakeRemuxer())
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -881,6 +1220,7 @@ func TestSpawnFailureClassifiedAsExitError(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir, filepath.Join(dir, "no-such-ffmpeg"))
 	m := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), up, "test")
+	m.SetRemuxer(newFakeRemuxer())
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()

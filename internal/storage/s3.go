@@ -5,9 +5,10 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"mime"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -39,9 +41,17 @@ type S3 struct {
 	uploader    *manager.Uploader
 	bucket      string
 	prefix      string
+	partSize    int64 // also the download chunk size
 	conditional atomic.Bool
 	checksum    types.ChecksumAlgorithm
 	log         *slog.Logger
+
+	// The conditional-write probe runs at most once per process; the mutex
+	// keeps two upload workers from probing (and writing a probe object) at
+	// the same time.
+	probeMu     sync.Mutex
+	probed      bool
+	probeResult bool
 }
 
 // NewS3 builds the client from configuration.
@@ -85,7 +95,10 @@ func NewS3(ctx context.Context, cfg *config.Config, log *slog.Logger) (*S3, erro
 		// client); without it every multipart upload still carries a CRC32 trailer.
 		u.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 	})
-	s := &S3{client: client, uploader: up, bucket: cfg.S3Bucket, prefix: cfg.S3Prefix, log: log}
+	s := &S3{
+		client: client, uploader: up, bucket: cfg.S3Bucket, prefix: cfg.S3Prefix,
+		partSize: cfg.UploadPartSize, log: log,
+	}
 	s.conditional.Store(cfg.S3ConditionalPut)
 	switch cfg.S3ChecksumAlgorithm {
 	case "crc32":
@@ -105,10 +118,19 @@ func (s *S3) Check(ctx context.Context) error {
 }
 
 // Upload stores the file under key, then verifies the stored object's size.
-// It returns the object's ETag. Failures are classified: permanent-looking
-// ones are wrapped in *recorder.PermanentError; a conditional-put conflict
-// with a different object yields recorder.ErrObjectExists.
-func (s *S3) Upload(ctx context.Context, path, key, contentType string, metadata map[string]string) (string, error) {
+// It returns the object's ETag without the surrounding quotes. Failures are
+// classified: permanent-looking ones are wrapped in *recorder.PermanentError.
+//
+// With an empty replaceETag the object must not already exist with different
+// content: the PUT carries If-None-Match: * (when S3_CONDITIONAL_PUT is on)
+// and a conflict with a differently sized object yields
+// recorder.ErrObjectExists. With a replaceETag the upload replaces exactly the
+// object carrying that ETag (If-Match) — this is how a later session of a
+// recording is merged into the object that already holds the earlier ones, so
+// a 412 must surface as recorder.ErrObjectChanged (re-read and merge again)
+// and an endpoint that cannot do If-Match must never fall back to an
+// unconditional PUT: that would drop whatever the object already held.
+func (s *S3) Upload(ctx context.Context, path, key, contentType string, metadata map[string]string, replaceETag string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
@@ -134,9 +156,18 @@ func (s *S3) Upload(ctx context.Context, path, key, contentType string, metadata
 	if s.checksum != "" {
 		in.ChecksumAlgorithm = s.checksum
 	}
-	conditional := s.conditional.Load()
-	if conditional {
-		in.IfNoneMatch = aws.String("*")
+	replacing := replaceETag != ""
+	conditional := false
+	if replacing {
+		// The SDK copies same-named fields from the PutObjectInput into the
+		// CompleteMultipartUploadInput, so this condition holds on both the
+		// single-part and the multipart path.
+		in.IfMatch = aws.String(quoteETag(replaceETag))
+	} else {
+		conditional = s.conditional.Load()
+		if conditional {
+			in.IfNoneMatch = aws.String("*")
+		}
 	}
 
 	out, err := s.uploader.Upload(ctx, in)
@@ -147,8 +178,20 @@ func (s *S3) Upload(ctx context.Context, path, key, contentType string, metadata
 			s.abortIfMultipart(err, key)
 		}
 		code, status := errorCodeAndStatus(err)
+		precondition := status == http.StatusPreconditionFailed || code == "PreconditionFailed"
 		switch {
-		case conditional && (status == http.StatusPreconditionFailed || code == "PreconditionFailed"):
+		case replacing && precondition:
+			// Someone else wrote the object between our HEAD and this PUT.
+			return "", recorder.ErrObjectChanged
+		case replacing && code == "NotImplemented":
+			// Retrying without the condition would overwrite the other
+			// writer's audio; the merge stays blocked instead.
+			return "", &recorder.PermanentError{
+				Err: fmt.Errorf("endpoint does not support If-Match on %s: %w", key, err),
+			}
+		case replacing:
+			return "", classify(err)
+		case conditional && precondition:
 			// Something already lives under this key. Idempotent recovery: if it
 			// has exactly our size, treat it as our own earlier upload.
 			remote, herr := s.headSize(ctx, key)
@@ -196,66 +239,241 @@ func (s *S3) Upload(ctx context.Context, path, key, contentType string, metadata
 	return etag, nil
 }
 
-// maxSmallObject bounds what GetObject is willing to read (playlists are a
-// few hundred bytes; anything larger under that key is not ours).
-const maxSmallObject = 4 << 20
-
-// PutObject stores body under key, replacing any existing object. It is used
-// for the folder playlists, which are rewritten whenever a file is added.
-func (s *S3) PutObject(ctx context.Context, key, contentType string, body []byte) error {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+// Head reports size, ETag and user metadata of the object under key. found is
+// false when there is no such object; everything else is classified. The
+// upload path reads the manifest (recording-id, sessions, parts) from the
+// metadata to decide whether the object is ours and which sessions it holds.
+func (s *S3) Head(ctx context.Context, key string) (recorder.ObjectInfo, bool, error) {
+	hctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	in := &s3.PutObjectInput{
-		Bucket:        aws.String(s.bucket),
-		Key:           aws.String(key),
-		Body:          bytes.NewReader(body),
-		ContentLength: aws.Int64(int64(len(body))),
-		ContentType:   aws.String(contentType),
+	out, err := s.client.HeadObject(hctx, &s3.HeadObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
+	if err != nil {
+		if isNotFound(err) {
+			return recorder.ObjectInfo{}, false, nil
+		}
+		return recorder.ObjectInfo{}, false, classify(err)
 	}
-	if s.checksum != "" {
-		in.ChecksumAlgorithm = s.checksum
+	info := recorder.ObjectInfo{
+		Size: aws.ToInt64(out.ContentLength),
+		ETag: strings.Trim(aws.ToString(out.ETag), `"`),
 	}
-	if _, err := s.client.PutObject(ctx, in); err != nil {
-		return classify(err)
+	if len(out.Metadata) > 0 {
+		// The SDK already lower-cases the x-amz-meta-* names; copy so the
+		// caller owns the map.
+		info.Metadata = make(map[string]string, len(out.Metadata))
+		for k, v := range out.Metadata {
+			info.Metadata[strings.ToLower(k)] = v
+		}
+	}
+	return info, true, nil
+}
+
+// Download writes the object at key to path using ranged GETs. It fails with
+// recorder.ErrObjectChanged when ifMatchETag is given and the object is no
+// longer the one that ETag describes — the merge is built on the manifest read
+// by an earlier HEAD, so a different object must not be mixed into it.
+//
+// The bytes land in path+".part" and are renamed only after the size has been
+// confirmed and the file is on disk: a truncated download would still parse as
+// an MP4 and would silently cost the audio it is missing.
+func (s *S3) Download(ctx context.Context, key, ifMatchETag, path string) error {
+	tmp := path + ".part"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			f.Close()
+			os.Remove(tmp)
+		}
+	}()
+
+	in := &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)}
+	if ifMatchETag != "" {
+		in.IfMatch = aws.String(quoteETag(ifMatchETag))
+	}
+	d := manager.NewDownloader(s.client, func(d *manager.Downloader) {
+		d.PartSize = s.partSize
+		d.Concurrency = 3
+	})
+	n, err := d.Download(ctx, f, in)
+	if err != nil {
+		code, status := errorCodeAndStatus(err)
+		if ifMatchETag != "" && (status == http.StatusPreconditionFailed || code == "PreconditionFailed") {
+			return recorder.ErrObjectChanged
+		}
+		return classify(fmt.Errorf("download %s: %w", key, err))
+	}
+	remote, err := s.headSize(ctx, key)
+	if err != nil {
+		return classify(fmt.Errorf("verify download of %s (head): %w", key, err))
+	}
+	if remote != n {
+		return fmt.Errorf("download %s: wrote %d bytes, object has %d", key, n, remote)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("fsync %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmp, err)
+	}
+	closed = true
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
 	}
 	return nil
 }
 
-// GetObject returns the content stored under key; found is false when there
-// is no such object.
-func (s *S3) GetObject(ctx context.Context, key string) (body []byte, found bool, err error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key)})
-	if err != nil {
-		code, status := errorCodeAndStatus(err)
-		if status == http.StatusNotFound || code == "NoSuchKey" || code == "NotFound" {
-			return nil, false, nil
-		}
-		return nil, false, classify(err)
+// ConditionalWrites reports whether the endpoint really enforces
+// If-None-Match/If-Match, on the single-part PUT *and* on
+// CompleteMultipartUpload (the SDK's uploader picks the path by size, so a
+// recording can take either). An endpoint that ignores the header answers 200
+// and would let one writer silently discard another's audio, so merging
+// sessions into one object is only allowed when this returns true. The answer
+// is probed once with a throw-away object and cached for the process.
+func (s *S3) ConditionalWrites(ctx context.Context) (bool, error) {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if s.probed {
+		return s.probeResult, nil
 	}
-	defer out.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(out.Body, maxSmallObject+1))
-	if err != nil {
-		return nil, false, classify(err)
+	if !s.conditional.Load() {
+		// S3_CONDITIONAL_PUT=false (or an endpoint that answered
+		// NotImplemented earlier): nothing sends a precondition, so nothing
+		// enforces one. No need to write a probe object.
+		s.probed, s.probeResult = true, false
+		return false, nil
 	}
-	if len(data) > maxSmallObject {
-		return nil, false, &recorder.PermanentError{Err: fmt.Errorf("object %s is larger than %d bytes", key, maxSmallObject)}
-	}
-	return data, true, nil
-}
-
-// Exists reports whether an object of exactly size bytes is stored under key.
-func (s *S3) Exists(ctx context.Context, key string, size int64) (bool, error) {
-	remote, err := s.headSize(ctx, key)
+	ok, err := s.probeConditionalWrites(ctx)
 	if err != nil {
-		code, status := errorCodeAndStatus(err)
-		if status == http.StatusNotFound || code == "NotFound" || code == "NoSuchKey" {
-			return false, nil
-		}
+		// A store that is simply unreachable says nothing about its
+		// preconditions; leave it unprobed so the next attempt tries again.
 		return false, err
 	}
-	return remote == size, nil
+	s.probed, s.probeResult = true, ok
+	return ok, nil
+}
+
+// probeConditionalWrites writes a tiny object under `{prefix}.recorder-probe/`
+// and checks that every conditional write against it is refused with 412.
+func (s *S3) probeConditionalWrites(ctx context.Context) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	suffix := make([]byte, 8)
+	if _, err := rand.Read(suffix); err != nil {
+		return false, fmt.Errorf("conditional write probe key: %w", err)
+	}
+	key := s.prefix + ".recorder-probe/" + hex.EncodeToString(suffix)
+	body := []byte("spectado-stream-recorder conditional write probe\n")
+	put := func(condition func(*s3.PutObjectInput)) error {
+		in := &s3.PutObjectInput{
+			Bucket:        aws.String(s.bucket),
+			Key:           aws.String(key),
+			Body:          bytes.NewReader(body),
+			ContentLength: aws.Int64(int64(len(body))),
+			ContentType:   aws.String("text/plain"),
+		}
+		if condition != nil {
+			condition(in)
+		}
+		_, err := s.client.PutObject(ctx, in)
+		return err
+	}
+
+	if err := put(nil); err != nil {
+		return false, classify(fmt.Errorf("conditional write probe (put %s): %w", key, err))
+	}
+	defer s.deleteProbe(key)
+
+	if err := put(func(in *s3.PutObjectInput) { in.IfNoneMatch = aws.String("*") }); !isPreconditionFailed(err) {
+		s.log.Warn("endpoint does not enforce If-None-Match on PutObject", "key", key, "error", err)
+		return false, nil
+	}
+	if err := put(func(in *s3.PutObjectInput) { in.IfMatch = aws.String(`"deadbeef"`) }); !isPreconditionFailed(err) {
+		s.log.Warn("endpoint does not enforce If-Match on PutObject", "key", key, "error", err)
+		return false, nil
+	}
+	return s.probeMultipartIfMatch(ctx, key, body)
+}
+
+// probeMultipartIfMatch completes a one-part multipart upload with a wrong
+// If-Match: the condition travels on CompleteMultipartUpload, which is a
+// different code path in every implementation, so it is probed separately.
+func (s *S3) probeMultipartIfMatch(ctx context.Context, key string, body []byte) (bool, error) {
+	create, err := s.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
+	})
+	if err != nil {
+		s.log.Warn("conditional write probe: create multipart upload failed", "key", key, "error", err)
+		return false, nil
+	}
+	uploadID := aws.ToString(create.UploadId)
+	// The complete below is meant to fail, so the upload always needs aborting;
+	// leftover parts are billable.
+	defer s.abortUpload(key, uploadID)
+
+	part, err := s.client.UploadPart(ctx, &s3.UploadPartInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+		PartNumber: aws.Int32(1), Body: bytes.NewReader(body), ContentLength: aws.Int64(int64(len(body))),
+	})
+	if err != nil {
+		s.log.Warn("conditional write probe: upload part failed", "key", key, "error", err)
+		return false, nil
+	}
+	_, err = s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: []types.CompletedPart{{ETag: part.ETag, PartNumber: aws.Int32(1)}},
+		},
+		IfMatch: aws.String(`"deadbeef"`),
+	})
+	if !isPreconditionFailed(err) {
+		s.log.Warn("endpoint does not enforce If-Match on CompleteMultipartUpload", "key", key, "error", err)
+		return false, nil
+	}
+	return true, nil
+}
+
+// deleteProbe removes the probe object with a fresh context: the probe runs
+// inside an upload attempt whose context may already be on its way out.
+func (s *S3) deleteProbe(key string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key),
+	}); err != nil {
+		s.log.Warn("delete conditional write probe object", "key", key, "error", err)
+	}
+}
+
+// isPreconditionFailed reports whether err is the 412 a refused conditional
+// write produces. A nil error is not one: the write went through.
+func isPreconditionFailed(err error) bool {
+	if err == nil {
+		return false
+	}
+	code, status := errorCodeAndStatus(err)
+	return status == http.StatusPreconditionFailed || code == "PreconditionFailed"
+}
+
+// isNotFound reports whether err says the object does not exist (HEAD answers
+// 404 with no code, GET with NoSuchKey).
+func isNotFound(err error) bool {
+	code, status := errorCodeAndStatus(err)
+	return status == http.StatusNotFound || code == "NotFound" || code == "NoSuchKey"
+}
+
+// quoteETag returns the ETag in the quoted form the If-Match/If-None-Match
+// headers require; ObjectInfo carries it unquoted.
+func quoteETag(etag string) string {
+	if strings.HasPrefix(etag, `"`) && strings.HasSuffix(etag, `"`) && len(etag) > 1 {
+		return etag
+	}
+	return `"` + etag + `"`
 }
 
 // mentionsConditional reports whether an error message refers to conditional
@@ -289,17 +507,26 @@ func (s *S3) abortIfMultipart(err error, key string) {
 	if !errors.As(err, &mf) || mf.UploadID() == "" {
 		return
 	}
+	s.abortUpload(key, mf.UploadID())
+}
+
+// abortUpload drops an unfinished multipart upload, with its own context for
+// the same reason as above.
+func (s *S3) abortUpload(key, uploadID string) {
+	if uploadID == "" {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_, aerr := s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(key), UploadId: aws.String(mf.UploadID()),
+	_, err := s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
 	})
-	if aerr != nil {
-		if code, _ := errorCodeAndStatus(aerr); code == "NoSuchUpload" {
-			s.log.Debug("multipart upload already aborted", "key", key, "uploadId", mf.UploadID())
+	if err != nil {
+		if code, _ := errorCodeAndStatus(err); code == "NoSuchUpload" {
+			s.log.Debug("multipart upload already aborted", "key", key, "uploadId", uploadID)
 			return
 		}
-		s.log.Warn("abort multipart upload", "key", key, "uploadId", mf.UploadID(), "error", aerr)
+		s.log.Warn("abort multipart upload", "key", key, "uploadId", uploadID, "error", err)
 	}
 }
 
@@ -384,9 +611,27 @@ func classify(err error) error {
 	return err
 }
 
+// reservedMetadata are the keys the upload path reads back from the stored
+// object to decide whether it may merge a new session into it. Losing one of
+// them turns the object into a foreign object and costs a second key, so they
+// are written first, get a larger per-value budget and are never dropped.
+var reservedMetadata = map[string]bool{
+	"recording-id":       true,
+	"sessions":           true,
+	"parts":              true,
+	"last-session-start": true,
+}
+
+// reservedValueMax is the per-value cap for the merge manifest: the sessions
+// list holds up to 20 x 9 bytes, well inside it, while a name or source is
+// still cut at 256.
+const reservedValueMax = 1024
+
 // SanitizeMetadata makes user-provided metadata safe for S3 headers: keys are
 // lower-cased and restricted to [a-z0-9-], values with non-ASCII characters
 // are RFC 2047 encoded, and the total size stays under the 2 KiB limit.
+// The reserved merge-manifest keys are processed first so a long title can
+// never push them out.
 func SanitizeMetadata(in map[string]string) map[string]string {
 	if len(in) == 0 {
 		return nil
@@ -398,17 +643,31 @@ func SanitizeMetadata(in map[string]string) map[string]string {
 	sort.Strings(keys) // deterministic selection when the size cap applies
 	out := make(map[string]string, len(in))
 	total := 0
-	for _, orig := range keys {
-		k := sanitizeKey(orig)
-		v := sanitizeValue(in[orig], 256)
-		if k == "" || v == "" {
-			continue
+	for _, pass := range []bool{true, false} {
+		for _, orig := range keys {
+			k := sanitizeKey(orig)
+			if k == "" || reservedMetadata[k] != pass {
+				continue
+			}
+			if _, taken := out[k]; taken {
+				continue // two inputs sanitize to the same key
+			}
+			max := 256
+			if pass {
+				max = reservedValueMax
+			}
+			v := sanitizeValue(in[orig], max)
+			if v == "" {
+				continue
+			}
+			// Reserved values are kept whatever the budget says; they are what
+			// makes the object mergeable at all.
+			if !pass && total+len(k)+len(v) > 1800 {
+				continue
+			}
+			total += len(k) + len(v)
+			out[k] = v
 		}
-		if total+len(k)+len(v) > 1800 {
-			continue
-		}
-		total += len(k) + len(v)
-		out[k] = v
 	}
 	return out
 }

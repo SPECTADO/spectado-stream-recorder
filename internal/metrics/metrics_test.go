@@ -29,6 +29,8 @@ func TestNewRegistersEverythingOnce(t *testing.T) {
 		"recorder_build_info", "recorder_schedule_fetch_total", "recorder_recordings_active",
 		"recorder_upload_duration_seconds", "recorder_cgroup_cpu_usage_seconds_total", "recorder_disk_low",
 		"recorder_ffmpeg_exits_total", "recorder_ffmpeg_stderr_suppressed_total",
+		"recorder_remux_total", "recorder_remux_duration_seconds", "recorder_remux_transcoded_total",
+		"recorder_upload_merges_total", "recorder_upload_fallback_total", "recorder_object_key_renames_total",
 		"go_goroutines", "process_open_fds",
 	} {
 		if _, ok := fams[name]; !ok {

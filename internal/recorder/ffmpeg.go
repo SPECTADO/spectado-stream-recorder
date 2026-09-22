@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net/url"
 	"os"
 	"os/exec"
@@ -23,7 +22,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/spectado/stream-recorder/internal/adts"
-	"github.com/spectado/stream-recorder/internal/id3"
 )
 
 // FFmpegCapabilities describes version-dependent options of the ffmpeg binary
@@ -85,12 +83,9 @@ type runState struct {
 	anchor       time.Time
 	anchorSource string  // "hls-pdt" | "wallclock"
 	offset       int64   // file size at run start (first byte of the run)
-	bytes        int64   // bytes written this run (frames + tags + junk)
+	bytes        int64   // bytes written this run (frames + junk)
 	frames       int     // complete frames written this run
 	seconds      float64 // media time of the run so far
-	nextTagAt    float64 // media seconds at which the next ID3 tag is due
-	tagsWritten  int
-	mediaBefore  float64 // media seconds of the previous runs of this session
 	started      bool    // at least one frame written this run
 	closed       bool    // endRun has finalized this run's record
 }
@@ -104,9 +99,16 @@ func (ar *activeRecording) lastDataTime() time.Time {
 }
 
 // captureWriter appends ffmpeg's stdout to the recording file, splitting it into
-// ADTS frames so it can insert in-band ID3 wall-clock tags between them. It never
-// drops or reorders ffmpeg's bytes: frames and junk are written through verbatim
-// (plus the inserted tags), so the file stays a faithful copy plus timing.
+// ADTS frames so every run's frame count, media time and byte range are known
+// exactly. It never drops, reorders or adds bytes: frames and junk are written
+// through verbatim, so the file stays a faithful copy of ffmpeg's output.
+//
+// Nothing is inserted between the frames. Until 1.1.0 the writer wrote an
+// ID3v2.4 wall-clock tag every CLOCK_ID3_INTERVAL of media time; those ~100 B
+// tags perturbed the bytes-per-second ratio raw ADTS players estimate the
+// duration from, and HLS-aware players read the Apple PRIV timestamp as a PTS
+// base and jumped the timeline. The wall clock now lives in the .m4a metadata
+// (per-run table) instead, where it cannot disturb playback.
 type captureWriter struct {
 	ar *activeRecording
 	m  *Manager
@@ -125,48 +127,22 @@ func (w *captureWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// onFrame handles one complete ADTS frame: it inserts an ID3 wall-clock tag when
-// one is due, then writes the frame. The first frame of a run also opens the
-// run's record.
+// onFrame writes one complete ADTS frame. The first frame of a run stamps the
+// wall-clock anchor (for a wallclock source) and opens the run's record.
 func (w *captureWriter) onFrame(b []byte, h adts.Header) {
 	ar := w.ar
 	rs := &ar.run
-	interval := w.m.cfg.ClockID3Interval
 
 	rs.mu.Lock()
 	first := !rs.started
 	rs.started = true
-	t := rs.seconds // media time of this frame's first sample within the run
 	if first && rs.anchorSource == "wallclock" {
 		rs.anchor = time.Now()
-	}
-	anchor := rs.anchor
-	source := rs.anchorSource
-	mediaBefore := rs.mediaBefore
-	writeTag := interval > 0 && (first || t >= rs.nextTagAt)
-	if writeTag {
-		if first {
-			// The first tag sits at t=0 and does not shift the cadence.
-			rs.nextTagAt = interval.Seconds()
-		} else {
-			rs.nextTagAt = t + interval.Seconds()
-		}
-		rs.tagsWritten++
 	}
 	rs.mu.Unlock()
 
 	if first {
 		w.m.openRunRecord(ar)
-	}
-	if writeTag {
-		wall := anchor.Add(time.Duration(t * float64(time.Second)))
-		pts90k := uint64(math.Round((mediaBefore + t) * 90000))
-		tag := id3.Tag(
-			id3.AppleTimestamp(pts90k),
-			id3.TXXX("WALLCLOCK", wall.UTC().Format("2006-01-02T15:04:05.000Z07:00")),
-			id3.TXXX("WALLCLOCK-SOURCE", source),
-		)
-		ar.writeRaw(tag)
 	}
 	ar.writeRaw(b)
 
@@ -203,11 +179,9 @@ func (ar *activeRecording) writeRaw(b []byte) {
 }
 
 // beginRun resets the frame-aware writer for the upcoming ffmpeg run with the
-// clock anchor looked up for it. mediaBefore is the media time already captured
-// by earlier runs of this session, so in-band PTS values keep increasing across
-// restarts. It must be called before runFFmpegOnce (after any tail trim, so the
-// offset is the true file size at run start).
-func (ar *activeRecording) beginRun(anchor time.Time, source string, mediaBefore float64) {
+// clock anchor looked up for it. It must be called before runFFmpegOnce (after
+// any tail trim, so the offset is the true file size at run start).
+func (ar *activeRecording) beginRun(anchor time.Time, source string) {
 	ar.run.mu.Lock()
 	ar.run.startedAt = time.Now()
 	ar.run.anchor = anchor
@@ -216,9 +190,6 @@ func (ar *activeRecording) beginRun(anchor time.Time, source string, mediaBefore
 	ar.run.bytes = 0
 	ar.run.frames = 0
 	ar.run.seconds = 0
-	ar.run.nextTagAt = 0
-	ar.run.tagsWritten = 0
-	ar.run.mediaBefore = mediaBefore
 	ar.run.started = false
 	ar.run.closed = false
 	ar.run.mu.Unlock()
@@ -247,18 +218,6 @@ func (m *Manager) openRunRecord(ar *activeRecording) {
 	}
 	_ = ar.s.saveQuick()
 	m.mu.Unlock()
-}
-
-// sessionMediaBefore returns the media time already captured by the previous
-// runs of the session, so the in-band PTS keeps increasing across restarts.
-func (m *Manager) sessionMediaBefore(ar *activeRecording) float64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var sum float64
-	for _, r := range ar.s.Runs {
-		sum += r.DurationSeconds
-	}
-	return sum
 }
 
 // endRun flushes any buffered partial frame to the file and finalizes the open
@@ -754,7 +713,7 @@ func (m *Manager) supervise(ar *activeRecording) {
 		if ctx.Err() != nil {
 			return
 		}
-		ar.beginRun(anchor, source, m.sessionMediaBefore(ar))
+		ar.beginRun(anchor, source)
 		started := time.Now()
 		ar.runBytes.Store(0)
 		ar.stderr.resetRun()

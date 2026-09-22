@@ -1,10 +1,11 @@
 package recorder
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -26,7 +27,8 @@ const (
 	StateUploading State = "uploading"
 	// StateUploaded: object stored, local file deleted.
 	StateUploaded State = "uploaded"
-	// StateKept: capture finished and uploads are disabled; file kept locally.
+	// StateKept: capture finished and uploads are disabled; the .m4a is kept
+	// locally (the .aac stays instead when its remux failed).
 	StateKept State = "kept"
 	// StateFailed: terminal failure (e.g. empty recording).
 	StateFailed State = "failed"
@@ -49,8 +51,9 @@ const sidecarSchemaVersion = 1
 const maxExits = 20
 
 // maxRuns bounds Session.Runs. When exceeded the two oldest adjacent runs are
-// coalesced so a pathologically flapping recording cannot grow the sidecar (and
-// the published playlist) without limit.
+// coalesced so a pathologically flapping recording cannot grow the sidecar
+// without limit (the run table also lands in the .m4a description metadata,
+// capped separately at 500 entries; see internal/recorder/objectmeta.go).
 const maxRuns = 2000
 
 // Run is one ffmpeg run that produced audio: the byte range it wrote and the
@@ -61,7 +64,7 @@ type Run struct {
 	Anchor          time.Time  `json:"anchor"`       // wall-clock time of the first sample
 	AnchorSource    string     `json:"anchorSource"` // "hls-pdt" | "wallclock"
 	Offset          int64      `json:"offset"`       // first byte of the run in the file
-	Bytes           int64      `json:"bytes"`        // bytes written (frames + ID3 tags)
+	Bytes           int64      `json:"bytes"`        // bytes written (frames + junk)
 	Frames          int        `json:"frames"`
 	DurationSeconds float64    `json:"durationSeconds"`
 }
@@ -116,7 +119,7 @@ type Session struct {
 	LastError     string     `json:"lastError,omitempty"`
 	// RecordLastError is why the *recording* last restarted, built from the
 	// filtered stderr. Set only by supervise; unlike LastError it survives the
-	// upload (completeUpload clears LastError, not this) so a finished object
+	// upload (completeGroup clears LastError, not this) so a finished object
 	// still shows why it flapped.
 	RecordLastError string     `json:"recordLastError,omitempty"`
 	Exits           []RunExit  `json:"exits,omitempty"`        // last runs' exits (bounded)
@@ -127,11 +130,18 @@ type Session struct {
 	UploadAttempts  int        `json:"uploadAttempts"`
 	KeyRenames      int        `json:"keyRenames,omitempty"`      // times the key was changed after a conflict
 	UploadBlocked   bool       `json:"uploadBlocked,omitempty"`   // permanent-looking error; slow retries
-	MediaUploaded   bool       `json:"mediaUploaded,omitempty"`   // audio object stored and verified; playlist may still be pending
-	DurationSeconds float64    `json:"durationSeconds,omitempty"` // playback time derived from the ADTS frames
+	MediaUploaded   bool       `json:"mediaUploaded,omitempty"`   // this session's audio is part of the object under Key
+	DurationSeconds float64    `json:"durationSeconds,omitempty"` // playback time of THIS session derived from its ADTS frames
 	UploadedAt      *time.Time `json:"uploadedAt,omitempty"`
 	UploadETag      string     `json:"uploadEtag,omitempty"`
 	NextUploadAt    *time.Time `json:"nextUploadAt,omitempty"`
+	// Transcoded records that the object had to be re-encoded because the
+	// stream parameters changed mid-capture (a stream copy would have been
+	// short/pitched). RemuxFailures is the key's consecutive remux-failure
+	// count, mirrored here for the API.
+	Transcoded    bool   `json:"transcoded,omitempty"`
+	RemuxFailures int    `json:"remuxFailures,omitempty"`
+	OutputFile    string `json:"outputFile,omitempty"` // kept mode: the local .m4a produced from the capture
 
 	UpdatedAt time.Time `json:"updatedAt"`
 
@@ -139,8 +149,26 @@ type Session struct {
 	runsCoalesced bool   // whether a coalesce has already been logged this session
 }
 
-// FilePath returns the path of the audio file.
+// FilePath returns the path of the raw ADTS capture. Recording stays raw ADTS
+// on disk (crash-safe append, resume, tail trimming); the .m4a is produced from
+// it at upload time.
 func (s *Session) FilePath() string { return filepath.Join(s.dir, s.SessionID+".aac") }
+
+// OutputPath is where kept mode (UPLOAD_DISABLED=true) writes the remuxed file.
+func (s *Session) OutputPath() string { return filepath.Join(s.dir, s.SessionID+".m4a") }
+
+// setKey is the ONLY way Session.Key may change. Moving a session to another
+// key invalidates everything we know about the object it used to belong to: an
+// object under a different key never contains this session, so a stale
+// MediaUploaded would make the upload skip audio that was never stored there.
+func (s *Session) setKey(k string) {
+	if s.Key == k {
+		return
+	}
+	s.Key = k
+	s.MediaUploaded = false
+	s.UploadETag = ""
+}
 
 // SidecarPath returns the path of the metadata file.
 func (s *Session) SidecarPath() string { return filepath.Join(s.dir, s.SessionID+".json") }
@@ -280,29 +308,43 @@ func scanSessions(root string) ([]*Session, []error) {
 	return out, errs
 }
 
-// defaultFolder is the bucket folder of a session without an explicit key.
-// Every folder holds the media files of one recording plus its index.m3u8.
+// objectExt is the suffix of every recorded object: one .m4a per recording.
+const objectExt = ".m4a"
+
+// objectKey is the key of the single object holding a recording that has no
+// explicit schedule key:
 //
-//	{prefix}{scheduled start date, UTC}/{safeId}/
-func defaultFolder(prefix string, s *Session) string {
-	return prefix + s.Start.UTC().Format("2006-01-02") + "/" + s.SafeID + "/"
-}
-
-// mediaKey is the object key of the session's audio file inside folder. It
-// reuses the local file name ({safeId}_{session start, UTC}.aac), which is
-// unique per session and sorts chronologically within the folder.
-func mediaKey(folder string, s *Session) string {
-	return folder + s.SessionID + ".aac"
-}
-
-// playlistKey returns the key of the index.m3u8 listing the media object key
-// (always the same folder).
-func playlistKey(mediaKey string) string {
-	dir := path.Dir(mediaKey)
-	if dir == "." || dir == "/" {
-		return "index.m3u8"
+//	{prefix}{scheduled start date in loc}/{safeId}.m4a
+//
+// e.g. "2026-09-22/match-ro-jpOkle8Mp0.m4a". loc is KEY_DATE_TZ (UTC by
+// default): a show starting at 23:30 UTC belongs to the next day for a
+// broadcaster in Prague, and the folder has to follow the broadcaster.
+func objectKey(prefix string, loc *time.Location, s *Session) string {
+	if loc == nil {
+		loc = time.UTC
 	}
-	return dir + "/index.m3u8"
+	return prefix + s.Start.In(loc).Format("2006-01-02") + "/" + s.SafeID + objectExt
+}
+
+// explicitObjectKey is the key of a recording whose schedule item carries a
+// key: since 1.1.0 that key names the OBJECT, not a folder. ".m4a" is appended
+// unless the key already ends in it (case-insensitively, because a producer
+// writing ".M4A" means the same object).
+func explicitObjectKey(prefix, key string) string {
+	k := prefix + strings.Trim(strings.TrimSpace(key), "/")
+	if strings.HasSuffix(strings.ToLower(k), objectExt) {
+		return k
+	}
+	return k + objectExt
+}
+
+// sessionDigest identifies a session inside an object's `sessions` manifest:
+// the first 8 hex characters of sha256(sessionId). The session ids themselves
+// would blow the metadata budget (20 parts x ~40 B), while 8 hex characters are
+// 4 bytes of collision resistance over the at most 20 sessions of one object.
+func sessionDigest(sessionID string) string {
+	sum := sha256.Sum256([]byte(sessionID))
+	return hex.EncodeToString(sum[:4])
 }
 
 // addExit appends e to the session's exit history, keeping only the most recent
@@ -405,8 +447,8 @@ func exitReasonsSummary(exits []RunExit) string {
 	return strings.Join(parts, ",")
 }
 
-// withSuffix inserts suffix before the file extension: ("a/b.aac", "_x") ->
-// "a/b_x.aac". Keys without an extension simply get the suffix appended.
+// withSuffix inserts suffix before the file extension: ("a/b.m4a", "-2") ->
+// "a/b-2.m4a". Keys without an extension simply get the suffix appended.
 func withSuffix(key, suffix string) string {
 	ext := filepath.Ext(key)
 	if strings.Contains(ext, "/") { // dot belongs to a directory component

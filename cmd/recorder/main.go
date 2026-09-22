@@ -95,7 +95,13 @@ func run() error {
 		"scheduleUrl", recorder.RedactURL(cfg.ScheduleURL), "pollInterval", cfg.SchedulePollInterval.String(),
 		"dataDir", cfg.DataDir, "httpAddr", cfg.HTTPAddr, "uploads", !cfg.UploadDisabled,
 		"bucket", cfg.S3Bucket, "codec", cfg.AudioCodec, "bitrate", cfg.AudioBitrate,
+		"keyDateTz", cfg.KeyDateTZ,
 		"startEarly", cfg.RecordStartEarly.String(), "stopLate", cfg.RecordStopLate.String())
+	// Configuration that loaded but is not what the operator probably meant
+	// (e.g. a variable a later version removed). Logged once, never fatal.
+	for _, w := range cfg.Warnings {
+		log.Warn(w)
+	}
 
 	if err := prepareDataDir(cfg.DataDir); err != nil {
 		return err
@@ -183,6 +189,12 @@ func run() error {
 				return
 			}
 			log.Info("S3 bucket reachable", "bucket", cfg.S3Bucket, "endpoint", cfg.S3Endpoint)
+			// Whether sessions of one recording can be merged into a single
+			// object depends on the endpoint honouring If-Match/If-None-Match.
+			// Probing it here — only once the bucket is known to be reachable,
+			// since the probe writes a small object — puts the answer in the log
+			// at startup instead of inside the first merge, hours later.
+			mgr.ProbeConditionalWrites(ctx)
 			if n, err := s3up.CleanupStaleMultipartUploads(ctx, time.Hour); err != nil {
 				log.Warn("could not clean up stale multipart uploads", "error", err)
 			} else if n > 0 {

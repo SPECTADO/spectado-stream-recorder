@@ -1,5 +1,5 @@
 {
-  "_comment": "Alternative object form of the schedule document: the same item objects wrapped in an \"items\" array. Top-level fields other than \"items\" are ignored.",
+  "_comment": "Alternative object form of the schedule document: the same item objects wrapped in an \"items\" array. Top-level fields other than \"items\" are ignored. An item's 'key' names its uploaded .m4a object directly (S3_PREFIX prepended, .m4a appended unless already present) -- e.g. radio-one/2026-09-01/morning-show.m4a below.",
   "generatedAt": "2026-08-31T18:00:00+02:00",
   "items": [
     {

@@ -1,14 +1,24 @@
+// Package hls parses the live source playlists the recorder reads to anchor
+// each ffmpeg run to the source's wall clock (#EXT-X-PROGRAM-DATE-TIME).
+//
+// The recorder no longer publishes playlists of its own: since 1.1.0 a
+// recording is a single .m4a object whose position-to-wall-clock map lives in
+// the MP4 metadata, so only the parsing half of HLS is left here.
 package hls
 
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"math"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// ErrNotPlaylist is returned when the input does not start with #EXTM3U.
+var ErrNotPlaylist = errors.New("not an M3U8 playlist")
 
 // LiveSegment is one media segment of a live source playlist.
 type LiveSegment struct {
@@ -177,4 +187,14 @@ func resolve(base *url.URL, uri string) string {
 		return uri
 	}
 	return base.ResolveReference(u).String()
+}
+
+// parseTime parses an RFC3339 timestamp with or without fractional seconds, the
+// two shapes #EXT-X-PROGRAM-DATE-TIME appears in.
+func parseTime(v string) (time.Time, error) {
+	v = strings.TrimSpace(v)
+	if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, v)
 }

@@ -48,9 +48,14 @@ RUN apk add --no-cache ca-certificates tzdata tini \
 COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
 COPY --from=build /out/recorder /usr/local/bin/recorder
 
-# Smoke test: the shipped ffmpeg must encode AAC into ADTS and speak https.
+# Smoke test: the shipped ffmpeg must encode AAC into ADTS, speak https, and
+# remux ADTS into the .m4a (ipod muxer) the upload path relies on.
 RUN ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=0.2" -c:a aac -f adts - > /dev/null \
     && ffmpeg -hide_banner -protocols 2>/dev/null | grep -q https \
+    && ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=0.2" -c:a aac -f adts /tmp/smoke.aac \
+    && ffmpeg -hide_banner -loglevel error -xerror -i /tmp/smoke.aac -c:a copy -movflags +faststart -f ipod /tmp/smoke.m4a \
+    && ffprobe -v error -show_entries format=format_name -of default=nw=1 /tmp/smoke.m4a | grep -q mp4 \
+    && rm -f /tmp/smoke.aac /tmp/smoke.m4a \
     && /usr/local/bin/recorder --version
 
 ENV DATA_DIR=/data \
