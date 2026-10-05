@@ -34,6 +34,14 @@ const (
 	// bucket forever because ffmpeg cannot digest it.
 	maxRemuxFailures = 3
 
+	// videoNoSpaceGiveUp is how long the video companion's share of the disk
+	// preflight may keep not fitting (while the audio's does) before the .m4a
+	// is stored without the .mp4. A shortage is usually transient (other
+	// uploads' temp files), so it is measured in time, not in attempts, and
+	// never counts against maxRemuxFailures (meant for deterministic build
+	// failures).
+	videoNoSpaceGiveUp = 30 * time.Minute
+
 	// maxKeyRenames bounds the "-2", "-3" ... escape hatch (as before 1.1.0).
 	maxKeyRenames = 3
 
@@ -347,7 +355,14 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 		if len(present) == 0 {
 			return nil
 		}
-		return m.completeGroup(present, key, info.ETag, completion{}, log)
+		var c completion
+		if groupHasVideo(group) {
+			var err error
+			if c, err = m.convergeVideo(ctx, key, s.ID, remote, log); err != nil {
+				return err
+			}
+		}
+		return m.completeGroup(present, key, info.ETag, c, log)
 	}
 
 	merging := remote != nil
@@ -365,8 +380,9 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 	// The .mp4 companion (RECORD_VIDEO): its key is classified like the .m4a's
 	// before anything is built, so a foreign object there moves the group now.
 	var vt *videoTarget
+	var vdone completion
 	if groupHasVideo(group) {
-		if vt, err = m.headVideo(ctx, key, s.ID, group, remote, log); err != nil {
+		if vt, err = m.headVideo(ctx, key, s.ID, group, remote, toAdd, log); err != nil {
 			return err
 		}
 	}
@@ -374,23 +390,54 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 	// 4. Disk preflight: the .m4a plus, when merging, the downloaded object and
 	//    its extraction have to fit next to the captures. The .mp4 needs its
 	//    TS inputs again (plus the ADTS for black or audio-only pieces), and a
-	//    reused stored .mp4 is downloaded, extracted and rebuilt.
+	//    reused stored .mp4 is downloaded, extracted and rebuilt. The audio's
+	//    share is checked first: when only the video's does not fit, that
+	//    counts as a failed companion build (retried, then given up on) — a
+	//    video problem never holds the .m4a back for good.
 	var localBytes int64
 	for _, mem := range toAdd {
 		localBytes += mem.size
+	}
+	// The sessions an inSync stored .mp4 already holds (the stored .m4a's and
+	// the first skip of this attempt's): they keep their picture even when
+	// this attempt gives the companion up.
+	var held map[string]bool
+	if vt != nil && vt.inSync {
+		held = map[string]bool{}
+		for _, mem := range present {
+			held[mem.s.SessionID] = true
+		}
+		for _, mem := range toAdd[:vt.skip] {
+			held[mem.s.SessionID] = true
+		}
 	}
 	need := localBytes*12/10 + m.cfg.MinFreeDiskBytes
 	if merging {
 		need += 3 * remote.size
 	}
-	if vt != nil {
-		need += videoBytes(toAdd)*12/10 + localBytes
-		if merging && vt.inSync {
-			need += 3 * vt.size
-		}
-	}
 	if err := m.checkDiskFor(key, need, log); err != nil {
 		return err
+	}
+	if vt != nil && !vt.reuse {
+		vneed := videoBytes(toAdd[vt.skip:])*12/10 + localBytes
+		if vt.inSync {
+			vneed += 3 * vt.size
+		}
+		if free, ok := m.freeDisk(); ok && free < uint64(need+vneed) {
+			m.met.VideoBuildsTotal.WithLabelValues("none", "nospace").Inc()
+			short := m.noteVideoNoSpace(key)
+			log.Warn("not enough free disk for the video companion", "free", free, "needAudio", need, "needVideo", vneed,
+				"shortFor", short.Truncate(time.Second).String())
+			if short < m.videoNoSpaceBudget {
+				return fmt.Errorf("nospace: %d bytes free, %d needed for the audio and %d more for the video companion", free, need, vneed)
+			}
+			log.Error("giving up on the video companion: not enough free disk; storing the audio without it",
+				"videoKey", vt.key, "shortFor", short.Truncate(time.Second).String())
+			vdone.videoErr = fmt.Sprintf("not enough disk for the video companion (%d bytes free, %d needed)", free, need+vneed)
+			vt = nil
+		} else {
+			m.clearVideoNoSpace(key)
+		}
 	}
 
 	// 5. Build the object.
@@ -430,9 +477,13 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 
 	// 6. The .mp4 companion goes first: once the .m4a lists a session, no later
 	//    attempt rebuilds anything for it. A build that keeps failing is given
-	//    up on (the audio is stored without it); a transfer error retries.
-	var vdone completion
-	if vt != nil {
+	//    up on (the audio is stored without it); a transfer error retries. A
+	//    stored .mp4 that already holds exactly this result (an earlier attempt
+	//    stored it, then failed on the .m4a) is kept as it is.
+	if vt != nil && vt.reuse {
+		log.Info("the stored video companion already holds these sessions; keeping it", "videoKey", vt.key)
+		vdone.video = true
+	} else if vt != nil {
 		var remotePart *buildPart
 		if merging {
 			remotePart = &parts[0]
@@ -442,6 +493,9 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 			return err
 		}
 		vdone.video, vdone.videoErr = stored, verr
+	}
+	if !vdone.video && vdone.videoErr != "" {
+		vdone.videoHeld = held
 	}
 
 	// 7. Store it: a new object is written conditionally (never overwrite), a
@@ -470,7 +524,8 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 	// 8. Both the sessions that were already in the object and the ones this
 	//    attempt added are done.
 	return m.completeGroup(append(toAdd, present...), key, etag,
-		completion{transcoded: transcoded, duration: res.Duration, video: vdone.video, videoErr: vdone.videoErr}, log)
+		completion{transcoded: transcoded, duration: res.Duration, video: vdone.video, videoErr: vdone.videoErr,
+			videoHeld: vdone.videoHeld}, log)
 }
 
 // claimGroup collects every session that belongs in the object under key — same
@@ -631,6 +686,13 @@ func (m *Manager) checkDiskFor(key string, need int64, log *slog.Logger) error {
 		log.Warn("not enough free disk to remux this recording; will retry", "free", free, "need", need)
 	}
 	return fmt.Errorf("nospace: %d bytes free, %d needed to remux", free, need)
+}
+
+// freeDisk reports the free bytes of the data disk (ok=false: unknown).
+func (m *Manager) freeDisk() (uint64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.diskFree()
 }
 
 // ---------------------------------------------------------------------------
@@ -956,6 +1018,7 @@ func (m *Manager) forgetKey(key string) {
 	defer m.mu.Unlock()
 	delete(m.remuxFailures, key)
 	delete(m.videoFailures, key)
+	delete(m.videoNoSpace, key)
 	delete(m.nospaceLogged, key)
 }
 
@@ -1099,6 +1162,10 @@ type completion struct {
 	duration   time.Duration
 	video      bool   // the .mp4 companion was stored with these sessions
 	videoErr   string // ... or why it was not (Session.VideoError)
+	// videoHeld: sessions (by id) the stored .mp4 already holds although this
+	// attempt gave its companion up (an inSync .mp4 an earlier attempt stored):
+	// they are videoUploaded, videoErr applies to the others only.
+	videoHeld map[string]bool
 }
 
 // completeGroup marks every session of the object uploaded and removes its
@@ -1132,7 +1199,7 @@ func (m *Manager) completeGroup(members []*uploadMember, key, etag string, c com
 		}
 		if s.Video {
 			switch {
-			case c.video:
+			case c.video, c.videoHeld[s.SessionID]:
 				s.VideoUploaded = true
 				s.VideoError = ""
 			case c.videoErr != "":
@@ -1275,19 +1342,28 @@ func videoBytes(toAdd []*uploadMember) int64 {
 
 // videoTarget is what the HEAD of the companion key found.
 type videoTarget struct {
-	key    string
-	etag   string // the object to replace; "" = none there (create-only put)
-	size   int64
-	inSync bool // a real (captured) picture of exactly the parts the stored .m4a holds
+	key  string
+	etag string // the stored companion's ETag (for its download); "" = none there
+	size int64
+	// inSync: the stored .mp4 is a real (captured) picture of the stored
+	// .m4a's parts followed by the first skip sessions of this attempt (an
+	// earlier attempt stored it, then failed before its .m4a): it becomes the
+	// first piece of the new one and only toAdd[skip:] are added to it.
+	inSync bool
+	skip   int
+	// reuse: the stored .mp4 already holds exactly the sessions this attempt
+	// stores (its .m4a put failed after the .mp4's): nothing to build or put.
+	reuse bool
 }
 
 // headVideo classifies the companion key like the .m4a's: an object there that
 // is not this recording's is a conflict (the group moves to a new key, both
-// objects with it). One of ours is reused as the stored part's picture only
-// when its manifest equals the stored .m4a's and it is not the black
-// placeholder; anything else is rebuilt from the stored audio and replaced.
+// objects with it). One of ours whose manifest is the target manifest (stored
+// .m4a's sessions + toAdd) is kept as it is; one that is a real picture of
+// the stored parts plus a prefix of toAdd is extended; anything else is
+// rebuilt from the stored audio and replaced.
 func (m *Manager) headVideo(ctx context.Context, key, recordingID string, group []*Session, remote *remoteObject,
-	log *slog.Logger,
+	toAdd []*uploadMember, log *slog.Logger,
 ) (*videoTarget, error) {
 	vkey := videoKey(key)
 	hctx, cancel := context.WithTimeout(ctx, headTimeout)
@@ -1306,11 +1382,56 @@ func (m *Manager) headVideo(ctx context.Context, key, recordingID string, group 
 		return nil, m.renameGroup(group, "conflict", log)
 	}
 	vt.etag, vt.size = info.ETag, info.Size
-	if remote != nil && strings.TrimSpace(info.Metadata["synthetic-video"]) == "false" {
-		ours := digestList(info.Metadata["sessions"])
-		vt.inSync = ours != "" && ours == strings.Join(remote.sessions, ",")
+	stored := digestList(info.Metadata["sessions"])
+	if stored == "" {
+		return vt, nil
+	}
+	var target []string
+	if remote != nil {
+		target = append(target, remote.sessions...)
+	}
+	base := len(target)
+	for _, mem := range toAdd {
+		target = append(target, mem.digest)
+	}
+	if stored == strings.Join(target, ",") {
+		vt.reuse = true
+		return vt, nil
+	}
+	if strings.TrimSpace(info.Metadata["synthetic-video"]) != "false" {
+		return vt, nil // a black placeholder is rebuilt, never extended
+	}
+	for k := 0; k < len(toAdd); k++ {
+		if base+k > 0 && stored == strings.Join(target[:base+k], ",") {
+			vt.inSync, vt.skip = true, k
+			break
+		}
 	}
 	return vt, nil
+}
+
+// convergeVideo is the companion's state for an attempt that has nothing to
+// add (every session is already in the .m4a; an earlier attempt stored it and
+// stopped before recording that): stored when the .mp4 there holds the same
+// sessions, else the reason it does not.
+func (m *Manager) convergeVideo(ctx context.Context, key, recordingID string, remote *remoteObject, log *slog.Logger) (completion, error) {
+	vkey := videoKey(key)
+	hctx, cancel := context.WithTimeout(ctx, headTimeout)
+	info, found, err := m.up.Head(hctx, vkey)
+	cancel()
+	if err != nil {
+		return completion{}, fmt.Errorf("head %s: %w", vkey, err)
+	}
+	switch {
+	case !found:
+		log.Warn("the stored recording has no video companion", "videoKey", vkey)
+		return completion{videoErr: "the .mp4 companion is missing"}, nil
+	case strings.TrimSpace(info.Metadata["recording-id"]) != recordingID || remote == nil ||
+		digestList(info.Metadata["sessions"]) != strings.Join(remote.sessions, ","):
+		log.Warn("the stored video companion does not hold the same sessions as the audio", "videoKey", vkey)
+		return completion{videoErr: "the .mp4 companion does not hold every session of the .m4a"}, nil
+	}
+	return completion{video: true}, nil
 }
 
 // digestList normalises a `sessions` manifest value for comparison.
@@ -1368,12 +1489,58 @@ func (m *Manager) uploadVideo(ctx context.Context, vt *videoTarget, key string, 
 		width:      res.Video.Width,
 		height:     res.Video.Height,
 	})
-	// Replacing exactly the companion the HEAD saw (or creating it): a racing
-	// writer makes the attempt look again instead of being overwritten.
-	if _, err := m.putObject(ctx, out, vt.key, videoContentType, objMeta, vt.etag, res.Size, log); err != nil {
+	// Conditional where the endpoint enforces it (create-only when the HEAD
+	// found nothing, If-Match on the ETag it found), so a concurrent writer's
+	// companion under the same key is never replaced: ErrObjectExists /
+	// ErrObjectChanged restart the attempt, whose HEAD then decides again
+	// (a foreign .mp4 moves the group). Unconditional only on an endpoint
+	// known not to enforce preconditions (ADR 0002). A refusal that retrying
+	// cannot fix costs the .mp4, never the .m4a; a transfer error retries the
+	// attempt.
+	if err := m.putVideo(ctx, out, vt.key, objMeta, res.Size, vt.etag, log); err != nil {
+		var perm *PermanentError
+		if errors.As(err, &perm) {
+			log.Error("the video companion upload was refused; storing the audio without it", "videoKey", vt.key, "error", err)
+			return false, "video upload refused: " + err.Error(), nil
+		}
 		return false, "", err
 	}
 	return true, "", nil
+}
+
+// putVideo stores the companion. When the endpoint enforces conditional
+// writes it goes through putObject: create-only when headETag is "" (the HEAD
+// found no .mp4), else If-Match on headETag. When the probe could not tell,
+// the conditional put is used too: an endpoint that cannot honour it refuses
+// with a PermanentError, which costs the .mp4 and never the .m4a. Only on an
+// endpoint known not to enforce preconditions is it written with
+// Uploader.Overwrite (an If-Match there would be refused every time).
+func (m *Manager) putVideo(ctx context.Context, path, key string, meta map[string]string, size int64,
+	headETag string, log *slog.Logger,
+) error {
+	cond, err := m.conditionalWrites(ctx)
+	if err != nil {
+		log.Warn("could not probe conditional writes; storing the video companion conditionally", "error", err)
+		cond = true
+	}
+	if cond {
+		_, err := m.putObject(ctx, path, key, videoContentType, meta, headETag, size, log)
+		return err
+	}
+	uctx, cancel := context.WithTimeout(ctx, m.transferDeadline(size))
+	defer cancel()
+	log.Info("upload started", "key", key, "bytes", size, "replace", false)
+	t0 := time.Now()
+	etag, err := m.up.Overwrite(uctx, path, key, videoContentType, meta)
+	if err != nil {
+		return err
+	}
+	took := time.Since(t0)
+	m.met.UploadBytesTotal.Add(float64(size))
+	m.met.UploadDuration.Observe(took.Seconds())
+	log.Info("object stored", "key", key, "bytes", size, "etag", etag,
+		"duration", took.Truncate(time.Millisecond).String())
+	return nil
 }
 
 // buildVideoCompanion lays out the companion's timeline — the stored part
@@ -1389,27 +1556,31 @@ func (m *Manager) buildVideoCompanion(ctx context.Context, vt *videoTarget, toAd
 		return "", remux.Result{}, &videoBuildError{err}
 	}
 	var remoteSeg *remux.VideoSegment
-	if remotePart != nil {
-		remoteSeg = &remux.VideoSegment{Audio: remotePart.path, Duration: remotePart.info.Duration}
-		if vt.inSync {
-			mp4 := filepath.Join(dir, ".tmp-remote-"+tmpID+".mp4")
-			ts := filepath.Join(dir, ".tmp-remote-"+tmpID+".ts")
-			tmps.add(mp4, ts)
-			dctx, cancel := context.WithTimeout(ctx, m.transferDeadline(vt.size))
-			err := m.up.Download(dctx, vt.key, vt.etag, mp4)
-			cancel()
-			if err != nil {
-				return "", remux.Result{}, err
-			}
-			if err := vr.ExtractVideoTS(ctx, mp4, ts); err != nil {
-				return "", remux.Result{}, &videoBuildError{fmt.Errorf("extract stored video: %w", err)}
-			}
-			_ = os.Remove(mp4) // only the extraction is needed from here on
-			remoteSeg = &remux.VideoSegment{TS: ts}
-			log.Info("merging into the stored video companion", "videoKey", vt.key, "remoteBytes", vt.size)
+	adding := toAdd
+	switch {
+	case vt.inSync:
+		// The stored picture covers the stored parts (and toAdd[:skip]).
+		mp4 := filepath.Join(dir, ".tmp-remote-"+tmpID+".mp4")
+		ts := filepath.Join(dir, ".tmp-remote-"+tmpID+".ts")
+		tmps.add(mp4, ts)
+		dctx, cancel := context.WithTimeout(ctx, m.transferDeadline(vt.size))
+		err := m.up.Download(dctx, vt.key, vt.etag, mp4)
+		cancel()
+		if err != nil {
+			return "", remux.Result{}, err
 		}
+		if err := vr.ExtractVideoTS(ctx, mp4, ts); err != nil {
+			return "", remux.Result{}, &videoBuildError{fmt.Errorf("extract stored video: %w", err)}
+		}
+		_ = os.Remove(mp4) // only the extraction is needed from here on
+		remoteSeg = &remux.VideoSegment{TS: ts}
+		adding = toAdd[vt.skip:]
+		log.Info("merging into the stored video companion", "videoKey", vt.key, "remoteBytes", vt.size,
+			"alreadyHolds", vt.skip)
+	case remotePart != nil:
+		remoteSeg = &remux.VideoSegment{Audio: remotePart.path, Duration: remotePart.info.Duration}
 	}
-	segs, err := m.videoSegments(toAdd, remoteSeg, dir, tmpID, tmps)
+	segs, err := m.videoSegments(adding, remoteSeg, dir, tmpID, tmps)
 	if err != nil {
 		return "", remux.Result{}, &videoBuildError{err}
 	}
@@ -1551,11 +1722,13 @@ func allTS(segs []remux.VideoSegment) bool {
 	return true
 }
 
-// sameVideo reports whether every probed capture has a picture and the same
-// parameters as the first (a stream copy can join them).
+// sameVideo reports whether every probed capture has a picture (a video
+// stream with packets: a capture killed before its first video packet only
+// declares one) and the same parameters as the first (a stream copy can join
+// them).
 func sameVideo(infos []remux.VideoInfo) bool {
 	for _, in := range infos {
-		if !in.HasVideo || !remux.SameVideoParams(infos[0], in) {
+		if !in.HasPicture() || !remux.SameVideoParams(infos[0], in) {
 			return false
 		}
 	}
@@ -1566,7 +1739,7 @@ func sameVideo(infos []remux.VideoInfo) bool {
 // picture in the timeline, else the black placeholder's.
 func transcodeTarget(infos []remux.VideoInfo) (w, h int, fps float64) {
 	for _, in := range infos {
-		if !in.HasVideo || in.Width <= 0 || in.Height <= 0 {
+		if !in.HasPicture() {
 			continue
 		}
 		fps = in.FPS
@@ -1576,6 +1749,29 @@ func transcodeTarget(infos []remux.VideoInfo) (w, h int, fps float64) {
 		return in.Width, in.Height, fps
 	}
 	return remux.BlackVideoWidth, remux.BlackVideoHeight, remux.BlackVideoFPS
+}
+
+// noteVideoNoSpace records that the companion's disk share does not fit for
+// the key and returns how long that has been the case without a break.
+func (m *Manager) noteVideoNoSpace(key string) time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.videoNoSpace == nil {
+		m.videoNoSpace = map[string]time.Time{}
+	}
+	since, ok := m.videoNoSpace[key]
+	if !ok {
+		since = time.Now()
+		m.videoNoSpace[key] = since
+	}
+	return time.Since(since)
+}
+
+// clearVideoNoSpace ends a disk shortage of the key's companion.
+func (m *Manager) clearVideoNoSpace(key string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.videoNoSpace, key)
 }
 
 // noteVideoFailure counts a consecutive companion build failure for the key.

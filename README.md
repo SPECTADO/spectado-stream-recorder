@@ -393,17 +393,37 @@ content type `video/mp4`. Design and trade-offs: [ADR-0002](docs/adr/0002-option
   (`videoSource=none`). H.264/HEVC → stream-copied (`copy`, no re-encode);
   any other codec → re-encoded live to H.264 (`x264`, libx264 `veryfast` CRF 23).
   An HLS **master** playlist with several video variants → the variant with the
-  highest `BANDWIDTH`.
+  highest `BANDWIDTH`, together with that variant's own audio (when it has one
+  of the same codec and AAC profile as the first audio, and not xHE-AAC;
+  `videoAudioMap` — if the video output still fails with it, the next run
+  retries with the first audio before video is given up). The `.m4a` keeps the first audio stream
+  exactly as without video, so when the highest variant is not listed first
+  ffmpeg downloads **two** variants (the first for the `.m4a`'s audio, the
+  highest for the picture): ingress is the sum of both. Prefer a media
+  playlist, or a master that lists its highest variant first.
 * **Capture.** The same ffmpeg process gets a second output: the chosen video
-  plus the same audio as the ADTS output, written to
+  plus its audio (encoded like the ADTS output), written to
   `DATA_DIR/recordings/<safeId>/<session>.v0001.ts`, `.v0002.ts` … (one MPEG-TS
   file per ffmpeg run, listed in `runs[].videoFiles`). The ADTS output is
   byte-identical to an audio-only run and stall detection still watches it
-  only. If two consecutive runs produce nothing with the video output active
-  and a trial run without it does produce audio, video capture is turned off
-  for the session (`videoCaptureError`, `recorder_video_capture_disabled_total`)
-  and the `.mp4` falls back to the black picture — video problems never stop
-  the audio.
+  only. Video problems never stop the audio — video capture is turned off for
+  the rest of the session (`videoSource=none`, `videoCaptureError`,
+  `recorder_video_capture_disabled_total{reason}`) when:
+  * two consecutive runs end with an error of the video output itself
+    (encoder, muxer, map or TS write; ffmpeg's `vost#1`/`out#1`/`libx264`
+    lines) — even when they wrote some audio first, since ffmpeg opens the
+    video encoder only on the first frame (`reason="output-error"`); or
+  * runs produce no audio at all with the video output active and no line of
+    its own: after two, one trial run goes without video; if it produces audio,
+    the next run tries video again and only if that one is empty too is video
+    turned off (`reason="empty-runs"`). A source outage that ends during the
+    trial therefore does not cost the picture (the trial run itself stays
+    audio-only until it ends).
+
+  A stream-copy rejection of the audio is handled exactly as without video
+  (two rejected runs → transcode; only the current run's ffmpeg output is
+  read, so an earlier video run's errors never count), and a source change
+  starts the counting over (and clears `videoCaptureError`).
 * **Building the `.mp4`** (at upload, after the `.m4a` is built, before it is
   put): the recording is split into segments in timeline order — the remote
   part when merging, then every run of every new session; a run with TS files
@@ -422,21 +442,44 @@ content type `video/mp4`. Design and trade-offs: [ADR-0002](docs/adr/0002-option
     black picture, AAC at the session bitrate.
 
   Every result is verified with ffprobe (streams, codecs, packet counts,
-  duration) before it is uploaded. Each concat join adds ~0.1–0.4 s, so a
-  multi-run `.mp4` can be marginally longer than its `.m4a`; use the `.m4a`'s
-  `description` table for wall-clock mapping.
+  duration) before it is uploaded. A TS file that declares a video stream but
+  carries no video packet (a run killed before its first frame) counts as an
+  audio segment. The concat list gives every file but the last an explicit
+  duration (the end of its longest stream), because a killed run's audio
+  usually runs on past its last video frame; each join therefore adds up to
+  ~0.1–0.4 s (the shorter stream's tail), so a multi-run `.mp4` can be
+  marginally longer than its `.m4a` — use the `.m4a`'s `description` table
+  for wall-clock mapping. Stream-copied HEVC is tagged `hvc1` (Apple players
+  refuse `hev1`).
 * **Merging.** When the `.m4a` merges with an existing object, an existing
   `.mp4` whose `sessions` manifest equals the remote `.m4a`'s (and is not
   synthetic) is downloaded and its video reused; otherwise the remote part
-  becomes an audio segment (black). A `.mp4` with a missing or foreign
-  `recording-id` renames the group to a `-2` key exactly like a foreign `.m4a`.
-  The `.mp4` is written **unconditionally** (it is derived from the `.m4a`'s
-  timeline; the `.m4a`'s conditional write stays the point of consistency).
+  becomes an audio segment (black). A `.mp4` whose manifest already equals the
+  manifest this attempt is about to store (an earlier attempt stored the
+  `.mp4` and then failed on the `.m4a`) is kept as it is, and a real one that
+  holds the remote parts plus the first of the new sessions is extended — so
+  a failed `.m4a` put never turns a stored picture black. A `.mp4` with a
+  missing or foreign `recording-id` renames the group to a `-2` key exactly
+  like a foreign `.m4a`. The `.mp4` is written **conditionally** when the
+  endpoint enforces conditional writes (`If-None-Match: *` for a new `.mp4`,
+  `If-Match` on the one the attempt read), so another recorder's `.mp4` under
+  the same key is never replaced — the attempt restarts and moves to a `-2`
+  key instead. Only on an endpoint that does not enforce them is it written
+  unconditionally. Known limit: after a video give-up the stored `.mp4` lags
+  the `.m4a`, and the next merge rebuilds it with the stored part black.
 * **Audio always wins.** An `.mp4` build that fails is retried with the whole
   upload attempt; after 3 consecutive failures for a key the `.m4a` is
   uploaded without the `.mp4` (`videoError`, `recorder_video_builds_total{result="failure"}`).
-  The raw-`.aac` remux fallback never has a `.mp4`. Network/put errors on the
-  `.mp4` retry like any upload error.
+  When the disk preflight fits the audio but not the video
+  (`recorder_video_builds_total{kind="none",result="nospace"}`) the attempt
+  is retried like any disk shortage; only after the shortage has lasted
+  30 minutes without a break is the `.m4a` uploaded without the `.mp4`. An
+  endpoint that refuses the `.mp4` put for good (a permanent error) costs the
+  `.mp4` only. On a give-up, sessions that a `.mp4` stored by an earlier
+  attempt already holds stay `videoUploaded`. The raw-`.aac` remux fallback never has a `.mp4`. Transient
+  network/put errors on the `.mp4` retry like any upload error. An attempt
+  that finds every session already in the `.m4a` (a crash after the puts)
+  still checks the `.mp4` and sets `videoUploaded`/`videoError`.
 * **Object metadata** on the `.mp4`: the `.m4a`'s manifest keys
   (`recording-id`, `sessions`, `parts`, `last-session-start`) and the same
   descriptive fields, plus `media=video`, `video-kind` (`black`|`copy`|`transcode`),
@@ -588,7 +631,7 @@ Per-recording diagnostic fields (in each `recordings.items[]` entry):
 * Video companion (only for sessions created with `RECORD_VIDEO=true`):
   `video` (the session's pinned mode), `videoSource` (`""` not yet probed,
   `copy`, `x264`, or `none` = no video in the source or capture turned off →
-  black picture), `videoCaptureError` (why video capture was turned off for
+  black from then on), `videoCaptureError` (why video capture was turned off for
   this session), `videoUploaded` (the `.mp4` companion holds this session),
   `videoError` (last reason the `.mp4` was skipped — the `.m4a` was still
   uploaded), `outputVideoFile` (kept mode: local path of `<session>.mp4`).
@@ -612,7 +655,7 @@ documented list):
 | `ffmpeg_cpu_seconds_total{id}`, `ffmpeg_memory_rss_bytes{id}` | per stream | Resource use of the ffmpeg children |
 | `uploads_total{result}`, `upload_bytes_total`, `upload_duration_seconds` (histogram 1 s – 1 h), `uploads_pending`, `upload_pending_bytes`, `uploads_in_progress`, `uploads_blocked`, `upload_oldest_pending_age_seconds`, `recordings_failed` | | Upload pipeline |
 | `remux_total{result}` (`success`\|`failure`\|`nospace`), `remux_duration_seconds` (histogram 0.5 s – 600 s), `remux_transcoded_total` | | ADTS → `.m4a` remux (the copy-vs-transcode decision and how long it takes) |
-| `video_builds_total{kind,result}` (`kind`: `black`\|`copy`\|`transcode`; `result`: `success`\|`failure`), `video_capture_disabled_total{reason}` (`empty-runs`) | counter | `.mp4` video companion (`RECORD_VIDEO=true`): how each companion was built, and sessions whose video capture was turned off (their `.mp4` gets a black picture) |
+| `video_builds_total{kind,result}` (`kind`: `black`\|`copy`\|`transcode`, `result`: `success`\|`failure`; plus `kind="none",result="nospace"`: the disk fits the audio but not the companion), `video_capture_disabled_total{reason}` (`output-error`\|`empty-runs`) | counter | `.mp4` video companion (`RECORD_VIDEO=true`): how each companion was built, and sessions whose video capture was turned off (the rest of the session is black in their `.mp4`) |
 | `upload_merges_total`, `upload_fallback_total`, `object_key_renames_total{reason}` (`conflict`\|`out-of-order`\|`parts-cap`\|`no-conditional-writes`\|`remux-failed`) | counter | One-object-per-recording bookkeeping: how often parts merged into an existing object, fell back to a raw `.aac` upload, or a key had to be renamed because the object under it wasn't safe to merge into |
 | `recordings_on_disk_bytes`, `disk_free_bytes{path}`, `disk_used_percent{path}`, `disk_low` | gauge | Local storage |
 | `host_cpu_percent`, `host_load1/5/15`, `host_memory_*`, `system_processes` | gauge | Host as seen through `/proc` |
@@ -770,5 +813,5 @@ server, Prometheus rules, Grafana dashboard).
 | "recording written to a second object" in the logs, `recorder_object_key_renames_total{reason}` | The object under this recording's key was not safe to merge into (`conflict`: foreign or mismatched object; `out-of-order`: an earlier part arrived after a later one was already uploaded; `parts-cap`: 20-part merge limit hit; `no-conditional-writes`: the bucket doesn't enforce `If-Match`/`If-None-Match`; `remux-failed`: the fallback path never merges) — the recording continues under a `-2`/`-3` suffixed key instead of risking data loss; both objects belong to the same recording. |
 | `RECORD_VIDEO=true requires an ffmpeg with the libx264 encoder` at startup | `FFMPEG_PATH` points at a build without libx264 (`ffmpeg -h encoder=libx264` must print `Encoder libx264`). Use the image's ffmpeg or a GPL build. |
 | A recording has a `.m4a` but no `.mp4` (`videoError` set, `recorder_video_builds_total{result="failure"}`) | Building the companion failed three times for that key — the `.m4a` was uploaded on its own by design (video never costs audio). `videoError` holds ffmpeg's reason. Also expected for the raw-`.aac` remux fallback, which never gets a `.mp4`. |
-| `.mp4` of a video source shows a black 16x16 picture (`synthetic-video=true`) | `videoSource=none`: the source had no video stream when probed, or video capture was turned off (`videoCaptureError`, `recorder_video_capture_disabled_total{reason="empty-runs"}`: ffmpeg produced nothing with the video output active but audio flowed without it). A recurring show re-probes next session. |
+| `.mp4` of a video source is black, entirely or from some point on | `videoSource=none`. Either the source had no video stream when probed — then the whole `.mp4` is the black 16x16 picture (`synthetic-video=true`, `video-kind=black`) — or video capture was turned off mid-session (`videoCaptureError`; `recorder_video_capture_disabled_total{reason="output-error"}`: the video output itself failed twice, or `{reason="empty-runs"}`: ffmpeg produced nothing with the video output active but audio without it, twice over). In the second case the runs captured before the switch keep their picture: the `.mp4` is a transcode at the first captured size with a black stretch for the rest (`video-kind=transcode`, `synthetic-video=false`); it is entirely black 16x16 only if no run captured any video. A recurring show re-probes next session; a source change re-probes at once. |
 | `object manifest inconsistent; refusing to merge` | The object's `sessions`/`parts` metadata doesn't agree with itself (hand-edited object, corrupted metadata) — merging is blocked entirely for that key rather than guessing; the local `.aac` is kept so nothing is lost while you investigate. |

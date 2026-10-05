@@ -159,7 +159,10 @@ type Session struct {
 	// "copy" (h264/hevc stream copy) or "x264" (re-encoded while capturing).
 	VideoSource string `json:"videoSource,omitempty"`
 	VideoMap    string `json:"videoMap,omitempty"` // ffmpeg -map spec of the video stream, e.g. 0:p:2:v:0
-	VideoSeq    int    `json:"videoSeq,omitempty"` // last TS file number handed out (persisted before ffmpeg starts)
+	// VideoAudioMap is the -map spec of the audio in the video output when the
+	// video variant has its own (e.g. 0:p:2:a:0); "" = 0:a:0 like the ADTS.
+	VideoAudioMap string `json:"videoAudioMap,omitempty"`
+	VideoSeq      int    `json:"videoSeq,omitempty"` // last TS file number handed out (persisted before ffmpeg starts)
 	// VideoCaptureError is why video capture was turned off for this session
 	// (VideoSource forced to "none"). A session with it set does not pass its
 	// VideoSource on to the next session of the same show.
@@ -271,6 +274,8 @@ func (s *Session) applyItem(it schedule.Item) (sourceChanged bool) {
 		s.ResolvedCodec = "" // re-probe against the new source
 		s.VideoSource = ""
 		s.VideoMap = ""
+		s.VideoAudioMap = ""
+		s.VideoCaptureError = "" // it was about the old source's video
 	}
 	return sourceChanged
 }
@@ -422,22 +427,39 @@ func (s *Session) addExit(e RunExit) {
 // summed, the first anchor/start kept, the later end taken). It returns true the
 // first time a coalesce happens so the caller can log it once. Caller holds
 // Manager.mu.
+//
+// A run with TS files (video companion) is only coalesced with one that has
+// some too: the .mp4 uses a run's TS files INSTEAD of its audio, so a merged
+// run listing only one half's files would drop the other half from the
+// picture's timeline. The oldest such pair wins; when there is none (runs
+// alternate) the oldest pair is merged without its TS files, so that stretch
+// becomes black in the .mp4 but keeps its audio and sync.
 func (s *Session) appendRun(r Run) (coalescedNow bool) {
 	s.Runs = append(s.Runs, r)
 	if len(s.Runs) <= maxRuns {
 		return false
 	}
-	a, b := s.Runs[0], s.Runs[1]
+	i, dropVideo := 0, true
+	for j := 0; j+1 < len(s.Runs)-1; j++ { // never the run just appended
+		if (len(s.Runs[j].VideoFiles) > 0) == (len(s.Runs[j+1].VideoFiles) > 0) {
+			i, dropVideo = j, false
+			break
+		}
+	}
+	a, b := s.Runs[i], s.Runs[i+1]
 	a.Bytes += b.Bytes
 	a.Frames += b.Frames
 	a.DurationSeconds += b.DurationSeconds
-	if len(b.VideoFiles) > 0 {
+	if dropVideo {
+		a.VideoFiles = nil // left on disk; removeVideoFiles finds them by name
+	} else if len(b.VideoFiles) > 0 {
 		a.VideoFiles = append(append([]string(nil), a.VideoFiles...), b.VideoFiles...)
 	}
 	a.EndedAt = laterTime(a.EndedAt, b.EndedAt)
 	merged := make([]Run, 0, len(s.Runs)-1)
+	merged = append(merged, s.Runs[:i]...)
 	merged = append(merged, a)
-	merged = append(merged, s.Runs[2:]...)
+	merged = append(merged, s.Runs[i+2:]...)
 	s.Runs = merged
 	if !s.runsCoalesced {
 		s.runsCoalesced = true

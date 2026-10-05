@@ -1430,3 +1430,377 @@ func TestVideoRealKeptMode(t *testing.T) {
 		t.Fatalf("view = %+v", views[0])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// video companion: transfer failures, disk, convergence
+// ---------------------------------------------------------------------------
+
+// TestVideoM4APutFailureKeepsStoredCompanion: the .mp4 is stored, then the
+// .m4a put fails. The retry finds a companion that already holds exactly this
+// attempt's sessions and keeps it — nothing is rebuilt or re-put (a rebuild
+// would turn a stored real picture black once its TS files are gone). The
+// companion is written create-only (the endpoint enforces conditional writes).
+func TestVideoM4APutFailureKeepsStoredCompanion(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Now().Add(-2 * time.Hour)
+	key := start.UTC().Format("2006-01-02") + "/a.m4a"
+	vkey := strings.TrimSuffix(key, ".m4a") + ".mp4"
+	s := seedFinalized(t, dir, "a", "a_20260101T000000Z", start, key, 30)
+	markVideo(t, s, "none")
+
+	up := &fakeUploader{errs: []error{nil, errors.New("connection reset by peer")}}
+	m, rx := newVideoRecoverManager(t, dir, up)
+	m.Recover()
+	m.settle()
+
+	if st, _ := m.sessionState(s.SessionID); st != StateUploaded {
+		t.Fatalf("state = %s", st)
+	}
+	if got := up.keys(); !slices.Equal(got, []string{vkey, key}) {
+		t.Fatalf("uploads = %q, want the .mp4 once and then the .m4a", got)
+	}
+	if b := rx.builds(); !slices.Equal(b, []string{"black"}) {
+		t.Fatalf("video builds = %q, want exactly one", b)
+	}
+	if c := up.calls[0]; c.overwrite || c.replace != "" {
+		t.Fatalf("the .mp4 put must be create-only: %+v", c)
+	}
+	if ok, verr, _ := videoFields(m, s.SessionID); !ok || verr != "" {
+		t.Fatalf("videoUploaded=%v videoError=%q", ok, verr)
+	}
+}
+
+// TestHeadVideoClassifiesStoredCompanion pins which stored .mp4 an attempt may
+// build on: exactly its own result (kept), a real picture of the stored parts
+// plus a prefix of its own sessions (extended), anything else (rebuilt).
+func TestHeadVideoClassifiesStoredCompanion(t *testing.T) {
+	m, _ := newRecoverManager(t, t.TempDir(), &fakeUploader{})
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	remote := &remoteObject{recordingID: "r", sessions: []string{"aa"}}
+	toAdd := []*uploadMember{{digest: "bb"}, {digest: "cc"}}
+	cases := []struct {
+		name      string
+		remote    *remoteObject
+		sessions  string
+		synthetic string
+		reuse     bool
+		inSync    bool
+		skip      int
+	}{
+		{"exact result, real", remote, "aa,bb,cc", "false", true, false, 0},
+		{"exact result, black", remote, "aa,bb,cc", "true", true, false, 0},
+		{"stored parts only, real", remote, "aa", "false", false, true, 0},
+		{"stored parts + first new session, real", remote, "aa,bb", "false", false, true, 1},
+		{"stored parts + first new session, black", remote, "aa,bb", "true", false, false, 0},
+		{"behind the stored .m4a (after a video give-up)", &remoteObject{recordingID: "r", sessions: []string{"aa", "zz"}}, "aa", "false", false, false, 0},
+		{"new object, first session stored", nil, "bb", "false", false, true, 1},
+		{"new object, exact", nil, "bb,cc", "false", true, false, 0},
+		{"unrelated", remote, "xx", "false", false, false, 0},
+	}
+	for _, tc := range cases {
+		up := &fakeUploader{}
+		up.seed("k.mp4", []byte("v"), map[string]string{"recording-id": "r", "sessions": tc.sessions, "synthetic-video": tc.synthetic})
+		m.up = up
+		vt, err := m.headVideo(t.Context(), "k.m4a", "r", nil, tc.remote, toAdd, log)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if vt.reuse != tc.reuse || vt.inSync != tc.inSync || vt.skip != tc.skip {
+			t.Errorf("%s: reuse=%v inSync=%v skip=%d, want %v %v %d", tc.name, vt.reuse, vt.inSync, vt.skip, tc.reuse, tc.inSync, tc.skip)
+		}
+	}
+}
+
+// TestVideoCompanionPutRefusedStoresAudio: an endpoint refusing the .mp4 put
+// for good (a PermanentError) costs the companion, not the .m4a.
+func TestVideoCompanionPutRefusedStoresAudio(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Now().Add(-2 * time.Hour)
+	key := start.UTC().Format("2006-01-02") + "/a.m4a"
+	s := seedFinalized(t, dir, "a", "a_20260101T000000Z", start, key, 30)
+	markVideo(t, s, "none")
+
+	up := &fakeUploader{errs: []error{&PermanentError{Err: errors.New("NotImplemented: header you provided implies functionality that is not implemented")}}}
+	m, _ := newVideoRecoverManager(t, dir, up)
+	m.Recover()
+	m.settle()
+
+	if st, _ := m.sessionState(s.SessionID); st != StateUploaded {
+		t.Fatalf("state = %s", st)
+	}
+	if got := up.keys(); !slices.Equal(got, []string{key}) {
+		t.Fatalf("uploads = %q, want the .m4a", got)
+	}
+	if ok, verr, _ := videoFields(m, s.SessionID); ok || !strings.Contains(verr, "video upload refused") {
+		t.Fatalf("videoUploaded=%v videoError=%q", ok, verr)
+	}
+}
+
+// TestVideoDiskShareDoesNotHoldAudioBack: when the audio's share of the disk
+// preflight fits but the companion's keeps not fitting for longer than the
+// budget (videoNoSpaceGiveUp), the companion is given up on and the .m4a is
+// stored.
+func TestVideoDiskShareDoesNotHoldAudioBack(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Now().Add(-2 * time.Hour)
+	key := start.UTC().Format("2006-01-02") + "/a.m4a"
+	s := seedFinalized(t, dir, "a", "a_20260101T000000Z", start, key, 30)
+	markVideo(t, s, "none")
+	st, err := os.Stat(s.FilePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	audioNeed := st.Size()*12/10 + 1 // testConfig: MIN_FREE_DISK=1
+	up := &fakeUploader{}
+	m, rx := newVideoRecoverManager(t, dir, up)
+	m.SetDiskFree(func() (uint64, bool) { return uint64(audioNeed + st.Size()/2), true })
+	m.mu.Lock()
+	m.videoNoSpaceBudget = 300 * time.Millisecond
+	m.mu.Unlock()
+	m.Recover()
+	m.settle()
+
+	if st, _ := m.sessionState(s.SessionID); st != StateUploaded {
+		t.Fatalf("state = %s", st)
+	}
+	if got := up.keys(); !slices.Equal(got, []string{key}) {
+		t.Fatalf("uploads = %q, want only the .m4a", got)
+	}
+	if b := rx.builds(); len(b) != 0 {
+		t.Fatalf("video builds = %q, want none", b)
+	}
+	if ok, verr, _ := videoFields(m, s.SessionID); ok || !strings.Contains(verr, "not enough disk") {
+		t.Fatalf("videoUploaded=%v videoError=%q", ok, verr)
+	}
+	if n := counterValue(t, m, "recorder_video_builds_total", map[string]string{"kind": "none", "result": "nospace"}); n < 2 {
+		t.Fatalf("nospace metric = %v, want the shortage retried before giving up", n)
+	}
+}
+
+// TestVideoBriefDiskShortageKeepsCompanion: a disk shortage of the companion's
+// share that ends (other uploads' temp files freed) is waited out — it is not
+// a build failure and does not cost the .mp4 after a few attempts.
+func TestVideoBriefDiskShortageKeepsCompanion(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Now().Add(-2 * time.Hour)
+	key := start.UTC().Format("2006-01-02") + "/a.m4a"
+	s := seedFinalized(t, dir, "a", "a_20260101T000000Z", start, key, 30)
+	markVideo(t, s, "none")
+	st, err := os.Stat(s.FilePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	audioNeed := st.Size()*12/10 + 1 // testConfig: MIN_FREE_DISK=1
+	up := &fakeUploader{}
+	m, rx := newVideoRecoverManager(t, dir, up)
+	until := time.Now().Add(time.Second)
+	m.SetDiskFree(func() (uint64, bool) {
+		if time.Now().Before(until) {
+			return uint64(audioNeed + st.Size()/2), true
+		}
+		return 1 << 40, true
+	})
+	m.Recover()
+	m.settle()
+
+	if st, _ := m.sessionState(s.SessionID); st != StateUploaded {
+		t.Fatalf("state = %s", st)
+	}
+	vkey := strings.TrimSuffix(key, ".m4a") + ".mp4"
+	if got := up.keys(); !slices.Equal(got, []string{vkey, key}) {
+		t.Fatalf("uploads = %q, want the .mp4 and the .m4a", got)
+	}
+	if b := rx.builds(); len(b) != 1 {
+		t.Fatalf("video builds = %q, want one", b)
+	}
+	if ok, verr, _ := videoFields(m, s.SessionID); !ok || verr != "" {
+		t.Fatalf("videoUploaded=%v videoError=%q", ok, verr)
+	}
+	if n := counterValue(t, m, "recorder_video_builds_total", map[string]string{"kind": "none", "result": "nospace"}); n < maxRemuxFailures {
+		t.Fatalf("nospace metric = %v, want at least %d retried shortages", n, maxRemuxFailures)
+	}
+}
+
+// TestVideoConvergeRecordsStoredCompanion: an attempt that finds every session
+// already in the .m4a (a crash after both puts, before the sidecars) still
+// records whether the .mp4 holds them too.
+func TestVideoConvergeRecordsStoredCompanion(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mp4      string // sessions manifest of the stored .mp4; "" = none stored
+		uploaded bool
+		videoErr string
+	}{
+		{"in sync", "self", true, ""},
+		{"missing", "", false, "missing"},
+		{"out of date", "deadbeef", false, "does not hold"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			start := time.Now().Add(-2 * time.Hour)
+			key := start.UTC().Format("2006-01-02") + "/a.m4a"
+			s := seedFinalized(t, dir, "a", "a_20260101T000000Z", start, key, 30)
+			markVideo(t, s, "none")
+			meta := map[string]string{
+				"recording-id": "a", "sessions": sessionDigest(s.SessionID), "parts": "1",
+				"last-session-start": start.UTC().Format(time.RFC3339),
+			}
+			up := &fakeUploader{}
+			up.seed(key, adtsStream(30), meta)
+			if tc.mp4 != "" {
+				vmeta := copyMeta(meta)
+				if tc.mp4 != "self" {
+					vmeta["sessions"] = tc.mp4
+				}
+				up.seed(strings.TrimSuffix(key, ".m4a")+".mp4", []byte("video"), vmeta)
+			}
+			m, _ := newVideoRecoverManager(t, dir, up)
+			m.Recover()
+			m.settle()
+
+			if st, _ := m.sessionState(s.SessionID); st != StateUploaded {
+				t.Fatalf("state = %s", st)
+			}
+			if up.count() != 0 {
+				t.Fatalf("nothing should be uploaded: %+v", up.keys())
+			}
+			ok, verr, _ := videoFields(m, s.SessionID)
+			if ok != tc.uploaded || (tc.videoErr == "" && verr != "") || !strings.Contains(verr, tc.videoErr) {
+				t.Fatalf("videoUploaded=%v videoError=%q", ok, verr)
+			}
+		})
+	}
+}
+
+// racingVideoUploader lets another recorder store the same key's .m4a and
+// .mp4 right after this attempt's first HEAD of the .mp4 found nothing.
+type racingVideoUploader struct {
+	*fakeUploader
+	key, vkey string
+	raced     bool
+}
+
+func (r *racingVideoUploader) Head(ctx context.Context, key string) (ObjectInfo, bool, error) {
+	info, found, err := r.fakeUploader.Head(ctx, key)
+	if key == r.vkey && !r.raced {
+		r.raced = true
+		foreign := map[string]string{"recording-id": "x", "parts": "1", "sessions": "ffffffff", "synthetic-video": "false"}
+		r.seed(r.vkey, []byte("X's picture"), foreign)
+		r.seed(r.key, []byte("X's audio"), foreign)
+	}
+	return info, found, err
+}
+
+// TestVideoPutNeverReplacesAConcurrentWritersCompanion: another recorder stores
+// the same key between this attempt's HEAD and its .mp4 put. The create-only
+// .mp4 put is refused, the retry finds the foreign objects and moves the group
+// to a -2 key — the other recording's .mp4 is left untouched.
+func TestVideoPutNeverReplacesAConcurrentWritersCompanion(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Now().Add(-2 * time.Hour)
+	key := start.UTC().Format("2006-01-02") + "/a.m4a"
+	vkey := strings.TrimSuffix(key, ".m4a") + ".mp4"
+	s := seedFinalized(t, dir, "a", "a_20260101T000000Z", start, key, 30)
+	markVideo(t, s, "none")
+
+	up := &racingVideoUploader{fakeUploader: &fakeUploader{}, key: key, vkey: vkey}
+	m, _ := newVideoRecoverManager(t, dir, up)
+	m.Recover()
+	m.settle()
+
+	if st, _ := m.sessionState(s.SessionID); st != StateUploaded {
+		t.Fatalf("state = %s", st)
+	}
+	if o := up.object(vkey); o == nil || string(o.body) != "X's picture" || o.meta["recording-id"] != "x" {
+		t.Fatal("the other recording's .mp4 was replaced")
+	}
+	k2 := strings.TrimSuffix(key, ".m4a") + "-2.m4a"
+	if up.object(k2) == nil || up.object(videoKey(k2)) == nil {
+		t.Fatalf("objects = %q, want this recording under %s and its .mp4", up.keys(), k2)
+	}
+	if ok, verr, _ := videoFields(m, s.SessionID); !ok || verr != "" {
+		t.Fatalf("videoUploaded=%v videoError=%q", ok, verr)
+	}
+}
+
+// TestPutVideoConditionality: create-only when the HEAD found nothing, If-Match
+// on the ETag it found, unconditional only on an endpoint that does not
+// enforce conditional writes.
+func TestPutVideoConditionality(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	file := filepath.Join(t.TempDir(), "v.mp4")
+	if err := os.WriteFile(file, []byte("our picture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const vkey = "k.mp4"
+
+	up := &fakeUploader{}
+	m, _ := newRecoverManager(t, t.TempDir(), up)
+	up.seed(vkey, []byte("their picture"), map[string]string{"recording-id": "x"})
+	if err := m.putVideo(context.Background(), file, vkey, nil, 11, "", log); !errors.Is(err, ErrObjectExists) {
+		t.Fatalf("create-only over an existing .mp4: err = %v, want ErrObjectExists", err)
+	}
+	if err := m.putVideo(context.Background(), file, vkey, nil, 11, "stale-etag", log); !errors.Is(err, ErrObjectChanged) {
+		t.Fatalf("If-Match on a changed .mp4: err = %v, want ErrObjectChanged", err)
+	}
+	if string(up.object(vkey).body) != "their picture" {
+		t.Fatal("a refused conditional put replaced the object")
+	}
+	if err := m.putVideo(context.Background(), file, vkey, nil, 11, up.object(vkey).etag, log); err != nil {
+		t.Fatalf("If-Match on the HEADed ETag: %v", err)
+	}
+	if c := up.lastCall(); c.overwrite || c.replace == "" {
+		t.Fatalf("want an If-Match put: %+v", c)
+	}
+
+	noCond := &fakeUploader{noCond: true}
+	m2, _ := newRecoverManager(t, t.TempDir(), noCond)
+	noCond.seed(vkey, []byte("stale"), nil)
+	if err := m2.putVideo(context.Background(), file, vkey, nil, 11, "whatever", log); err != nil {
+		t.Fatal(err)
+	}
+	if c := noCond.lastCall(); !c.overwrite {
+		t.Fatalf("an endpoint without conditional writes gets Overwrite: %+v", c)
+	}
+}
+
+// TestVideoGiveUpKeepsSessionsTheStoredCompanionHolds: an earlier attempt
+// stored the .mp4 with session B and then failed before the .m4a. The retry's
+// group is [B, C]; the stored .mp4 is extended (inSync, skip 1) but C's video
+// build keeps failing and is given up on. B is in the stored .mp4's manifest,
+// so it stays videoUploaded; only C gets the videoError.
+func TestVideoGiveUpKeepsSessionsTheStoredCompanionHolds(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Now().Add(-4 * time.Hour)
+	key := start.UTC().Format("2006-01-02") + "/a.m4a"
+	vkey := strings.TrimSuffix(key, ".m4a") + ".mp4"
+	b := seedFinalized(t, dir, "a", "a_20260101T000000Z", start, key, 30)
+	c := seedFinalized(t, dir, "a", "a_20260101T010000Z", start.Add(time.Hour), key, 30)
+	markVideo(t, b, "none")
+	markVideo(t, c, "none")
+
+	up := &fakeUploader{}
+	up.seed(vkey, []byte("B's picture"), map[string]string{
+		"recording-id": "a", "sessions": sessionDigest(b.SessionID), "synthetic-video": "false",
+	})
+	m, rx := newVideoRecoverManager(t, dir, up)
+	boom := errors.New("ffmpeg exited 1: Invalid data found when processing input")
+	rx.setVideoErrs(boom, boom, boom, boom, boom, boom)
+	m.Recover()
+	m.settle()
+
+	for _, sid := range []string{b.SessionID, c.SessionID} {
+		if st, _ := m.sessionState(sid); st != StateUploaded {
+			t.Fatalf("%s: state = %s", sid, st)
+		}
+	}
+	if got := string(up.object(vkey).body); got != "B's picture" {
+		t.Fatalf("the stored .mp4 changed: %q", got)
+	}
+	if ok, verr, _ := videoFields(m, b.SessionID); !ok || verr != "" {
+		t.Errorf("B (in the stored .mp4): videoUploaded=%v videoError=%q, want true and none", ok, verr)
+	}
+	if ok, verr, _ := videoFields(m, c.SessionID); ok || !strings.Contains(verr, "video build failed") {
+		t.Errorf("C: videoUploaded=%v videoError=%q, want false and the build failure", ok, verr)
+	}
+}

@@ -34,9 +34,18 @@ package remux
 //     the audio, so the video track ends up to 1 s before the audio and audio
 //     shorter than ~1 s gets no video track at all. Short audio is therefore
 //     given a fixed-length colour source instead.
-//   - The concat demuxer leaves a gap of ~0.1–0.4 s per join (the next file
-//     starts after the longer stream of the previous one); A/V sync inside each
+//   - The concat demuxer offsets each file by the PREVIOUS file's probed
+//     format duration. For a capture that was killed or restarted the audio
+//     usually runs on past the last video frame, and the probed duration
+//     follows the video: the next file's first audio packet then lands before
+//     the previous file's last one and the mp4 muxer aborts ("Non-monotonic
+//     DTS", exit 234). The list therefore carries an explicit `duration` for
+//     every file but the last: the end of its longest stream (last packet's
+//     pts + duration) minus its start_time. Each join then leaves a gap of
+//     ~0.1–0.4 s at most (the shorter stream's tail); A/V sync inside each
 //     file is kept.
+//   - Stream-copied HEVC is muxed as `hev1` by default, which Apple players
+//     (Safari, QuickTime, AVPlayer) refuse; it is tagged `hvc1` instead.
 
 import (
 	"context"
@@ -91,6 +100,7 @@ type VideoInfo struct {
 	HasVideo     bool
 	VideoCodec   string // e.g. "h264", "hevc"
 	VideoProfile string // e.g. "High", "Constrained Baseline"
+	VideoTag     string // codec_tag_string, e.g. "avc1", "hvc1" (MP4); "[27][0][0][0]" (TS)
 	PixFmt       string // e.g. "yuv420p"
 	Width        int
 	Height       int
@@ -101,6 +111,7 @@ type VideoInfo struct {
 	Channels   int
 
 	Duration     time.Duration // format duration (the longer stream)
+	StartTime    time.Duration // format start_time (the earliest stream's first pts)
 	AudioPackets int           // packets of the first audio stream (corrupt ones discarded)
 	VideoPackets int           // packets of the first video stream (corrupt ones discarded)
 	Format       string        // ffprobe format_name, e.g. "mpegts"
@@ -120,11 +131,21 @@ func SameVideoParams(a, b VideoInfo) bool {
 		a.Channels == b.Channels
 }
 
+// HasPicture reports whether the file really carries a picture: a video
+// stream with a known size AND at least one packet. A capture killed before
+// its first video packet (or fed by a variant that delivered no segments)
+// still declares the stream in its PMT, but mapping it would fail the build
+// ("at least one of its streams received no packets").
+func (v VideoInfo) HasPicture() bool {
+	return v.HasVideo && v.VideoPackets > 0 && v.Width > 0 && v.Height > 0
+}
+
 // videoProbeOutput mirrors the ffprobe JSON ProbeVideo asks for.
 type videoProbeOutput struct {
 	Streams []struct {
 		CodecType     string `json:"codec_type"`
 		CodecName     string `json:"codec_name"`
+		CodecTag      string `json:"codec_tag_string"`
 		Profile       string `json:"profile"`
 		PixFmt        string `json:"pix_fmt"`
 		Width         int    `json:"width"`
@@ -138,6 +159,7 @@ type videoProbeOutput struct {
 	Format struct {
 		FormatName string `json:"format_name"`
 		Duration   string `json:"duration"`
+		StartTime  string `json:"start_time"`
 	} `json:"format"`
 }
 
@@ -152,7 +174,7 @@ func (r *Remuxer) ProbeVideo(ctx context.Context, path string) (VideoInfo, error
 	}
 	args := []string{
 		"-v", "error", "-fflags", "+discardcorrupt", "-count_packets",
-		"-show_entries", "format=format_name,duration:stream=codec_type,codec_name,profile,pix_fmt,width,height,r_frame_rate,avg_frame_rate,sample_rate,channels,nb_read_packets",
+		"-show_entries", "format=format_name,duration,start_time:stream=codec_type,codec_name,codec_tag_string,profile,pix_fmt,width,height,r_frame_rate,avg_frame_rate,sample_rate,channels,nb_read_packets",
 		"-of", "json", path,
 	}
 	// ProbeTimeout plus the byte term of timeoutFor (size / MinThroughput).
@@ -164,7 +186,8 @@ func (r *Remuxer) ProbeVideo(ctx context.Context, path string) (VideoInfo, error
 	if err := json.Unmarshal(stdout, &out); err != nil {
 		return VideoInfo{}, fmt.Errorf("remux: probe %s: parse ffprobe output: %w", path, err)
 	}
-	info := VideoInfo{Format: out.Format.FormatName, Duration: parseSeconds(out.Format.Duration)}
+	info := VideoInfo{Format: out.Format.FormatName, Duration: parseSeconds(out.Format.Duration),
+		StartTime: parseSeconds(out.Format.StartTime)}
 	seenV, seenA := false, false
 	for _, s := range out.Streams {
 		switch {
@@ -173,6 +196,7 @@ func (r *Remuxer) ProbeVideo(ctx context.Context, path string) (VideoInfo, error
 			info.HasVideo = true
 			info.VideoCodec = s.CodecName
 			info.VideoProfile = s.Profile
+			info.VideoTag = s.CodecTag
 			info.PixFmt = s.PixFmt
 			info.Width, info.Height = s.Width, s.Height
 			info.FPS = parseRate(s.RFrameRate)
@@ -189,6 +213,72 @@ func (r *Remuxer) ProbeVideo(ctx context.Context, path string) (VideoInfo, error
 		}
 	}
 	return info, nil
+}
+
+// spanProbeWindow is how much of a file's end mediaSpan reads: the streams'
+// last packets lie within a few seconds of each other (one HLS segment at
+// most), so the tail is enough and a 4 h capture is not read twice.
+const spanProbeWindow = 20 * time.Second
+
+// mediaSpan is how long the file at path lasts on the concat timeline: the end
+// of its longest stream (the latest pts + duration of any packet) minus its
+// start_time. Only the last spanProbeWindow of media is read (the whole file
+// when it is shorter, or when the seek finds no packet).
+func (r *Remuxer) mediaSpan(ctx context.Context, path string, info VideoInfo) (time.Duration, error) {
+	size, err := totalSize([]string{path})
+	if err != nil {
+		return 0, err
+	}
+	timeout := r.probeTimeout() + r.timeoutFor(size) - r.timeoutFor(0)
+	read := func(from time.Duration) (time.Duration, bool, error) {
+		args := []string{"-v", "error", "-fflags", "+discardcorrupt"}
+		if from > 0 {
+			// "+X%": from X after the start to the end of the file.
+			args = append(args, "-read_intervals", "+"+seconds(from)+"%")
+		}
+		args = append(args, "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0", path)
+		stdout, err := r.runFFprobeFor(ctx, timeout, args)
+		if err != nil {
+			return 0, false, fmt.Errorf("remux: span of %s: %w", path, err)
+		}
+		var end float64
+		found := false
+		for _, line := range strings.Split(string(stdout), "\n") {
+			f := strings.Split(strings.TrimSpace(line), ",")
+			if len(f) < 2 {
+				continue
+			}
+			pts, err := strconv.ParseFloat(f[0], 64)
+			if err != nil {
+				continue // N/A
+			}
+			d, _ := strconv.ParseFloat(f[1], 64)
+			if e := pts + d; !found || e > end {
+				end, found = e, true
+			}
+		}
+		return time.Duration(end * float64(time.Second)), found, nil
+	}
+	from := info.Duration - spanProbeWindow
+	end, found, err := read(from)
+	if err == nil && !found && from > 0 {
+		end, found, err = read(0)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, fmt.Errorf("%w: %s has no timestamped packets", ErrNoAudio, path)
+	}
+	return end - info.StartTime, nil
+}
+
+// videoTagFor is the MP4 sample entry a stream copy of codec must carry.
+func videoTagFor(codec string) string {
+	if codec == "hevc" {
+		return "hvc1"
+	}
+	return ""
 }
 
 // parseRate parses an ffprobe rational ("25/1", "30000/1001", "0/0").
@@ -268,8 +358,12 @@ func (r *Remuxer) BuildBlackVideo(ctx context.Context, audioM4A, out string, met
 // temporary ffconcat list next to out, `-fflags +discardcorrupt`, `-xerror`,
 // `-c copy`), with meta.
 //
-// Every input must have video and audio and SameVideoParams as the first one
-// (else ErrParamsMismatch, nothing is run). The result is verified: same
+// Every input must have a picture (HasPicture) and audio and SameVideoParams
+// as the first one (else ErrNoVideo/ErrParamsMismatch, nothing is run). Every
+// file but the last gets an explicit `duration` in the list (mediaSpan: the
+// end of its longest stream), so audio that runs on past the last video frame
+// of a killed capture cannot overlap the next file. HEVC is tagged `hvc1`.
+// The result is verified: same
 // codecs and size as the inputs, audio packets == the sum of the inputs'
 // EXACTLY, video packets within one per input below the sum, duration within
 // [90 % of the inputs' sum, sum + 1 s per input]. out is written atomically.
@@ -284,16 +378,24 @@ func (r *Remuxer) BuildVideoConcat(ctx context.Context, tsFiles []string, out st
 	var first VideoInfo
 	var audioPackets, videoPackets int
 	var sum time.Duration
+	spans := make([]time.Duration, len(tsFiles)) // 0 = no duration directive
 	for i, p := range tsFiles {
 		info, err := r.ProbeVideo(ctx, p)
 		if err != nil {
 			return Result{}, err
 		}
-		if !info.HasVideo {
+		if !info.HasPicture() {
 			return Result{}, fmt.Errorf("%w: %s", ErrNoVideo, p)
 		}
 		if info.AudioCodec == "" || info.AudioPackets == 0 {
 			return Result{}, fmt.Errorf("%w: %s", ErrNoAudio, p)
+		}
+		if i < len(tsFiles)-1 {
+			span, err := r.mediaSpan(ctx, p, info)
+			if err != nil {
+				return Result{}, err
+			}
+			spans[i] = span
 		}
 		if i == 0 {
 			first = info
@@ -306,7 +408,7 @@ func (r *Remuxer) BuildVideoConcat(ctx context.Context, tsFiles []string, out st
 		sum += info.Duration
 	}
 
-	list, err := writeConcatList(filepath.Dir(out), tsFiles)
+	list, err := writeConcatList(filepath.Dir(out), tsFiles, spans)
 	if err != nil {
 		return Result{}, err
 	}
@@ -318,14 +420,18 @@ func (r *Remuxer) BuildVideoConcat(ctx context.Context, tsFiles []string, out st
 		"-f", "concat", "-safe", "0", "-i", list,
 		"-map", "0:v:0", "-map", "0:a:0", "-sn", "-dn",
 		"-c", "copy",
-		"-map_metadata", "-1",
 	}
+	if first.VideoCodec == "hevc" {
+		args = append(args, "-tag:v", "hvc1")
+	}
+	args = append(args, "-map_metadata", "-1")
 	args = append(args, metadataArgs(meta)...)
 	args = append(args, "-movflags", "+faststart", "-f", "mp4", out+".part")
 
 	n := len(tsFiles)
 	expect := videoExpect{
 		VideoCodec: first.VideoCodec, Width: first.Width, Height: first.Height,
+		VideoTag:        videoTagFor(first.VideoCodec),
 		AudioCodec:      first.AudioCodec,
 		AudioPackets:    audioPackets,
 		VideoPacketsMin: videoPackets - n,
@@ -455,7 +561,9 @@ func (r *Remuxer) BuildVideoTranscode(ctx context.Context, segs []VideoSegment, 
 		if info.AudioCodec == "" || info.AudioPackets == 0 {
 			return Result{}, fmt.Errorf("%w: %s", ErrNoAudio, in.path)
 		}
-		in.hasVideo = !in.adts && info.HasVideo
+		// A TS that declares a video stream without carrying a packet of it
+		// is pictured black like an audio segment.
+		in.hasVideo = !in.adts && info.HasPicture()
 		in.duration = s.Duration
 		if in.duration <= 0 {
 			in.duration = info.Duration
@@ -558,6 +666,7 @@ func (r *Remuxer) transcodeTimeout(inputBytes int64, media time.Duration) time.D
 // zero packet range) are not checked.
 type videoExpect struct {
 	VideoCodec      string
+	VideoTag        string // codec_tag_string, e.g. "hvc1"
 	Width, Height   int
 	AudioCodec      string
 	AudioPackets    int // exact
@@ -620,6 +729,9 @@ func verifyVideo(path string, got VideoInfo, want videoExpect) error {
 	if want.VideoCodec != "" && got.VideoCodec != want.VideoCodec {
 		return fmt.Errorf("%w: %s video codec is %q, want %q", ErrParamsMismatch, path, got.VideoCodec, want.VideoCodec)
 	}
+	if want.VideoTag != "" && got.VideoTag != want.VideoTag {
+		return fmt.Errorf("%w: %s video is tagged %q, want %q", ErrParamsMismatch, path, got.VideoTag, want.VideoTag)
+	}
 	if want.Width > 0 && (got.Width != want.Width || got.Height != want.Height) {
 		return fmt.Errorf("%w: %s picture is %dx%d, want %dx%d", ErrParamsMismatch, path, got.Width, got.Height, want.Width, want.Height)
 	}
@@ -653,10 +765,12 @@ func describeVideo(v VideoInfo) string {
 // writeConcatList writes an ffconcat list of paths (made absolute: the
 // demuxer resolves relative entries against the list's directory) into dir as
 // a `.tmp-` file, so a crash leaves nothing the recorder's temp reaper misses.
-func writeConcatList(dir string, paths []string) (string, error) {
+// A positive durations[i] becomes that file's `duration` directive (where the
+// next file starts, relative to this one's start_time); nil means none.
+func writeConcatList(dir string, paths []string, durations []time.Duration) (string, error) {
 	var sb strings.Builder
 	sb.WriteString("ffconcat version 1.0\n")
-	for _, p := range paths {
+	for i, p := range paths {
 		a, err := filepath.Abs(p)
 		if err != nil {
 			return "", fmt.Errorf("remux: concat list: %w", err)
@@ -666,6 +780,9 @@ func writeConcatList(dir string, paths []string) (string, error) {
 			return "", err
 		}
 		sb.WriteString("file " + line + "\n")
+		if i < len(durations) && durations[i] > 0 {
+			sb.WriteString("duration " + seconds(durations[i]) + "\n")
+		}
 	}
 	f, err := os.CreateTemp(dir, ".tmp-concat-*.ffconcat")
 	if err != nil {

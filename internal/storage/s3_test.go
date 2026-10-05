@@ -1061,3 +1061,28 @@ func TestQuoteETag(t *testing.T) {
 		}
 	}
 }
+
+// TestOverwriteIsUnconditional: the .mp4 companion is written without
+// If-Match/If-None-Match — it replaces whatever is stored (a create-only put
+// would refuse it with ErrObjectExists) and is size-verified like Upload.
+func TestOverwriteIsUnconditional(t *testing.T) {
+	s, b := newTestS3(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	key := "2026-10-05/x.mp4"
+	if _, err := s.Upload(ctx, writeFile(t, filepath.Join(dir, "a"), []byte("first")), key, "video/mp4", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	p := writeFile(t, filepath.Join(dir, "b"), []byte("second, longer"))
+	if _, err := s.Upload(ctx, p, key, "video/mp4", nil, ""); !errors.Is(err, recorder.ErrObjectExists) {
+		t.Fatalf("create-only put: err=%v, want ErrObjectExists", err)
+	}
+	etag, err := s.Overwrite(ctx, p, key, "video/mp4", map[string]string{"media": "video"})
+	if err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	obj, ok := b.object(key)
+	if !ok || string(obj.data) != "second, longer" || obj.etag != etag || obj.meta["media"] != "video" {
+		t.Fatalf("stored %+v, etag %q", obj, etag)
+	}
+}

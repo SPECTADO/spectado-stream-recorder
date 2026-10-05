@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -86,6 +87,7 @@ type uploadCall struct {
 	size                   int64
 	meta                   map[string]string
 	replace                string // ETag the upload replaced ("" for a new object)
+	overwrite              bool   // unconditional put (Overwrite)
 }
 
 // fakeObject is one stored object: bytes, user metadata and an ETag that
@@ -162,6 +164,35 @@ func (f *fakeUploader) Upload(ctx context.Context, path, key, contentType string
 	f.objects[key] = &fakeObject{body: body, meta: copyMeta(meta), etag: etag, ctype: contentType}
 	f.calls = append(f.calls, uploadCall{path: path, key: key, contentType: contentType,
 		size: int64(len(body)), meta: copyMeta(meta), replace: replaceETag})
+	return etag, nil
+}
+
+// Overwrite stores unconditionally (the .mp4 companion); errs apply as for
+// Upload. Its calls are recorded with overwrite set.
+func (f *fakeUploader) Overwrite(ctx context.Context, path, key, contentType string, meta map[string]string) (string, error) {
+	f.mu.Lock()
+	var err error
+	if len(f.errs) > 0 {
+		err, f.errs = f.errs[0], f.errs[1:]
+	}
+	f.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	body, rerr := os.ReadFile(path)
+	if rerr != nil {
+		return "", rerr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.objects == nil {
+		f.objects = map[string]*fakeObject{}
+	}
+	f.etagSeq++
+	etag := fmt.Sprintf("etag-%d", f.etagSeq)
+	f.objects[key] = &fakeObject{body: body, meta: copyMeta(meta), etag: etag, ctype: contentType}
+	f.calls = append(f.calls, uploadCall{path: path, key: key, contentType: contentType,
+		size: int64(len(body)), meta: copyMeta(meta), overwrite: true})
 	return etag, nil
 }
 
@@ -1425,7 +1456,9 @@ func TestRecordingsViewRedactsSecrets(t *testing.T) {
 // (-show_entries) it reports an aac + h264 source. As ffmpeg it appends bytes
 // to the video companion output (the "file:" argument) while streaming real
 // ADTS frames to stdout; while the file failFlag exists, a run WITH a video
-// output creates its TS file and exits without audio (a video-caused failure).
+// output creates its TS file and exits without audio (a video-caused failure
+// without a line of its own), and a run without one streams ~0.5 s and ends
+// (so the trial run ends and the decisive run with video follows).
 func fakeFFmpegVideo(t *testing.T, dir, failFlag string) string {
 	t.Helper()
 	frames := adtsFramesFile(t, dir)
@@ -1443,12 +1476,15 @@ if [ -n "$ts" ] && [ -f %q ]; then
   echo '[error] video output failed' >&2
   exit 1
 fi
+n=0
 while :; do
   cat %q || exit 0
   if [ -n "$ts" ]; then printf 'TSDATA' >> "$ts"; fi
+  n=$((n + 1))
+  if [ -z "$ts" ] && [ -f %q ] && [ "$n" -gt 10 ]; then exit 0; fi
   sleep 0.05
 done
-`, failFlag, frames)
+`, failFlag, frames, failFlag)
 	p := filepath.Join(dir, "ffmpeg-video.sh")
 	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
@@ -1526,9 +1562,10 @@ func TestVideoCaptureWritesRunTSFile(t *testing.T) {
 
 // TestVideoCaptureFailureDisablesVideoNotAudio: runs that die without audio
 // while the video output is active are blamed on the video only after an
-// audio-only trial run succeeds; video is then turned off for the session
-// (black at upload), the audio keeps recording, the copy fallback never fires,
-// and the failed runs' TS files are gone.
+// audio-only trial run succeeds AND the next run with video is empty again;
+// video is then turned off for the session (black at upload), the audio keeps
+// recording, the copy fallback never fires, and the failed runs' TS files are
+// gone.
 func TestVideoCaptureFailureDisablesVideoNotAudio(t *testing.T) {
 	m, dir := newVideoTestManager(t, true)
 	now := time.Now()
@@ -1626,5 +1663,277 @@ func TestVideoRetentionRemovesLeftoverTS(t *testing.T) {
 	}
 	if _, err := os.Stat(s.SidecarPath()); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("sidecar not removed: %v", err)
+	}
+}
+
+// fakeFFmpegScenario is a fake ffmpeg/ffprobe for the video failure
+// attribution tests. It numbers its runs (file "runs") and behaves by mode:
+//   - evidence: a run with a video output writes some audio, then fails with
+//     an error line of output #1 (the libx264 encoder failing to open lazily,
+//     after the first audio packets); runs without one stream audio.
+//   - outage: runs 1 and 2 end empty (a source outage, no line of the video
+//     output); run 3 — the audio-only trial — streams ~0.5 s and ends; every
+//     later run streams audio (and TS bytes).
+//   - copyreject: any run stream-copying the audio ("-c:a copy") is rejected
+//     by the ADTS muxer without audio; transcoding runs stream.
+//   - variantaudio: ffprobe reports an HLS master whose top variant has its
+//     own (same codec and profile) audio; a run mapping it ("0:p:1:a:0")
+//     fails like mpegts refusing that audio, any other run streams.
+//   - adtsvideo: a run with a video output dies on output #1's ADTS
+//     sub-muxer ("[adts @ …]", no #1 marker); runs without one are empty
+//     ("Connection refused") until run 5, which streams.
+func fakeFFmpegScenario(t *testing.T, dir, mode string) string {
+	t.Helper()
+	frames := adtsFramesFile(t, dir)
+	body := fmt.Sprintf(`#!/bin/sh
+trap 'exit 0' INT TERM
+ts=""; copy=0; prev=""; vamap=0
+for a in "$@"; do
+  case "$a" in
+    -show_entries)
+      if [ %q = variantaudio ]; then
+        echo '{"programs":[{"program_id":0,"tags":{"variant_bitrate":"100"},"streams":[{"index":0,"codec_type":"video"},{"index":1,"codec_type":"audio"}]},{"program_id":1,"tags":{"variant_bitrate":"900"},"streams":[{"index":2,"codec_type":"video"},{"index":3,"codec_type":"audio"}]}],"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac","profile":"LC"},{"index":2,"codec_type":"video","codec_name":"h264"},{"index":3,"codec_type":"audio","codec_name":"aac","profile":"LC"}]}'
+      else
+        echo '{"streams":[{"index":0,"codec_type":"audio","codec_name":"aac","profile":"LC"},{"index":1,"codec_type":"video","codec_name":"h264"}]}'
+      fi
+      exit 0;;
+    file:*) ts="${a#file:}";;
+    0:p:1:a:0) vamap=1;;
+  esac
+  if [ "$prev" = "-c:a" ] && [ "$a" = "copy" ]; then copy=1; fi
+  prev="$a"
+done
+c=%q
+n=$(cat "$c" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$c"
+case %q in
+  evidence)
+    if [ -n "$ts" ]; then
+      : > "$ts"
+      cat %q
+      echo '[vost#1:0/libx264 @ 0x1] [enc:libx264 @ 0x2] [error] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.' >&2
+      exit 187
+    fi;;
+  outage)
+    if [ "$n" -le 2 ]; then echo '[error] Error during demuxing: Server returned 500' >&2; exit 0; fi
+    if [ "$n" -eq 3 ]; then i=0; while [ $i -lt 10 ]; do cat %q; i=$((i + 1)); sleep 0.05; done; exit 0; fi;;
+  copyreject)
+    if [ "$copy" = 1 ]; then
+      if [ -n "$ts" ]; then : > "$ts"; fi
+      echo '[out#0/adts @ 0x1] [error] Could not write header (incorrect codec parameters ?): Invalid data found' >&2
+      exit 1
+    fi;;
+  variantaudio)
+    if [ "$vamap" = 1 ]; then
+      if [ -n "$ts" ]; then : > "$ts"; fi
+      echo '[adts @ 0x1] [error] MPEG-4 AOT 42 is not allowed in ADTS' >&2
+      echo '[out#1/mpegts @ 0x2] [error] Could not write header (incorrect codec parameters ?): Invalid argument' >&2
+      exit 183
+    fi;;
+  adtsvideo)
+    if [ -n "$ts" ]; then
+      : > "$ts"
+      echo '[adts @ 0x1] [error] MPEG-4 AOT 42 is not allowed in ADTS' >&2
+      echo '[out#1/mpegts @ 0x2] [error] Could not write header (incorrect codec parameters ?): Invalid argument' >&2
+      exit 183
+    fi
+    if [ "$n" -le 4 ]; then
+      echo '[tcp @ 0x3] [error] Connection to tcp://origin:443 failed: Connection refused' >&2
+      echo '[in#0 @ 0x4] [error] Error opening input: Connection refused' >&2
+      exit 1
+    fi;;
+esac
+while :; do
+  cat %q || exit 0
+  if [ -n "$ts" ]; then printf 'TSDATA' >> "$ts"; fi
+  sleep 0.05
+done
+`, mode, filepath.Join(dir, "runs"), mode, frames, frames, frames)
+	p := filepath.Join(dir, "ffmpeg-"+mode+".sh")
+	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func newScenarioManager(t *testing.T, mode, codec string) (*Manager, string) {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := testConfig(dir, fakeFFmpegScenario(t, dir, mode))
+	cfg.RecordVideo = true
+	cfg.AudioCodec = codec
+	m := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), &fakeUploader{}, "test")
+	m.SetRemuxer(newFakeRemuxer())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		m.Shutdown(ctx)
+	})
+	return m, dir
+}
+
+func scenarioRuns(t *testing.T, dir string) int {
+	t.Helper()
+	b, _ := os.ReadFile(filepath.Join(dir, "runs"))
+	n, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	return n
+}
+
+// TestVideoOutputErrorAfterAudioDisablesVideo: ffmpeg opens the video encoder
+// lazily, so a broken video output kills runs that already wrote audio. Its
+// own error line (output #1) attributes those runs to the video even though
+// they produced bytes: after two of them video is off and the audio records
+// uninterrupted, without any trial run.
+func TestVideoOutputErrorAfterAudioDisablesVideo(t *testing.T) {
+	m, dir := newScenarioManager(t, "evidence", "aac")
+	now := time.Now()
+	m.SetSchedule(sched(item("v", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("v")
+	if ar == nil {
+		t.Fatal("recording not started")
+	}
+	waitFor(t, 10*time.Second, "video turned off", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return ar.s.VideoSource == "none"
+	})
+	time.Sleep(300 * time.Millisecond)
+	if n := scenarioRuns(t, dir); n != 3 {
+		t.Errorf("runs = %d, want 2 failed runs with video + 1 streaming run without", n)
+	}
+	m.mu.Lock()
+	capErr := ar.s.VideoCaptureError
+	m.mu.Unlock()
+	if !strings.Contains(capErr, "Error while opening encoder") {
+		t.Errorf("VideoCaptureError = %q", capErr)
+	}
+	if got := counterValue(t, m, "recorder_video_capture_disabled_total", map[string]string{"reason": "output-error"}); got != 1 {
+		t.Errorf("video_capture_disabled_total{output-error} = %v", got)
+	}
+	before := ar.bytes.Load()
+	waitFor(t, 5*time.Second, "audio keeps flowing", func() bool { return ar.bytes.Load() > before })
+}
+
+// TestVideoOutageEndingDuringTrialKeepsVideo: a source outage empties the runs
+// with video, the audio-only trial happens to start as the source recovers.
+// That is not proof against the video: the next run with video produces audio,
+// so video stays on and later runs capture TS files again.
+func TestVideoOutageEndingDuringTrialKeepsVideo(t *testing.T) {
+	m, dir := newScenarioManager(t, "outage", "aac")
+	now := time.Now()
+	m.SetSchedule(sched(item("v", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("v")
+	if ar == nil {
+		t.Fatal("recording not started")
+	}
+	waitFor(t, 10*time.Second, "a run with video after the trial", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return len(ar.s.Runs) >= 2 && len(ar.s.Runs[len(ar.s.Runs)-1].VideoFiles) == 1
+	})
+	m.mu.Lock()
+	source, capErr, runs := ar.s.VideoSource, ar.s.VideoCaptureError, append([]Run(nil), ar.s.Runs...)
+	m.mu.Unlock()
+	if source != "copy" || capErr != "" {
+		t.Errorf("video source=%q captureError=%q, want copy and none", source, capErr)
+	}
+	if len(runs[0].VideoFiles) != 0 {
+		t.Errorf("trial run lists TS files %q", runs[0].VideoFiles)
+	}
+	if got := counterValue(t, m, "recorder_video_capture_disabled_total", map[string]string{"reason": "empty-runs"}); got != 0 {
+		t.Errorf("video_capture_disabled_total = %v", got)
+	}
+	if n := scenarioRuns(t, dir); n != 4 {
+		t.Errorf("runs = %d, want 2 empty + trial + streaming", n)
+	}
+}
+
+// TestCopyRejectionWithVideoFallsBackLikeAudioOnly: the ADTS muxer rejecting
+// the stream-copied audio is an audio problem even while the video output is
+// active — two rejected runs fall back to aac (as without video), and video
+// is neither blamed nor turned off.
+func TestCopyRejectionWithVideoFallsBackLikeAudioOnly(t *testing.T) {
+	m, dir := newScenarioManager(t, "copyreject", "auto")
+	now := time.Now()
+	m.SetSchedule(sched(item("v", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("v")
+	if ar == nil {
+		t.Fatal("recording not started")
+	}
+	waitFor(t, 10*time.Second, "audio after the fallback", func() bool { return ar.bytes.Load() > 0 })
+	m.mu.Lock()
+	resolved, source, runs := ar.s.ResolvedCodec, ar.s.VideoSource, append([]Run(nil), ar.s.Runs...)
+	m.mu.Unlock()
+	if resolved != "aac" || source != "copy" {
+		t.Errorf("ResolvedCodec=%q VideoSource=%q, want aac and copy", resolved, source)
+	}
+	if n := scenarioRuns(t, dir); n != 3 {
+		t.Errorf("runs = %d, want 2 rejected + 1 transcoding", n)
+	}
+	if len(runs) != 1 || len(runs[0].VideoFiles) != 1 {
+		t.Errorf("runs = %+v, want one run with its TS file", runs)
+	}
+	if got := counterValue(t, m, "recorder_codec_fallbacks_total", nil); got != 1 {
+		t.Errorf("codec_fallbacks_total = %v", got)
+	}
+}
+
+// TestVideoVariantAudioFailureFallsBackToFirstAudio: the video output's own
+// variant audio (VideoAudioMap) is the one input the ADTS output does not
+// share. When the video output fails with it, the next run retries with 0:a:0
+// before video is given up — and that run records audio and video.
+func TestVideoVariantAudioFailureFallsBackToFirstAudio(t *testing.T) {
+	m, dir := newScenarioManager(t, "variantaudio", "auto")
+	now := time.Now()
+	m.SetSchedule(sched(item("v", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("v")
+	if ar == nil {
+		t.Fatal("recording not started")
+	}
+	waitFor(t, 10*time.Second, "a run with video and audio", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return len(ar.s.Runs) >= 1 && len(ar.s.Runs[0].VideoFiles) == 1 && ar.bytes.Load() > 0
+	})
+	m.mu.Lock()
+	source, vmap, amap, capErr, resolved := ar.s.VideoSource, ar.s.VideoMap, ar.s.VideoAudioMap, ar.s.VideoCaptureError, ar.s.ResolvedCodec
+	m.mu.Unlock()
+	if source != "copy" || vmap != "0:p:1:v:0" || amap != "" || capErr != "" {
+		t.Errorf("video = (%q, %q, amap %q, err %q), want copy of 0:p:1:v:0 with 0:a:0 and no error", source, vmap, amap, capErr)
+	}
+	if resolved != "copy" {
+		t.Errorf("ResolvedCodec = %q, want copy (a video output failure is not the audio's)", resolved)
+	}
+	if n := scenarioRuns(t, dir); n != 2 {
+		t.Errorf("runs = %d, want 1 failed with the variant audio + 1 streaming", n)
+	}
+}
+
+// TestVideoADTSErrorDoesNotCauseLaterCopyFallback: the video output's ADTS
+// sub-muxer error ("[adts @ …]", no #1 marker) turns video off; it must not
+// stay around as evidence of a copy rejection for the empty audio-only runs
+// of a later outage.
+func TestVideoADTSErrorDoesNotCauseLaterCopyFallback(t *testing.T) {
+	m, dir := newScenarioManager(t, "adtsvideo", "auto")
+	now := time.Now()
+	m.SetSchedule(sched(item("v", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("v")
+	if ar == nil {
+		t.Fatal("recording not started")
+	}
+	waitFor(t, 15*time.Second, "audio after the outage", func() bool { return ar.bytes.Load() > 0 })
+	m.mu.Lock()
+	resolved, source := ar.s.ResolvedCodec, ar.s.VideoSource
+	m.mu.Unlock()
+	if source != "none" {
+		t.Errorf("VideoSource = %q, want none (video output failed twice)", source)
+	}
+	if resolved != "copy" {
+		t.Errorf("ResolvedCodec = %q, want copy: the outage runs were not copy rejections", resolved)
+	}
+	if got := counterValue(t, m, "recorder_codec_fallbacks_total", nil); got != 0 {
+		t.Errorf("codec_fallbacks_total = %v", got)
+	}
+	if n := scenarioRuns(t, dir); n != 5 {
+		t.Errorf("runs = %d, want 2 video failures + 2 empty + 1 streaming", n)
 	}
 }

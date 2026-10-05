@@ -487,3 +487,130 @@ func TestParseRate(t *testing.T) {
 		}
 	}
 }
+
+// avTSLongAudio is avTS with the audio running on past the last video frame
+// (audioSeconds > videoSeconds) and an optional encoder — what a capture cut
+// by SIGTERM or a restart routinely looks like.
+func avTSLongAudio(t *testing.T, dir, name, vcodec string, videoSeconds, audioSeconds float64) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	args := []string{
+		"-nostdin", "-hide_banner", "-v", "error", "-y",
+		"-f", "lavfi", "-i", fmt.Sprintf("testsrc2=s=320x240:r=25:d=%g", videoSeconds),
+		"-f", "lavfi", "-i", fmt.Sprintf("sine=frequency=440:sample_rate=48000:duration=%g", audioSeconds),
+		"-c:v", vcodec, "-preset", "ultrafast", "-g", "25", "-pix_fmt", "yuv420p",
+	}
+	if vcodec == "libx265" {
+		args = append(args, "-x265-params", "log-level=error")
+	}
+	args = append(args, "-ac", "2", "-c:a", "aac", "-b:a", "128k", "-f", "mpegts", path)
+	out, err := exec.Command("ffmpeg", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("generate %s: %v\n%s", name, err, out)
+	}
+	return path
+}
+
+// TestBuildVideoConcatAudioPastVideo: the first capture's audio runs 0.5 s
+// past its last video frame. The concat demuxer would start the second file
+// at the first one's probed (video-led) duration, before the first file's last
+// audio packet ("Non-monotonic DTS", exit 234) — the list's duration
+// directive must prevent that.
+func TestBuildVideoConcatAudioPastVideo(t *testing.T) {
+	r := videoTools(t)
+	dir := t.TempDir()
+	a := avTSLongAudio(t, dir, "a.ts", "libx264", 3, 3.5)
+	b := avTSLongAudio(t, dir, "b.ts", "libx264", 3, 3.5)
+	ia, ib := probeVideo(t, r, a), probeVideo(t, r, b)
+
+	span, err := r.mediaSpan(t.Context(), a, ia)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if span < 3500*time.Millisecond || span > 3700*time.Millisecond {
+		t.Errorf("span = %s, want the audio's ~3.56 s", span)
+	}
+
+	out := filepath.Join(dir, "out.mp4")
+	res, err := r.BuildVideoConcat(t.Context(), []string{a, b}, out, Metadata{})
+	if err != nil {
+		t.Fatalf("BuildVideoConcat: %v", err)
+	}
+	if res.Video.AudioPackets != ia.AudioPackets+ib.AudioPackets {
+		t.Errorf("audio packets = %d, inputs %d + %d", res.Video.AudioPackets, ia.AudioPackets, ib.AudioPackets)
+	}
+	if res.Duration < 6900*time.Millisecond || res.Duration > 7500*time.Millisecond {
+		t.Errorf("duration = %s, want ~7.1 s", res.Duration)
+	}
+	if out, err := exec.Command("ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", out, "-map", "0:a:0", "-f", "null", "-").CombinedOutput(); err != nil {
+		t.Errorf("decode: %v\n%s", err, out)
+	}
+}
+
+// TestBuildVideoConcatTagsHEVCAsHvc1: Apple players only play HEVC-in-MP4
+// tagged hvc1; ffmpeg's default for a stream copy is hev1.
+func TestBuildVideoConcatTagsHEVCAsHvc1(t *testing.T) {
+	r := videoTools(t)
+	if out, err := exec.Command(r.FFmpegPath, "-hide_banner", "-h", "encoder=libx265").CombinedOutput(); err != nil ||
+		!strings.Contains(string(out), "Encoder libx265") {
+		t.Skip("ffmpeg has no libx265")
+	}
+	dir := t.TempDir()
+	a := avTSLongAudio(t, dir, "a.ts", "libx265", 2, 2)
+	b := avTSLongAudio(t, dir, "b.ts", "libx265", 2, 2)
+	res, err := r.BuildVideoConcat(t.Context(), []string{a, b}, filepath.Join(dir, "out.mp4"), Metadata{})
+	if err != nil {
+		t.Fatalf("BuildVideoConcat: %v", err)
+	}
+	if res.Video.VideoCodec != "hevc" || res.Video.VideoTag != "hvc1" {
+		t.Errorf("video = %s tagged %q, want hevc tagged hvc1", res.Video.VideoCodec, res.Video.VideoTag)
+	}
+}
+
+// stripPID removes every TS packet of pid from path (in place).
+func stripPID(t *testing.T, path string, pid int) {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []byte
+	for i := 0; i+188 <= len(b); i += 188 {
+		p := b[i : i+188]
+		if p[0] == 0x47 && (int(p[1]&0x1f)<<8|int(p[2])) == pid {
+			continue
+		}
+		out = append(out, p...)
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestVideoInputWithoutVideoPackets: a capture killed before its first video
+// packet declares the stream (PMT) without carrying any. It has no picture:
+// the concat refuses it up front and the transcode pictures it black instead
+// of mapping an empty stream (ffmpeg exit 183, "received no packets").
+func TestVideoInputWithoutVideoPackets(t *testing.T) {
+	r := videoTools(t)
+	dir := t.TempDir()
+	good := avTS(t, dir, "good.ts", 320, 240, 2, 48000, 1)
+	novid := avTS(t, dir, "novid.ts", 320, 240, 2, 48000, 1)
+	stripPID(t, novid, 0x100) // ffmpeg's mpegts muxer puts the first stream (video) on 0x100
+
+	info := probeVideo(t, r, novid)
+	if !info.HasVideo || info.HasPicture() || info.VideoPackets != 0 {
+		t.Fatalf("probe = %+v, want a declared video stream without packets", info)
+	}
+	if _, err := r.BuildVideoConcat(t.Context(), []string{good, novid}, filepath.Join(dir, "c.mp4"), Metadata{}); !errors.Is(err, ErrNoVideo) {
+		t.Errorf("concat err = %v, want ErrNoVideo", err)
+	}
+	res, err := r.BuildVideoTranscode(t.Context(), []VideoSegment{{TS: good}, {TS: novid}}, filepath.Join(dir, "t.mp4"),
+		320, 240, 25, "96k", Metadata{})
+	if err != nil {
+		t.Fatalf("BuildVideoTranscode: %v", err)
+	}
+	if res.Duration < 3500*time.Millisecond || res.Video.Width != 320 {
+		t.Errorf("result = %s, %s", describeVideo(res.Video), res.Duration)
+	}
+}

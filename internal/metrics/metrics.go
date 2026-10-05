@@ -75,7 +75,7 @@ type Metrics struct {
 
 	// Video companion (.mp4 next to the .m4a, RECORD_VIDEO=true).
 	VideoBuildsTotal          *prometheus.CounterVec // kind=black|copy|transcode, result=success|failure
-	VideoCaptureDisabledTotal *prometheus.CounterVec // reason=empty-runs
+	VideoCaptureDisabledTotal *prometheus.CounterVec // reason=empty-runs|output-error
 
 	// System (host view via /proc, plus container cgroup view).
 	SysCPUPercent          prometheus.Gauge
@@ -244,7 +244,7 @@ func New(version string) *Metrics {
 	}
 	m.VideoCaptureDisabledTotal = counterVec("video_capture_disabled_total",
 		"Sessions whose video capture was turned off (the .mp4 then gets a black picture), by reason.", "reason")
-	for _, r := range []string{"empty-runs"} {
+	for _, r := range []string{"empty-runs", "output-error"} {
 		m.VideoCaptureDisabledTotal.WithLabelValues(r)
 	}
 

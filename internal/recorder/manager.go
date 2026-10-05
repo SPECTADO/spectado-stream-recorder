@@ -35,6 +35,11 @@ type Uploader interface {
 	// with one it must replace exactly the object that has that ETag and
 	// return ErrObjectChanged otherwise.
 	Upload(ctx context.Context, path, key, contentType string, metadata map[string]string, replaceETag string) (etag string, err error)
+	// Overwrite stores the file at path under key unconditionally (no
+	// If-Match/If-None-Match), replacing whatever is there. Only the derived
+	// .mp4 video companion is written this way, and only on an endpoint that
+	// does not enforce conditional writes (ADR 0002); never the audio.
+	Overwrite(ctx context.Context, path, key, contentType string, metadata map[string]string) (etag string, err error)
 	// Head reports size, ETag and user metadata of key; found is false when
 	// there is no such object.
 	Head(ctx context.Context, key string) (info ObjectInfo, found bool, err error)
@@ -127,16 +132,20 @@ type Manager struct {
 	loggedInvalid map[string]struct{}
 	remuxFailures map[string]int       // object key -> consecutive remux failures
 	videoFailures map[string]int       // object key -> consecutive .mp4 companion build failures
-	nospaceLogged map[string]time.Time // object key -> last "no disk" warning
-	warnedSafeID  map[string]struct{}  // recording ids whose object name differs
-	warnedKeys    map[string]struct{}  // explicit schedule keys already explained
-	mergeProbed   bool                 // ConditionalWrites has been asked
-	mergeAllowed  bool                 // ... and said yes
-	shuttingDown  atomic.Bool
-	schedLoaded   atomic.Bool
-	activeCount   atomic.Int64
-	diskLow       atomic.Bool
-	diskFree      func() (free uint64, ok bool)
+	videoNoSpace  map[string]time.Time // object key -> since when the .mp4's disk share has not fit
+	// videoNoSpaceBudget is how long the .mp4's disk share may keep not
+	// fitting before the .m4a is stored without it (videoNoSpaceGiveUp).
+	videoNoSpaceBudget time.Duration
+	nospaceLogged      map[string]time.Time // object key -> last "no disk" warning
+	warnedSafeID       map[string]struct{}  // recording ids whose object name differs
+	warnedKeys         map[string]struct{}  // explicit schedule keys already explained
+	mergeProbed        bool                 // ConditionalWrites has been asked
+	mergeAllowed       bool                 // ... and said yes
+	shuttingDown       atomic.Bool
+	schedLoaded        atomic.Bool
+	activeCount        atomic.Int64
+	diskLow            atomic.Bool
+	diskFree           func() (free uint64, ok bool)
 
 	uploadCtx    context.Context
 	uploadCancel context.CancelFunc
@@ -149,28 +158,30 @@ type Manager struct {
 func NewManager(cfg *config.Config, log *slog.Logger, met *metrics.Metrics, up Uploader, version string) *Manager {
 	uctx, ucancel := context.WithCancel(context.Background())
 	m := &Manager{
-		cfg:           cfg,
-		log:           log.With("component", "recorder"),
-		met:           met,
-		up:            up,
-		root:          filepath.Join(cfg.DataDir, "recordings"),
-		version:       version,
-		startedAt:     time.Now(),
-		probeSem:      make(chan struct{}, cfg.ProbeConcurrency),
-		uploadSem:     make(chan struct{}, cfg.UploadConcurrency),
-		active:        map[string]*activeRecording{},
-		sessions:      map[string]*Session{},
-		uploadLoops:   map[string]bool{},
-		skipLogged:    map[string]time.Time{},
-		loggedInvalid: map[string]struct{}{},
-		remuxFailures: map[string]int{},
-		videoFailures: map[string]int{},
-		nospaceLogged: map[string]time.Time{},
-		warnedSafeID:  map[string]struct{}{},
-		warnedKeys:    map[string]struct{}{},
-		diskFree:      func() (uint64, bool) { return 0, false },
-		uploadCtx:     uctx,
-		uploadCancel:  ucancel,
+		cfg:                cfg,
+		log:                log.With("component", "recorder"),
+		met:                met,
+		up:                 up,
+		root:               filepath.Join(cfg.DataDir, "recordings"),
+		version:            version,
+		startedAt:          time.Now(),
+		probeSem:           make(chan struct{}, cfg.ProbeConcurrency),
+		uploadSem:          make(chan struct{}, cfg.UploadConcurrency),
+		active:             map[string]*activeRecording{},
+		sessions:           map[string]*Session{},
+		uploadLoops:        map[string]bool{},
+		skipLogged:         map[string]time.Time{},
+		loggedInvalid:      map[string]struct{}{},
+		remuxFailures:      map[string]int{},
+		videoFailures:      map[string]int{},
+		videoNoSpace:       map[string]time.Time{},
+		nospaceLogged:      map[string]time.Time{},
+		warnedSafeID:       map[string]struct{}{},
+		warnedKeys:         map[string]struct{}{},
+		diskFree:           func() (uint64, bool) { return 0, false },
+		videoNoSpaceBudget: videoNoSpaceGiveUp,
+		uploadCtx:          uctx,
+		uploadCancel:       ucancel,
 	}
 	// The remuxer runs the same ffmpeg/ffprobe binaries as the capture; the
 	// transfer throughput assumption doubles as the remux throughput floor.
@@ -604,6 +615,7 @@ func (m *Manager) startSessionLocked(it schedule.Item, now time.Time) error {
 				latest = other.SessionStart
 				s.VideoSource = other.VideoSource
 				s.VideoMap = other.VideoMap
+				s.VideoAudioMap = other.VideoAudioMap
 			}
 		}
 	}

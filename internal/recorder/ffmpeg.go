@@ -64,13 +64,17 @@ type activeRecording struct {
 	stallKilled  atomic.Bool
 	savedBytes   int64
 
-	// Video companion failure attribution (supervise goroutine only):
-	// consecutive empty runs that had a video output, whether the next run is
-	// the audio-only trial that decides whether video was the culprit, and the
-	// last stderr line of those failed runs.
-	videoFailures int
-	videoTrial    bool
-	videoFailLine string
+	// Video companion failure attribution (supervise goroutine only; see
+	// attributeVideo): consecutive runs that failed with the video output
+	// active, whether the next run is the audio-only trial, the stderr line of
+	// those failures, a pending suspicion (the trial produced audio: the next
+	// run with video decides between an outage and a video fault) and the
+	// source these counters refer to (a source change starts them over).
+	videoFailures  int
+	videoTrial     bool
+	videoFailLine  string
+	videoSuspect   string
+	videoCounterOf string
 
 	// Frame-aware writer state. splitter is owned by the writer goroutine
 	// (single-threaded per run); run holds the live per-run counters and clock
@@ -99,7 +103,6 @@ type runState struct {
 	started      bool    // at least one frame written this run
 	closed       bool    // endRun has finalized this run's record
 	videoFile    string  // basename of the TS file this run writes ("" = no video output)
-	videoTrial   string  // non-empty: this run is the audio-only video trial (holds the failure line)
 }
 
 func (ar *activeRecording) lastDataTime() time.Time {
@@ -205,7 +208,6 @@ func (ar *activeRecording) beginRun(anchor time.Time, source string) {
 	ar.run.started = false
 	ar.run.closed = false
 	ar.run.videoFile = ""
-	ar.run.videoTrial = ""
 	ar.run.mu.Unlock()
 	ar.splitter = adts.Splitter{}
 }
@@ -227,26 +229,11 @@ func (m *Manager) openRunRecord(ar *activeRecording) {
 	if ar.run.videoFile != "" {
 		r.VideoFiles = []string{ar.run.videoFile}
 	}
-	trial := ar.run.videoTrial
 	ar.run.mu.Unlock()
 
 	m.mu.Lock()
 	if ar.s.appendRun(r) {
 		m.log.Warn("run history reached the cap; coalescing oldest runs", "id", ar.s.ID, "session", ar.s.SessionID, "cap", maxRuns)
-	}
-	if trial != "" && ar.s.VideoSource != "none" {
-		// The audio-only trial produces audio where the runs with the video
-		// output did not: the video output was the culprit. Decided on the
-		// first frame (not at the run's end, which may be the session's end).
-		ar.s.VideoSource = "none"
-		ar.s.VideoMap = ""
-		ar.s.VideoCaptureError = "ffmpeg produced no audio while the video output was active"
-		if trial != "-" {
-			ar.s.VideoCaptureError += " | " + trial
-		}
-		m.met.VideoCaptureDisabledTotal.WithLabelValues("empty-runs").Inc()
-		m.log.Warn("video capture turned off for this session: ffmpeg produces audio only without the video output; the .mp4 gets a black picture",
-			"id", ar.s.ID, "session", ar.s.SessionID, "stderr", trial)
 	}
 	_ = ar.s.saveQuick()
 	m.mu.Unlock()
@@ -378,6 +365,15 @@ type stderrBuffer struct {
 	onSuppressed  func(reason string) // hook fired for each benign line dropped
 	benignRun     int                 // benign lines dropped during the current run
 	lastErrorLine string              // most recent [error]/[fatal]/[panic] line of the run
+	// Video output attribution: error-level lines of the current run that
+	// contain one of videoMarkers (set per run; see videoOutputMarkers).
+	videoMarkers   []string
+	videoErrorLine string // first such line of the run
+	// runTail is the tail of the current run only (capped like tail): the
+	// copy-rejection check must not see an earlier run's lines, e.g. the
+	// video output's own "[adts @ …]" sub-muxer error, which carries no #1
+	// marker and would otherwise outlive video being turned off.
+	runTail []string
 }
 
 func newStderrBuffer(mode string, logLine func(slog.Level, string)) *stderrBuffer {
@@ -447,11 +443,18 @@ func (b *stderrBuffer) pushLocked(line string) {
 	}
 	if level == slog.LevelError {
 		b.lastErrorLine = msg
+		if b.videoErrorLine == "" && containsAny(msg, b.videoMarkers) {
+			b.videoErrorLine = msg
+		}
 	}
 	b.lastMessage = msg
 	b.tail = append(b.tail, time.Now().UTC().Format(time.RFC3339)+" "+msg)
 	if len(b.tail) > b.maxTail {
 		b.tail = b.tail[len(b.tail)-b.maxTail:]
+	}
+	b.runTail = append(b.runTail, msg)
+	if len(b.runTail) > b.maxTail {
+		b.runTail = b.runTail[len(b.runTail)-b.maxTail:]
 	}
 	if b.logLine == nil || b.mode == "off" {
 		return
@@ -487,6 +490,13 @@ func (b *stderrBuffer) Tail() []string {
 	return out
 }
 
+// RunTail returns a copy of the last lines of the current run (since resetRun).
+func (b *stderrBuffer) RunTail() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.runTail...)
+}
+
 // Last returns the most recent stderr line.
 func (b *stderrBuffer) Last() string {
 	b.mu.Lock()
@@ -494,13 +504,50 @@ func (b *stderrBuffer) Last() string {
 	return b.lastMessage
 }
 
-// resetRun zeroes the per-run diagnostics (benign counter and error line) at
-// the start of a new ffmpeg run. The rolling tail and lastMessage are kept.
-func (b *stderrBuffer) resetRun() {
+// resetRun zeroes the per-run diagnostics (benign counter and error lines) at
+// the start of a new ffmpeg run and sets the markers that attribute an error
+// line to the video output (nil: the run has none). The rolling tail and
+// lastMessage are kept; the run tail starts over.
+func (b *stderrBuffer) resetRun(videoMarkers ...string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.benignRun = 0
 	b.lastErrorLine = ""
+	b.videoMarkers = videoMarkers
+	b.videoErrorLine = ""
+	b.runTail = nil
+}
+
+// VideoErrorLine returns the first error-level line of the current run that
+// came from the video output, or "".
+func (b *stderrBuffer) VideoErrorLine() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.videoErrorLine
+}
+
+func containsAny(s string, subs []string) bool {
+	for _, sub := range subs {
+		if sub != "" && strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// videoOutputMarkers are fragments that tie an ffmpeg 9 log line to the video
+// companion output (output #1) rather than the input or the ADTS output
+// (output #0): its streams and filters log as "[vost#1:0/libx264 @ …]",
+// "[aost#1:1/copy @ …]", "[vf#1:0 @ …]", the muxer as "[out#1/mpegts @ …]",
+// the encoder as "[enc:libx264 @ …]" / "[libx264 @ …]", and option or open
+// errors quote the map spec or the TS path. There is only one input (#0), so
+// "#1:" and "#1/" cannot match an input line.
+func videoOutputMarkers(v videoPlan) []string {
+	out := []string{"#1:", "#1/", "enc:libx264", "[libx264 @", "'" + v.vmap + "'", "file:" + v.path}
+	if v.amap != "" { // never "''": ffmpeg prints "Stream map '' …" for any output
+		out = append(out, "'"+v.amap+"'")
+	}
+	return out
 }
 
 // suppressedRun returns how many benign lines were dropped in the current run.
@@ -639,6 +686,7 @@ var videoCaptureX264Args = []string{"-c:v", "libx264", "-preset", "veryfast", "-
 type videoPlan struct {
 	source string // "copy" | "x264"
 	vmap   string // -map spec of the video stream
+	amap   string // -map spec of its audio ("" = 0:a:0, the ADTS output's)
 	path   string // absolute path of the run's TS file
 }
 
@@ -650,9 +698,15 @@ func (v videoPlan) active() bool { return v.path != "" }
 // at an arbitrary byte by a crash). Options before an output url apply to that
 // output only, so the ADTS output's -vn/-map stay scoped to pipe:1 and its
 // bytes are identical to an audio-only run. The audio is encoded like the ADTS
-// output (copy, or aac at the same bitrate) so both files carry the same audio.
+// output (copy, or aac at the same bitrate). It is the video variant's own
+// audio when decideVideo found one of the same codec there (amap), so picture
+// and sound of the .mp4 come from one playlist; else the ADTS output's 0:a:0.
 func (m *Manager) videoOutputArgs(s *Session, codec string, v videoPlan) []string {
-	args := []string{"-map", v.vmap, "-map", "0:a:0", "-sn", "-dn"}
+	amap := v.amap
+	if amap == "" {
+		amap = "0:a:0"
+	}
+	args := []string{"-map", v.vmap, "-map", amap, "-sn", "-dn"}
 	if v.source == "copy" {
 		args = append(args, "-c:v", "copy")
 	} else {
@@ -774,7 +828,7 @@ func (m *Manager) probeMedia(ctx context.Context, s *Session) (*probeResult, err
 	args = append(args, m.inputArgs(s, false, false)...)
 	args = append(args,
 		"-show_entries", "stream=index,codec_type,codec_name,profile,sample_rate,channels,width,height:"+
-			"stream_disposition=attached_pic:program=program_id:program_tags=variant_bitrate:program_stream=index,codec_type",
+			"stream_disposition=attached_pic:program=program_id:program_tags=variant_bitrate:program_stream=index,codec_type,codec_name",
 		"-of", "json",
 		s.Source,
 	)
@@ -812,14 +866,38 @@ func (r *probeResult) firstAudio() (probeStream, bool) {
 	return probeStream{}, false
 }
 
+// stream returns the top-level stream entry with the given index.
+func (r *probeResult) stream(index int) (probeStream, bool) {
+	for _, st := range r.Streams {
+		if st.Index == index {
+			return st, true
+		}
+	}
+	return probeStream{}, false
+}
+
+// sameAudioFormat reports whether a variant's audio can take the place of the
+// first audio stream in the video output: the same codec and profile, and a
+// profile the ADTS/MPEG-TS stream copy can carry.
+func sameAudioFormat(a, first probeStream) bool {
+	return a.CodecType == "audio" &&
+		strings.EqualFold(a.CodecName, first.CodecName) &&
+		strings.EqualFold(strings.TrimSpace(a.Profile), strings.TrimSpace(first.Profile)) &&
+		copyableProfile(a.Profile)
+}
+
 // decideVideo turns a probe into the capture decision of a video session.
 // No video stream: "none" (the upload renders a black picture). Otherwise the
 // stream is copied when MP4 can carry it as-is (h264/hevc) and re-encoded to
 // H.264 while capturing when not. With two or more programs carrying video (an
 // HLS master: one program per variant) the program with the highest
-// variant_bitrate wins (ties: the first listed); "-map 0:p:<id>:v:0" then makes
-// ffmpeg's hls demuxer fetch only that variant's segments for the video.
-func decideVideo(r *probeResult) (source, vmap string) {
+// variant_bitrate wins (ties: the first listed): "-map 0:p:<id>:v:0". Its own
+// audio ("0:p:<id>:a:0", when it has one of the same codec as the first audio
+// stream) goes into the video output with it, so the .mp4's sound comes from
+// the playlist its picture does. The ADTS output keeps 0:a:0 (byte-identical
+// audio), so ffmpeg still fetches that variant too: a master whose first
+// variant is not the highest one is downloaded twice (verified, ffmpeg 9.0.1).
+func decideVideo(r *probeResult) (source, vmap, amap string) {
 	best, bestRate, withVideo := -1, int64(-1), 0
 	var bestStream probeStream
 	for i, p := range r.Programs {
@@ -838,6 +916,24 @@ func decideVideo(r *probeResult) (source, vmap string) {
 	var video probeStream
 	if withVideo >= 2 {
 		vmap = fmt.Sprintf("0:p:%d:v:0", r.Programs[best].ProgramID)
+		if first, ok := r.firstAudio(); ok {
+			for _, st := range r.Programs[best].Streams {
+				if st.CodecType == "audio" {
+					// Program entries carry no profile: judge the variant's
+					// audio by its top-level stream entry. It must be copyable
+					// exactly like the first audio (same codec AND profile), or
+					// "-c:a copy" into MPEG-TS could hit what copyableProfile
+					// guards against (xHE-AAC/USAC: "AOT 42 is not allowed in
+					// ADTS") and kill the whole run, audio included.
+					if st.Index != first.Index {
+						if va, ok := r.stream(st.Index); ok && sameAudioFormat(va, first) {
+							amap = fmt.Sprintf("0:p:%d:a:0", r.Programs[best].ProgramID)
+						}
+					}
+					break
+				}
+			}
+		}
 		// Programs list stream index/type only; take the codec from the
 		// top-level stream entry.
 		video = bestStream
@@ -856,15 +952,15 @@ func decideVideo(r *probeResult) (source, vmap string) {
 			}
 		}
 		if !found {
-			return "none", ""
+			return "none", "", ""
 		}
 		vmap = "0:v:0"
 	}
 	switch strings.ToLower(video.CodecName) {
 	case "h264", "hevc":
-		return "copy", vmap
+		return "copy", vmap, amap
 	default:
-		return "x264", vmap
+		return "x264", vmap, amap
 	}
 }
 
@@ -946,32 +1042,34 @@ func (m *Manager) resolveCodec(ctx context.Context, ar *activeRecording, snap *S
 }
 
 // resolveVideo returns the video capture decision of a video session (once per
-// session, persisted like ResolvedCodec): source "none" | "copy" | "x264" and
-// the -map spec. A probe failure means no video output for this run only (not
-// persisted, re-probed on the next restart) — the audio is never held back.
-func (m *Manager) resolveVideo(ctx context.Context, ar *activeRecording, snap *Session, mp *mediaProbe) (source, vmap string) {
+// session, persisted like ResolvedCodec): source "none" | "copy" | "x264", the
+// -map spec of the video and of its audio ("" = 0:a:0). A probe failure means
+// no video output for this run only (not persisted, re-probed on the next
+// restart) — the audio is never held back.
+func (m *Manager) resolveVideo(ctx context.Context, ar *activeRecording, snap *Session, mp *mediaProbe) (source, vmap, amap string) {
 	if !snap.Video {
-		return "", ""
+		return "", "", ""
 	}
 	if snap.VideoSource != "" {
-		return snap.VideoSource, snap.VideoMap
+		return snap.VideoSource, snap.VideoMap, snap.VideoAudioMap
 	}
 	res, err := m.probeOnce(ctx, snap, mp)
 	switch {
 	case ctx.Err() != nil:
-		return "", ""
+		return "", "", ""
 	case err != nil:
 		m.log.Warn("video probe failed; recording this run without video, will re-probe on restart", "id", ar.s.ID, "error", err)
-		return "", ""
+		return "", "", ""
 	}
-	source, vmap = decideVideo(res)
+	source, vmap, amap = decideVideo(res)
 	m.mu.Lock()
 	ar.s.VideoSource = source
 	ar.s.VideoMap = vmap
+	ar.s.VideoAudioMap = amap
 	_ = ar.s.save()
 	m.mu.Unlock()
-	m.log.Info("video resolved", "id", ar.s.ID, "videoSource", source, "videoMap", vmap)
-	return source, vmap
+	m.log.Info("video resolved", "id", ar.s.ID, "videoSource", source, "videoMap", vmap, "videoAudioMap", amap)
+	return source, vmap, amap
 }
 
 // prepareVideoFile hands out the next TS file name for the upcoming run and
@@ -1016,9 +1114,14 @@ func (m *Manager) supervise(ar *activeRecording) {
 		m.mu.Lock()
 		snap := *ar.s
 		m.mu.Unlock()
+		if snap.Source != ar.videoCounterOf {
+			// A new source: earlier failures say nothing about its video.
+			ar.videoCounterOf = snap.Source
+			ar.videoFailures, ar.videoTrial, ar.videoFailLine, ar.videoSuspect = 0, false, "", ""
+		}
 		var mp mediaProbe
 		codec := m.resolveCodec(ctx, ar, &snap, &mp)
-		vsource, vmap := m.resolveVideo(ctx, ar, &snap, &mp)
+		vsource, vmap, amap := m.resolveVideo(ctx, ar, &snap, &mp)
 		if ctx.Err() != nil {
 			return
 		}
@@ -1040,25 +1143,21 @@ func (m *Manager) supervise(ar *activeRecording) {
 			} else if abs, err := filepath.Abs(ar.s.VideoPath(name)); err != nil {
 				log.Warn("could not resolve the video file path; recording this run without video", "error", err)
 			} else {
-				video = videoPlan{source: vsource, vmap: vmap, path: abs}
+				video = videoPlan{source: vsource, vmap: vmap, amap: amap, path: abs}
 				ar.run.mu.Lock()
 				ar.run.videoFile = name
 				ar.run.mu.Unlock()
 			}
 		}
 		trial := ar.videoTrial
-		if trial {
-			ar.run.mu.Lock()
-			ar.run.videoTrial = ar.videoFailLine
-			if ar.run.videoTrial == "" {
-				ar.run.videoTrial = "-"
-			}
-			ar.run.mu.Unlock()
-		}
 		ar.videoTrial = false
 		started := time.Now()
 		ar.runBytes.Store(0)
-		ar.stderr.resetRun()
+		if video.active() {
+			ar.stderr.resetRun(videoOutputMarkers(video)...)
+		} else {
+			ar.stderr.resetRun()
+		}
 		ar.writeErr.Store(nil)
 		// Clear the previous run's stall flag here (not only after a successful
 		// cmd.Start): a run that never starts, e.g. a fork/exec failure right
@@ -1091,6 +1190,7 @@ func (m *Manager) supervise(ar *activeRecording) {
 		// and how many benign lines were dropped this run.
 		lastLine := ar.stderr.Last()
 		errorLine := ar.stderr.LastErrorLine()
+		videoLine := ar.stderr.VideoErrorLine()
 		suppressed := ar.stderr.suppressedRun()
 		reason := classifyExit(runErr, werr, diskFull, killed, stallKilled, errorLine)
 
@@ -1133,10 +1233,25 @@ func (m *Manager) supervise(ar *activeRecording) {
 			ErrorLine:  errorLine,
 			Suppressed: suppressed,
 		})
-		if trial {
+		// The video output's own error lines are its evidence: a run that died
+		// with one counts against the video even when it wrote some audio first
+		// (ffmpeg opens the video encoder/muxer lazily, after the first audio
+		// packets went to pipe:1).
+		videoFault := video.active() && werr == nil && videoLine != "" && (runErr != nil || runBytes == 0)
+		videoCleared := false
+		if trial && werr == nil {
+			if runBytes > 0 {
+				// Audio without the video output, after empty runs with it: an
+				// outage that just ended looks exactly the same as a video
+				// fault. The next run with video decides (attributeVideo).
+				ar.videoSuspect = ar.videoFailLine
+				if ar.videoSuspect == "" {
+					ar.videoSuspect = "-"
+				}
+				log.Info("ffmpeg produced audio without the video output; the next run tries video again to tell an outage from a video fault")
+			}
 			// Empty without video too: the source, not the video output, is
-			// the problem; video stays on and the count starts over. With
-			// audio, openRunRecord has already turned video off.
+			// the problem; video stays on and the count starts over.
 			ar.videoFailures = 0
 		}
 		// ffmpeg rejects unknown input options outright ("Option X not found"):
@@ -1146,21 +1261,25 @@ func (m *Manager) supervise(ar *activeRecording) {
 			ar.safeArgs = true
 			ar.copyFailures = 0 // the empty run was not the codec's fault
 			log.Warn("ffmpeg rejected an optional option; retrying with the minimal command line", "stderr", last)
-		} else if video.active() && runBytes == 0 && werr == nil {
-			// An empty run with a video output may be the video's fault (map,
-			// codec, muxer) or the source's (outage). Video must never cost the
-			// audio, and the audio copy fallback must not fire for a video
-			// problem: after two such runs the next run goes without video. If
-			// that trial produces audio, video was the culprit and is turned
-			// off for the session (openRunRecord; the .mp4 then gets a black
-			// picture).
+		} else if videoFault {
+			// The video output failed (encoder/muxer/map/TS write): twice in
+			// a row turns video off for the session; never the audio fallback.
+			ar.videoSuspect = ""
 			ar.videoFailures++
-			ar.videoFailLine = recDetail
+			ar.videoFailLine = videoLine
 			if ar.videoFailures >= 2 {
-				ar.videoTrial = true
-				log.Warn("ffmpeg produced no audio twice with the video output; trying one run without video", "stderr", lastLine)
+				m.disableVideoLocked(ar, log, "output-error", "the video output failed twice: "+videoLine)
+			} else if video.amap != "" && ar.s.VideoAudioMap == video.amap {
+				// The variant's own audio is the one input the ADTS output
+				// does not share: retry with 0:a:0 (known good for the audio)
+				// before giving up on the video.
+				ar.s.VideoAudioMap = ""
+				_ = ar.s.save()
+				log.Warn("the video output failed; retrying it once with the audio output's stream instead of the variant's own audio", "stderr", videoLine, "videoAudioMap", video.amap, "bytes", runBytes)
+			} else {
+				log.Warn("the video output failed; video stays on for one more try", "stderr", videoLine, "bytes", runBytes)
 			}
-		} else if codec == "copy" && runBytes == 0 && werr == nil && looksLikeCopyRejection(ar.stderr.Tail()) {
+		} else if codec == "copy" && runBytes == 0 && werr == nil && looksLikeCopyRejection(ar.stderr.RunTail()) {
 			// The muxer/codec stage rejected the stream (not a network outage).
 			ar.copyFailures++
 			explicit := snap.Codec == "copy" || ((snap.Codec == "" || snap.Codec == "auto") && m.cfg.AudioCodec == "copy")
@@ -1173,12 +1292,41 @@ func (m *Manager) supervise(ar *activeRecording) {
 				m.met.CodecFallbacksTotal.Inc()
 				log.Warn("stream copy rejected twice, falling back to transcoding", "stderr", ar.stderr.Last())
 			}
+		} else if video.active() && runBytes == 0 && werr == nil {
+			// Empty with the video output and no line of its own: the video's
+			// fault or the source's (outage)? Video must never cost the audio:
+			// after two such runs the next run goes without video (the trial).
+			// If that one produced audio, this is the decisive run with video:
+			// empty again means the video output is the culprit.
+			if ar.videoSuspect != "" {
+				why := "ffmpeg produced no audio while the video output was active, and did without it"
+				if ar.videoSuspect != "-" {
+					why += " | " + ar.videoSuspect
+				}
+				m.disableVideoLocked(ar, log, "empty-runs", why)
+			} else {
+				ar.videoFailures++
+				ar.videoFailLine = recDetail
+				if ar.videoFailures >= 2 {
+					ar.videoTrial = true
+					log.Warn("ffmpeg produced no audio twice with the video output; trying one run without video", "stderr", lastLine)
+				}
+			}
 		} else if runBytes > 0 {
 			ar.copyFailures = 0
-			ar.videoFailures = 0
+			if !trial {
+				ar.videoFailures = 0
+			}
+			if video.active() && ar.videoSuspect != "" {
+				ar.videoSuspect = "" // audio with video again: it was an outage
+				videoCleared = true
+			}
 		}
 		_ = ar.s.saveQuick()
 		m.mu.Unlock()
+		if videoCleared {
+			log.Info("ffmpeg produced audio with the video output again; the earlier empty runs were the source's, video stays on")
+		}
 		ar.restartsCounter.Inc()
 		m.met.FFmpegExitsTotal.WithLabelValues(reason).Inc()
 		if werr != nil {
@@ -1221,6 +1369,20 @@ func (m *Manager) supervise(ar *activeRecording) {
 		}
 		backoff = next
 	}
+}
+
+// disableVideoLocked turns video capture off for the rest of the session
+// (persisted: VideoSource "none"); the remaining runs record audio only and
+// the .mp4 gets a black stretch for them. Caller holds m.mu.
+func (m *Manager) disableVideoLocked(ar *activeRecording, log *slog.Logger, reason, why string) {
+	ar.s.VideoSource = "none"
+	ar.s.VideoMap = ""
+	ar.s.VideoAudioMap = ""
+	ar.s.VideoCaptureError = why
+	ar.videoFailures, ar.videoTrial, ar.videoFailLine, ar.videoSuspect = 0, false, "", ""
+	m.met.VideoCaptureDisabledTotal.WithLabelValues(reason).Inc()
+	log.Warn("video capture turned off for this session; the rest of it is recorded audio-only (black in the .mp4)",
+		"reason", reason, "error", why)
 }
 
 // firstNonEmptyErr returns the message of the first non-nil error, or "".
@@ -1269,6 +1431,11 @@ func benignReason(line string) string {
 
 func looksLikeCopyRejection(tail []string) bool {
 	for _, line := range tail {
+		// A line of the video companion output (output #1) is never the ADTS
+		// stage's rejection; audio-only runs have no such lines.
+		if strings.Contains(line, "#1:") || strings.Contains(line, "#1/") {
+			continue
+		}
 		l := strings.ToLower(line)
 		for _, mk := range copyRejectionMarkers {
 			if strings.Contains(l, mk) {

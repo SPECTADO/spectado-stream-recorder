@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -393,6 +394,10 @@ func TestCaptureArgsVideoOutput(t *testing.T) {
 			"-map", "0:v:0", "-map", "0:a:0", "-sn", "-dn",
 			"-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
 			"-f", "mpegts", "-flush_packets", "1", "-y", "file:/d/s.v0002.ts"}},
+		// The video variant's own audio goes with its picture.
+		{"copy", videoPlan{source: "copy", vmap: "0:p:2:v:0", amap: "0:p:2:a:0", path: "/d/s.v0003.ts"}, []string{
+			"-map", "0:p:2:v:0", "-map", "0:p:2:a:0", "-sn", "-dn", "-c:v", "copy", "-c:a", "copy",
+			"-f", "mpegts", "-flush_packets", "1", "-y", "file:/d/s.v0003.ts"}},
 	}
 	for _, tc := range cases {
 		first := m.ffmpegArgs(s, tc.codec, true, false)
@@ -412,9 +417,9 @@ func TestCaptureArgsVideoOutput(t *testing.T) {
 // hlsMasterProbe is real ffprobe output (ffmpeg 9.0.1) for a three-variant HLS
 // master whose highest-bandwidth variant (640x360) is listed second.
 const hlsMasterProbe = `{"programs": [
- {"program_id": 0, "tags": {"variant_bitrate": "280872"}, "streams": [{"index": 0, "codec_type": "video"}, {"index": 1, "codec_type": "audio"}]},
- {"program_id": 1, "tags": {"variant_bitrate": "1990920"}, "streams": [{"index": 2, "codec_type": "video"}, {"index": 3, "codec_type": "audio"}]},
- {"program_id": 2, "tags": {"variant_bitrate": "627168"}, "streams": [{"index": 4, "codec_type": "video"}, {"index": 5, "codec_type": "audio"}]}],
+ {"program_id": 0, "tags": {"variant_bitrate": "280872"}, "streams": [{"index": 0, "codec_type": "video", "codec_name": "h264"}, {"index": 1, "codec_type": "audio", "codec_name": "aac"}]},
+ {"program_id": 1, "tags": {"variant_bitrate": "1990920"}, "streams": [{"index": 2, "codec_type": "video", "codec_name": "h264"}, {"index": 3, "codec_type": "audio", "codec_name": "aac"}]},
+ {"program_id": 2, "tags": {"variant_bitrate": "627168"}, "streams": [{"index": 4, "codec_type": "video", "codec_name": "h264"}, {"index": 5, "codec_type": "audio", "codec_name": "aac"}]}],
  "streams": [
  {"index": 0, "codec_name": "h264", "profile": "Constrained Baseline", "codec_type": "video", "width": 160, "height": 90},
  {"index": 1, "codec_name": "aac", "profile": "LC", "codec_type": "audio", "sample_rate": "48000", "channels": 1},
@@ -425,31 +430,51 @@ const hlsMasterProbe = `{"programs": [
 
 func TestDecideVideo(t *testing.T) {
 	cases := []struct {
-		name, json   string
-		source, vmap string
+		name, json         string
+		source, vmap, amap string
 	}{
-		{"hls master: highest variant_bitrate wins", hlsMasterProbe, "copy", "0:p:1:v:0"},
+		{"hls master: highest variant_bitrate wins, with its own audio", hlsMasterProbe, "copy", "0:p:1:v:0", "0:p:1:a:0"},
+		{"hls master: variant audio of another codec stays 0:a:0", `{"programs":[
+			{"program_id":0,"tags":{"variant_bitrate":"100"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"}]},
+			{"program_id":1,"tags":{"variant_bitrate":"900"},"streams":[{"index":2,"codec_type":"video","codec_name":"h264"},{"index":3,"codec_type":"audio","codec_name":"ac3"}]}],
+			"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"},
+			{"index":2,"codec_type":"video","codec_name":"h264"},{"index":3,"codec_type":"audio","codec_name":"ac3"}]}`, "copy", "0:p:1:v:0", ""},
+		{"hls master: xHE-AAC variant audio (not copyable into MPEG-TS) stays 0:a:0", `{"programs":[
+			{"program_id":0,"tags":{"variant_bitrate":"100"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"}]},
+			{"program_id":1,"tags":{"variant_bitrate":"900"},"streams":[{"index":2,"codec_type":"video","codec_name":"h264"},{"index":3,"codec_type":"audio","codec_name":"aac"}]}],
+			"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac","profile":"LC"},
+			{"index":2,"codec_type":"video","codec_name":"h264"},{"index":3,"codec_type":"audio","codec_name":"aac","profile":"xHE-AAC"}]}`, "copy", "0:p:1:v:0", ""},
+		{"hls master: variant audio of another aac profile stays 0:a:0", `{"programs":[
+			{"program_id":0,"tags":{"variant_bitrate":"100"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"}]},
+			{"program_id":1,"tags":{"variant_bitrate":"900"},"streams":[{"index":2,"codec_type":"video","codec_name":"h264"},{"index":3,"codec_type":"audio","codec_name":"aac"}]}],
+			"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac","profile":"LC"},
+			{"index":2,"codec_type":"video","codec_name":"h264"},{"index":3,"codec_type":"audio","codec_name":"aac","profile":"HE-AAC"}]}`, "copy", "0:p:1:v:0", ""},
+		{"hls master: first variant is the highest", `{"programs":[
+			{"program_id":0,"tags":{"variant_bitrate":"900"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"}]},
+			{"program_id":1,"tags":{"variant_bitrate":"100"},"streams":[{"index":2,"codec_type":"video","codec_name":"h264"},{"index":3,"codec_type":"audio","codec_name":"aac"}]}],
+			"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"},
+			{"index":2,"codec_type":"video","codec_name":"h264"},{"index":3,"codec_type":"audio","codec_name":"aac"}]}`, "copy", "0:p:0:v:0", ""},
 		{"audio only", `{"programs":[{"program_id":0,"tags":{"variant_bitrate":"64000"},"streams":[{"index":0,"codec_type":"audio"}]}],
-			"streams":[{"index":0,"codec_type":"audio","codec_name":"aac"}]}`, "none", ""},
+			"streams":[{"index":0,"codec_type":"audio","codec_name":"aac"}]}`, "none", "", ""},
 		{"no programs, hevc", `{"streams":[{"index":0,"codec_type":"audio","codec_name":"aac"},{"index":1,"codec_type":"video","codec_name":"hevc"}]}`,
-			"copy", "0:v:0"},
+			"copy", "0:v:0", ""},
 		{"single program mpegts, mpeg2 needs x264", `{"programs":[{"program_id":1,"streams":[{"index":0,"codec_type":"video"},{"index":1,"codec_type":"audio"}]}],
-			"streams":[{"index":0,"codec_type":"video","codec_name":"mpeg2video"},{"index":1,"codec_type":"audio","codec_name":"mp2"}]}`, "x264", "0:v:0"},
+			"streams":[{"index":0,"codec_type":"video","codec_name":"mpeg2video"},{"index":1,"codec_type":"audio","codec_name":"mp2"}]}`, "x264", "0:v:0", ""},
 		{"cover art is not video", `{"streams":[{"index":0,"codec_type":"audio","codec_name":"mp3"},
-			{"index":1,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}}]}`, "none", ""},
+			{"index":1,"codec_type":"video","codec_name":"mjpeg","disposition":{"attached_pic":1}}]}`, "none", "", ""},
 		{"tie: first listed program", `{"programs":[
 			{"program_id":7,"tags":{"variant_bitrate":"500"},"streams":[{"index":0,"codec_type":"video"}]},
 			{"program_id":3,"tags":{"variant_bitrate":"500"},"streams":[{"index":1,"codec_type":"video"}]}],
-			"streams":[{"index":0,"codec_type":"video","codec_name":"vp9"},{"index":1,"codec_type":"video","codec_name":"h264"}]}`, "x264", "0:p:7:v:0"},
+			"streams":[{"index":0,"codec_type":"video","codec_name":"vp9"},{"index":1,"codec_type":"video","codec_name":"h264"}]}`, "x264", "0:p:7:v:0", ""},
 	}
 	for _, tc := range cases {
 		var r probeResult
 		if err := json.Unmarshal([]byte(tc.json), &r); err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
-		source, vmap := decideVideo(&r)
-		if source != tc.source || vmap != tc.vmap {
-			t.Errorf("%s: got (%q, %q), want (%q, %q)", tc.name, source, vmap, tc.source, tc.vmap)
+		source, vmap, amap := decideVideo(&r)
+		if source != tc.source || vmap != tc.vmap || amap != tc.amap {
+			t.Errorf("%s: got (%q, %q, %q), want (%q, %q, %q)", tc.name, source, vmap, amap, tc.source, tc.vmap, tc.amap)
 		}
 	}
 	var r probeResult
@@ -479,17 +504,45 @@ func TestSessionVideoHelpers(t *testing.T) {
 
 	// Coalescing the two oldest runs keeps their TS files, in order.
 	s.Runs = make([]Run, maxRuns)
-	s.Runs[0].VideoFiles = []string{"x.v0001.ts"}
-	s.Runs[1].VideoFiles = []string{"x.v0002.ts"}
+	for i := range s.Runs {
+		s.Runs[i].VideoFiles = []string{fmt.Sprintf("x.v%04d.ts", i+1)}
+	}
 	s.appendRun(Run{VideoFiles: []string{"x.v2001.ts"}})
 	if got := s.Runs[0].VideoFiles; !slices.Equal(got, []string{"x.v0001.ts", "x.v0002.ts"}) {
 		t.Errorf("coalesced VideoFiles = %q", got)
 	}
 
-	// A source change forgets the video decision along with the codec.
+	// A run with TS files is never merged with one without (the .mp4 would
+	// lose the latter's audio): the oldest compatible pair is merged instead.
+	s.Runs = make([]Run, maxRuns)
+	for i := range s.Runs {
+		s.Runs[i].Bytes = int64(i + 1)
+	}
+	s.Runs[0].VideoFiles = []string{"x.v0001.ts"} // run 0 video, run 1 none, runs 1+2 none
+	s.appendRun(Run{Bytes: 9999})
+	if len(s.Runs) != maxRuns || !slices.Equal(s.Runs[0].VideoFiles, []string{"x.v0001.ts"}) || s.Runs[0].Bytes != 1 ||
+		s.Runs[1].Bytes != 2+3 || s.Runs[1].VideoFiles != nil {
+		t.Errorf("mixed coalesce: runs[0]=%+v runs[1]=%+v", s.Runs[0], s.Runs[1])
+	}
+	// Strictly alternating: the oldest pair is merged without its TS files
+	// (black for that stretch, audio and sync intact).
+	for i := range s.Runs {
+		s.Runs[i] = Run{Bytes: 1}
+		if i%2 == 0 {
+			s.Runs[i].VideoFiles = []string{fmt.Sprintf("x.v%04d.ts", i+1)}
+		}
+	}
+	s.appendRun(Run{Bytes: 1})
+	if s.Runs[0].Bytes != 2 || s.Runs[0].VideoFiles != nil || len(s.Runs[1].VideoFiles) != 1 {
+		t.Errorf("alternating coalesce: runs[0]=%+v runs[1]=%+v", s.Runs[0], s.Runs[1])
+	}
+
+	// A source change forgets the video decision along with the codec, and
+	// why video was turned off for the old source.
+	s.VideoAudioMap, s.VideoCaptureError = "0:p:1:a:0", "boom"
 	s.applyItem(schedule.Item{Source: "http://b"})
-	if s.VideoSource != "" || s.VideoMap != "" {
-		t.Errorf("source change kept the video decision: %q %q", s.VideoSource, s.VideoMap)
+	if s.VideoSource != "" || s.VideoMap != "" || s.VideoAudioMap != "" || s.VideoCaptureError != "" {
+		t.Errorf("source change kept the video decision: %q %q %q %q", s.VideoSource, s.VideoMap, s.VideoAudioMap, s.VideoCaptureError)
 	}
 
 	// removeVideoFiles also finds TS files no run lists (a run without audio).
@@ -592,11 +645,11 @@ func TestVideoCaptureMultiVariantHLS(t *testing.T) {
 	var mp mediaProbe
 	ctx := context.Background()
 	codec := m.resolveCodec(ctx, ar, &snap, &mp)
-	source, vmap := m.resolveVideo(ctx, ar, &snap, &mp)
-	if codec != "copy" || source != "copy" || vmap != "0:p:1:v:0" {
-		t.Fatalf("resolved codec=%q video=%q map=%q, want copy/copy/0:p:1:v:0", codec, source, vmap)
+	source, vmap, amap := m.resolveVideo(ctx, ar, &snap, &mp)
+	if codec != "copy" || source != "copy" || vmap != "0:p:1:v:0" || amap != "0:p:1:a:0" {
+		t.Fatalf("resolved codec=%q video=%q map=%q amap=%q, want copy/copy/0:p:1:v:0/0:p:1:a:0", codec, source, vmap, amap)
 	}
-	if s.ResolvedCodec != "copy" || s.VideoSource != "copy" || s.VideoMap != "0:p:1:v:0" {
+	if s.ResolvedCodec != "copy" || s.VideoSource != "copy" || s.VideoMap != "0:p:1:v:0" || s.VideoAudioMap != "0:p:1:a:0" {
 		t.Fatalf("decision not persisted on the session: %+v", s)
 	}
 	if gets := resetGets(); gets["/master.m3u8"] != 1 {
@@ -616,14 +669,16 @@ func TestVideoCaptureMultiVariantHLS(t *testing.T) {
 	audioOnly := run(m.captureArgs(s, codec, false, false, videoPlan{}))
 	resetGets()
 	ts := filepath.Join(dir, s.videoFileName(1))
-	withVideo := run(m.captureArgs(s, codec, false, false, videoPlan{source: source, vmap: vmap, path: ts}))
+	withVideo := run(m.captureArgs(s, codec, false, false, videoPlan{source: source, vmap: vmap, amap: amap, path: ts}))
 	fetched := resetGets()
 	if len(audioOnly) == 0 || !bytes.Equal(audioOnly, withVideo) {
 		t.Errorf("ADTS output differs with the video output (%d vs %d bytes)", len(audioOnly), len(withVideo))
 	}
 	// Segments: v2 (first listed: the audio of -map 0:a:0) and v0 (the video
-	// variant) entirely; v1 only what stream probing reads before ffmpeg
-	// discards the unused variant (its first one or two segments).
+	// variant, picture and its own audio) entirely; v1 only what stream
+	// probing reads before ffmpeg discards the unused variant (its first one or
+	// two segments). The ADTS output's 0:a:0 keeps v2 in: two variants are
+	// downloaded (documented; the ADTS bytes must not depend on RECORD_VIDEO).
 	count := func(prefix string) (n int) {
 		for p, c := range fetched {
 			if strings.HasPrefix(p, prefix) && strings.HasSuffix(p, ".ts") {
@@ -677,8 +732,40 @@ func TestVideoProbeAudioOnlySource(t *testing.T) {
 	s := &Session{ID: "a", SessionID: "a_1", Source: srv.URL + "/a.m3u8", Codec: "auto", Video: true, dir: dir}
 	snap := *s
 	var mp mediaProbe
-	source, vmap := m.resolveVideo(context.Background(), &activeRecording{s: s}, &snap, &mp)
+	source, vmap, _ := m.resolveVideo(context.Background(), &activeRecording{s: s}, &snap, &mp)
 	if source != "none" || vmap != "" || s.VideoSource != "none" {
 		t.Fatalf("audio-only source: got (%q, %q), session %q", source, vmap, s.VideoSource)
+	}
+}
+
+// TestStderrVideoErrorLine: only error-level lines of the current run that
+// carry a marker of the video output (output #1) are its evidence; the ADTS
+// output's (#0) and the input's lines are not, nor is a warning.
+func TestStderrVideoErrorLine(t *testing.T) {
+	b := newStderrBuffer("off", nil)
+	b.resetRun(videoOutputMarkers(videoPlan{source: "x264", vmap: "0:v:0", path: "/d/s.v0001.ts"})...)
+	for _, l := range []string{
+		"[in#0/hls @ 0x1] [error] Error during demuxing: Server returned 500",
+		"[aost#0:0/copy @ 0x1] [error] Error submitting a packet to the muxer",
+		"[fatal] Stream map '' matches no streams.",
+		"[vost#1:0/libx264 @ 0x1] [warning] something harmless",
+	} {
+		_, _ = b.Write([]byte(l + "\n"))
+	}
+	if got := b.VideoErrorLine(); got != "" {
+		t.Fatalf("VideoErrorLine = %q, want none", got)
+	}
+	_, _ = b.Write([]byte("[vost#1:0/libx264 @ 0x1] [enc:libx264 @ 0x2] [error] Error while opening encoder\n"))
+	_, _ = b.Write([]byte("[out#1/mpegts @ 0x3] [error] Nothing was written into output file\n"))
+	if got := b.VideoErrorLine(); !strings.Contains(got, "Error while opening encoder") {
+		t.Fatalf("VideoErrorLine = %q, want the first video output error", got)
+	}
+	b.resetRun()
+	_, _ = b.Write([]byte("[out#1/mpegts @ 0x3] [error] boom\n"))
+	if got := b.VideoErrorLine(); got != "" {
+		t.Fatalf("a run without a video output has no video evidence: %q", got)
+	}
+	if looksLikeCopyRejection([]string{"[out#1/mpegts @ 0x3] could not write header"}) {
+		t.Fatal("a video output line must not count as an ADTS copy rejection")
 	}
 }

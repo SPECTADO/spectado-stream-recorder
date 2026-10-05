@@ -239,6 +239,57 @@ func (s *S3) Upload(ctx context.Context, path, key, contentType string, metadata
 	return etag, nil
 }
 
+// Overwrite stores the file under key UNCONDITIONALLY (no If-Match, no
+// If-None-Match), replacing whatever is there, and verifies the stored size
+// like Upload. The recorder uses it only for the .mp4 video companion: a
+// derived object whose consistency is checked through its sessions manifest,
+// never for the audio (see recorder.Overwriter, ADR 0002).
+func (s *S3) Overwrite(ctx context.Context, path, key, contentType string, metadata map[string]string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	size := st.Size()
+	if size == 0 {
+		return "", &recorder.PermanentError{Err: errors.New("refusing to upload an empty file")}
+	}
+	in := &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(key),
+		Body:          f,
+		ContentType:   aws.String(contentType),
+		ContentLength: aws.Int64(size),
+		Metadata:      SanitizeMetadata(metadata),
+	}
+	if s.checksum != "" {
+		in.ChecksumAlgorithm = s.checksum
+	}
+	out, err := s.uploader.Upload(ctx, in)
+	if err != nil {
+		if ctx.Err() != nil {
+			s.abortIfMultipart(err, key)
+		}
+		return "", classify(err)
+	}
+	remote, err := s.headSize(ctx, key)
+	if err != nil {
+		return "", classify(fmt.Errorf("verify upload (head): %w", err))
+	}
+	if remote != size {
+		return "", fmt.Errorf("verify upload: remote size %d != local size %d", remote, size)
+	}
+	etag := ""
+	if out != nil {
+		etag = strings.Trim(aws.ToString(out.ETag), `"`)
+	}
+	return etag, nil
+}
+
 // Head reports size, ETag and user metadata of the object under key. found is
 // false when there is no such object; everything else is classified. The
 // upload path reads the manifest (recording-id, sessions, parts) from the
