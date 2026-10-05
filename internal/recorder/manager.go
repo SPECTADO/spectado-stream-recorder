@@ -126,6 +126,7 @@ type Manager struct {
 	skipLogged    map[string]time.Time
 	loggedInvalid map[string]struct{}
 	remuxFailures map[string]int       // object key -> consecutive remux failures
+	videoFailures map[string]int       // object key -> consecutive .mp4 companion build failures
 	nospaceLogged map[string]time.Time // object key -> last "no disk" warning
 	warnedSafeID  map[string]struct{}  // recording ids whose object name differs
 	warnedKeys    map[string]struct{}  // explicit schedule keys already explained
@@ -163,6 +164,7 @@ func NewManager(cfg *config.Config, log *slog.Logger, met *metrics.Metrics, up U
 		skipLogged:    map[string]time.Time{},
 		loggedInvalid: map[string]struct{}{},
 		remuxFailures: map[string]int{},
+		videoFailures: map[string]int{},
 		nospaceLogged: map[string]time.Time{},
 		warnedSafeID:  map[string]struct{}{},
 		warnedKeys:    map[string]struct{}{},
@@ -576,6 +578,7 @@ func (m *Manager) startSessionLocked(it schedule.Item, now time.Time) error {
 		SessionStart: now,
 		State:        StateRecording,
 		Codec:        "auto",
+		Video:        m.cfg.RecordVideo, // pinned for the session's lifetime
 		dir:          filepath.Join(m.root, safe),
 	}
 	s.applyItem(it)
@@ -587,6 +590,20 @@ func (m *Manager) startSessionLocked(it schedule.Item, now time.Time) error {
 			if other.ID == it.ID && other.Source == it.Source && other.ResolvedCodec != "" && other.SessionStart.After(latest) {
 				latest = other.SessionStart
 				s.ResolvedCodec = other.ResolvedCodec
+			}
+		}
+	}
+	// Same for the video decision (one probe answers both). A decision that
+	// came from turning video off after capture failures is not passed on: the
+	// next session tries the source's video again.
+	if s.Video {
+		var latest time.Time
+		for _, other := range m.sessions {
+			if other.ID == it.ID && other.Source == it.Source && other.Video && other.VideoSource != "" &&
+				other.VideoCaptureError == "" && other.SessionStart.After(latest) {
+				latest = other.SessionStart
+				s.VideoSource = other.VideoSource
+				s.VideoMap = other.VideoMap
 			}
 		}
 	}
@@ -813,8 +830,9 @@ func (m *Manager) migrateKeyLocked(s *Session) {
 		"oldKey", old, "newKey", s.Key)
 }
 
-// warnOrphans logs audio files that have no sidecar (nothing is deleted). A
-// kept .m4a next to its .json is not an orphan, so both extensions count.
+// warnOrphans logs recording files that have no sidecar (nothing is deleted).
+// A kept .m4a/.mp4 next to its .json is not an orphan, and a video companion
+// TS file (<session>.vNNNN.ts) belongs to <session>.json.
 func (m *Manager) warnOrphans() {
 	entries, err := os.ReadDir(m.root)
 	if err != nil {
@@ -831,10 +849,17 @@ func (m *Manager) warnOrphans() {
 		for _, f := range files {
 			name := f.Name()
 			ext := filepath.Ext(name)
-			if ext != ".aac" && ext != objectExt {
+			base := strings.TrimSuffix(name, ext)
+			switch ext {
+			case ".aac", objectExt, ".mp4":
+			case ".ts":
+				if i := strings.LastIndex(base, ".v"); i > 0 {
+					base = base[:i]
+				}
+			default:
 				continue
 			}
-			sidecar := filepath.Join(m.root, e.Name(), strings.TrimSuffix(name, ext)+".json")
+			sidecar := filepath.Join(m.root, e.Name(), base+".json")
 			if _, err := os.Stat(sidecar); err != nil {
 				m.log.Warn("orphan recording without metadata (left untouched)", "file", filepath.Join(m.root, e.Name(), name))
 			}
@@ -988,12 +1013,16 @@ func (m *Manager) retention() {
 				// throw metadata away while data is on disk.
 				continue
 			}
+			// Video TS files are only an input of the .mp4 companion: once the
+			// audio is stored they are leftovers, never data to keep.
+			s.removeVideoFiles()
 			_ = os.Remove(s.SidecarPath())
 		case StateFailed:
 			if st, err := os.Stat(s.FilePath()); err == nil && st.Size() == 0 {
 				_ = os.Remove(s.FilePath())
 			}
 			if _, err := os.Stat(s.FilePath()); errors.Is(err, os.ErrNotExist) {
+				s.removeVideoFiles()
 				_ = os.Remove(s.SidecarPath())
 			} else {
 				continue // keep metadata next to a non-empty failed file
@@ -1106,6 +1135,13 @@ type RecordingView struct {
 	OutputFile       string     `json:"outputFile,omitempty"` // kept mode: the local .m4a
 	RemuxFailures    int        `json:"remuxFailures,omitempty"`
 	Transcoded       bool       `json:"transcoded,omitempty"` // the object had to be re-encoded
+	// Video companion (RECORD_VIDEO): see Session for the meaning.
+	Video             bool   `json:"video,omitempty"`
+	VideoSource       string `json:"videoSource,omitempty"`
+	VideoCaptureError string `json:"videoCaptureError,omitempty"`
+	VideoUploaded     bool   `json:"videoUploaded,omitempty"`
+	VideoError        string `json:"videoError,omitempty"`
+	OutputVideoFile   string `json:"outputVideoFile,omitempty"` // kept mode: the local .mp4
 }
 
 // UploadStats summarises upload queue state.
@@ -1135,6 +1171,8 @@ func (m *Manager) Recordings() []RecordingView {
 			UploadAttempts:  s.UploadAttempts, UploadBlocked: s.UploadBlocked, UploadedAt: s.UploadedAt,
 			NextUploadAt: s.NextUploadAt, File: s.FilePath(), OutputFile: s.OutputFile,
 			RemuxFailures: s.RemuxFailures, Transcoded: s.Transcoded,
+			Video: s.Video, VideoSource: s.VideoSource, VideoCaptureError: redactLine(s.VideoCaptureError),
+			VideoUploaded: s.VideoUploaded, VideoError: redactLine(s.VideoError), OutputVideoFile: s.OutputVideoFile,
 		}
 		// exits[] and runs[] are shown for ALL states so finished/uploaded items
 		// still reveal why they restarted and where each run's clock sits; copy

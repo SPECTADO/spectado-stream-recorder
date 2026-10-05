@@ -362,8 +362,19 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 		}
 	}
 
+	// The .mp4 companion (RECORD_VIDEO): its key is classified like the .m4a's
+	// before anything is built, so a foreign object there moves the group now.
+	var vt *videoTarget
+	if groupHasVideo(group) {
+		if vt, err = m.headVideo(ctx, key, s.ID, group, remote, log); err != nil {
+			return err
+		}
+	}
+
 	// 4. Disk preflight: the .m4a plus, when merging, the downloaded object and
-	//    its extraction have to fit next to the captures.
+	//    its extraction have to fit next to the captures. The .mp4 needs its
+	//    TS inputs again (plus the ADTS for black or audio-only pieces), and a
+	//    reused stored .mp4 is downloaded, extracted and rebuilt.
 	var localBytes int64
 	for _, mem := range toAdd {
 		localBytes += mem.size
@@ -371,6 +382,12 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 	need := localBytes*12/10 + m.cfg.MinFreeDiskBytes
 	if merging {
 		need += 3 * remote.size
+	}
+	if vt != nil {
+		need += videoBytes(toAdd)*12/10 + localBytes
+		if merging && vt.inSync {
+			need += 3 * vt.size
+		}
 	}
 	if err := m.checkDiskFor(key, need, log); err != nil {
 		return err
@@ -411,7 +428,23 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 		return m.uploadFallback(ctx, group, toAdd, present, key, dir, tmpID, remote, sum, tmps, log)
 	}
 
-	// 6. Store it: a new object is written conditionally (never overwrite), a
+	// 6. The .mp4 companion goes first: once the .m4a lists a session, no later
+	//    attempt rebuilds anything for it. A build that keeps failing is given
+	//    up on (the audio is stored without it); a transfer error retries.
+	var vdone completion
+	if vt != nil {
+		var remotePart *buildPart
+		if merging {
+			remotePart = &parts[0]
+		}
+		stored, verr, err := m.uploadVideo(ctx, vt, key, toAdd, remotePart, out, transcoded, sum, meta, dir, tmpID, tmps, log)
+		if err != nil {
+			return err
+		}
+		vdone.video, vdone.videoErr = stored, verr
+	}
+
+	// 7. Store it: a new object is written conditionally (never overwrite), a
 	//    merge replaces exactly the object the HEAD saw.
 	replaceETag := ""
 	if merging {
@@ -434,10 +467,10 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 		m.met.UploadMergesTotal.Inc()
 	}
 
-	// 7. Both the sessions that were already in the object and the ones this
+	// 8. Both the sessions that were already in the object and the ones this
 	//    attempt added are done.
 	return m.completeGroup(append(toAdd, present...), key, etag,
-		completion{transcoded: transcoded, duration: res.Duration}, log)
+		completion{transcoded: transcoded, duration: res.Duration, video: vdone.video, videoErr: vdone.videoErr}, log)
 }
 
 // claimGroup collects every session that belongs in the object under key — same
@@ -814,14 +847,7 @@ func (m *Manager) build(ctx context.Context, parts []buildPart, out, tmpID strin
 	if err != nil {
 		return remux.Result{}, false, err
 	}
-	bitrate := m.cfg.AudioBitrate
-	if len(toAdd) > 0 {
-		m.mu.Lock()
-		if b := toAdd[len(toAdd)-1].s.Bitrate; b != "" {
-			bitrate = b
-		}
-		m.mu.Unlock()
-	}
+	bitrate := m.transcodeBitrate(toAdd)
 	res, err := m.remuxer().BuildTranscode(ctx, chunks, out, duration, bitrate, meta)
 	if err != nil {
 		return remux.Result{}, false, err
@@ -832,6 +858,20 @@ func (m *Manager) build(ctx context.Context, parts []buildPart, out, tmpID strin
 	log.Info("remuxed recording (re-encoded)", "duration", res.Duration.Truncate(time.Millisecond).String(),
 		"bytes", res.Size, "bitrate", bitrate, "took", time.Since(started).Truncate(time.Millisecond).String())
 	return res, true, nil
+}
+
+// transcodeBitrate is the AAC bitrate of a re-encode: the newest session's
+// (per item), else the configured default.
+func (m *Manager) transcodeBitrate(toAdd []*uploadMember) string {
+	bitrate := m.cfg.AudioBitrate
+	if len(toAdd) > 0 {
+		m.mu.Lock()
+		if b := toAdd[len(toAdd)-1].s.Bitrate; b != "" {
+			bitrate = b
+		}
+		m.mu.Unlock()
+	}
+	return bitrate
 }
 
 // writeChunks materialises every homogeneous byte range of every part as its
@@ -915,6 +955,7 @@ func (m *Manager) forgetKey(key string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.remuxFailures, key)
+	delete(m.videoFailures, key)
 	delete(m.nospaceLogged, key)
 }
 
@@ -941,6 +982,13 @@ func (m *Manager) uploadFallback(ctx context.Context, group []*Session, toAdd, p
 	if remote != nil {
 		log.Error("cannot store the raw capture next to an existing object; using a new key")
 		return m.renameGroup(group, "remux-failed", log)
+	}
+	// No .mp4 without an .m4a to build it from: the TS files go with the
+	// sessions, and the sidecars say why there is no video.
+	done := completion{}
+	if groupHasVideo(group) {
+		done.videoErr = "no video companion: the audio was stored as raw ADTS after repeated remux failures"
+		log.Error("dropping the video companion: storing the raw audio capture instead")
 	}
 	paths := make([]string, len(toAdd))
 	var frames int
@@ -975,7 +1023,8 @@ func (m *Manager) uploadFallback(ctx context.Context, group []*Session, toAdd, p
 		// died before its sidecars said so. Converge instead of re-uploading.
 		log.Warn("the raw capture is already stored under the fallback key; completing without uploading", "key", fbKey)
 		m.forgetKey(key)
-		return m.completeGroup(append(toAdd, present...), fbKey, info.ETag, completion{duration: duration}, log)
+		done.duration = duration
+		return m.completeGroup(append(toAdd, present...), fbKey, info.ETag, done, log)
 	}
 
 	out := filepath.Join(dir, ".tmp-upload-"+tmpID+".aac")
@@ -1003,7 +1052,8 @@ func (m *Manager) uploadFallback(ctx context.Context, group []*Session, toAdd, p
 	// The .m4a key is not used by this recording any more; its failure count
 	// must not greet the next recording that computes the same key.
 	m.forgetKey(key)
-	return m.completeGroup(append(toAdd, present...), fbKey, etag, completion{duration: duration}, log)
+	done.duration = duration
+	return m.completeGroup(append(toAdd, present...), fbKey, etag, done, log)
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,10 +1097,12 @@ func (m *Manager) putObject(ctx context.Context, path, key, contentType string, 
 type completion struct {
 	transcoded bool
 	duration   time.Duration
+	video      bool   // the .mp4 companion was stored with these sessions
+	videoErr   string // ... or why it was not (Session.VideoError)
 }
 
 // completeGroup marks every session of the object uploaded and removes its
-// capture. Order matters: the sidecars are fsynced first and a file is only
+// capture (and its video TS files). Order matters: the sidecars are fsynced first and a file is only
 // deleted once its own sidecar durably says "uploaded", so a crash in the
 // middle can only cost a re-verified upload, never the audio.
 func (m *Manager) completeGroup(members []*uploadMember, key, etag string, c completion, log *slog.Logger) error {
@@ -1078,6 +1130,15 @@ func (m *Manager) completeGroup(members []*uploadMember, key, etag string, c com
 		if c.transcoded {
 			s.Transcoded = true
 		}
+		if s.Video {
+			switch {
+			case c.video:
+				s.VideoUploaded = true
+				s.VideoError = ""
+			case c.videoErr != "":
+				s.VideoError = c.videoErr
+			}
+		}
 		data, err := s.encode()
 		if err != nil {
 			m.mu.Unlock()
@@ -1101,6 +1162,11 @@ func (m *Manager) completeGroup(members []*uploadMember, key, etag string, c com
 		if err := os.Remove(w.mem.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			log.Warn("remove uploaded capture (retried on next start)", "file", w.mem.path, "error", err)
 		}
+		// The TS files only ever fed the .mp4; once the session is stored (with
+		// or without its video) they are leftovers.
+		m.mu.Lock()
+		w.mem.s.removeVideoFiles()
+		m.mu.Unlock()
 	}
 	if failed != nil {
 		return failed
@@ -1143,13 +1209,396 @@ func (m *Manager) renameGroup(group []*Session, reason string, log *slog.Logger)
 }
 
 // ---------------------------------------------------------------------------
+// video companion (RECORD_VIDEO)
+// ---------------------------------------------------------------------------
+
+const (
+	// videoContentType is what the .mp4 companion is stored as.
+	videoContentType = "video/mp4"
+
+	// Values of the video-kind object metadata and the kind metric label.
+	videoKindBlack     = "black"     // no captured picture at all: 16x16 black over the .m4a's audio
+	videoKindCopy      = "copy"      // every piece is a captured TS with the same parameters
+	videoKindTranscode = "transcode" // mixed pieces: re-encoded to H.264 through the concat filter
+)
+
+// VideoRemuxer is the video half of *remux.Remuxer. It is a separate interface
+// (asserted on the installed Remuxer) so the audio-only fakes keep working;
+// a remuxer without it simply cannot build the companion.
+type VideoRemuxer interface {
+	ProbeVideo(ctx context.Context, path string) (remux.VideoInfo, error)
+	BuildBlackVideo(ctx context.Context, audioM4A, out string, meta remux.Metadata) (remux.Result, error)
+	BuildVideoConcat(ctx context.Context, tsFiles []string, out string, meta remux.Metadata) (remux.Result, error)
+	ExtractVideoTS(ctx context.Context, mp4In, tsOut string) error
+	BuildVideoTranscode(ctx context.Context, segs []remux.VideoSegment, out string, w, h int, fps float64, bitrate string, meta remux.Metadata) (remux.Result, error)
+}
+
+func (m *Manager) videoRemuxer() (VideoRemuxer, error) {
+	if vr, ok := m.remuxer().(VideoRemuxer); ok {
+		return vr, nil
+	}
+	return nil, errors.New("the installed remuxer cannot build video")
+}
+
+// videoBuildError is a failure of the .mp4 itself (probe, ffmpeg,
+// verification) as opposed to a transfer: only these count toward giving up
+// on the companion.
+type videoBuildError struct{ err error }
+
+func (e *videoBuildError) Error() string { return "video: " + e.err.Error() }
+func (e *videoBuildError) Unwrap() error { return e.err }
+
+// groupHasVideo reports whether any session of the group was created with the
+// video companion on (Session.Video is pinned at creation, never written
+// again, so it is read without the lock).
+func groupHasVideo(group []*Session) bool {
+	for _, o := range group {
+		if o.Video {
+			return true
+		}
+	}
+	return false
+}
+
+// videoBytes is the size of the TS files the new sessions captured.
+func videoBytes(toAdd []*uploadMember) int64 {
+	var n int64
+	for _, mem := range toAdd {
+		for _, p := range mem.s.VideoFilesAll() {
+			if st, err := os.Stat(p); err == nil {
+				n += st.Size()
+			}
+		}
+	}
+	return n
+}
+
+// videoTarget is what the HEAD of the companion key found.
+type videoTarget struct {
+	key    string
+	etag   string // the object to replace; "" = none there (create-only put)
+	size   int64
+	inSync bool // a real (captured) picture of exactly the parts the stored .m4a holds
+}
+
+// headVideo classifies the companion key like the .m4a's: an object there that
+// is not this recording's is a conflict (the group moves to a new key, both
+// objects with it). One of ours is reused as the stored part's picture only
+// when its manifest equals the stored .m4a's and it is not the black
+// placeholder; anything else is rebuilt from the stored audio and replaced.
+func (m *Manager) headVideo(ctx context.Context, key, recordingID string, group []*Session, remote *remoteObject,
+	log *slog.Logger,
+) (*videoTarget, error) {
+	vkey := videoKey(key)
+	hctx, cancel := context.WithTimeout(ctx, headTimeout)
+	info, found, err := m.up.Head(hctx, vkey)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("head %s: %w", vkey, err)
+	}
+	vt := &videoTarget{key: vkey}
+	if !found {
+		return vt, nil
+	}
+	if id := strings.TrimSpace(info.Metadata["recording-id"]); id != recordingID {
+		log.Error("object under the video key belongs to a different recording or was not written by this recorder",
+			"videoKey", vkey, "remoteId", id)
+		return nil, m.renameGroup(group, "conflict", log)
+	}
+	vt.etag, vt.size = info.ETag, info.Size
+	if remote != nil && strings.TrimSpace(info.Metadata["synthetic-video"]) == "false" {
+		ours := digestList(info.Metadata["sessions"])
+		vt.inSync = ours != "" && ours == strings.Join(remote.sessions, ",")
+	}
+	return vt, nil
+}
+
+// digestList normalises a `sessions` manifest value for comparison.
+func digestList(v string) string {
+	var out []string
+	for _, d := range strings.Split(v, ",") {
+		if d = strings.TrimSpace(d); d != "" {
+			out = append(out, d)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+// uploadVideo builds and stores the companion of the .m4a built at audioM4A.
+// It returns stored=true once the .mp4 is in the bucket; a build that failed
+// maxRemuxFailures times in a row returns stored=false and the reason, and the
+// caller stores the .m4a without it. Any other error retries the attempt.
+func (m *Manager) uploadVideo(ctx context.Context, vt *videoTarget, key string, toAdd []*uploadMember,
+	remotePart *buildPart, audioM4A string, transcoded bool, sum objectSummary, meta remux.Metadata,
+	dir, tmpID string, tmps *tempFiles, log *slog.Logger,
+) (stored bool, videoErr string, err error) {
+	out := filepath.Join(dir, ".tmp-upload-"+tmpID+".mp4")
+	tmps.add(out)
+	kind, res, err := m.buildVideoCompanion(ctx, vt, toAdd, remotePart, audioM4A, out, meta, dir, tmpID, tmps, log)
+	var vbe *videoBuildError
+	switch {
+	case errors.As(err, &vbe):
+		if ctx.Err() != nil {
+			// Shutdown, not a broken recording.
+			return false, "", ctx.Err()
+		}
+		failures := m.noteVideoFailure(key)
+		log.Error("video companion build failed", "error", vbe.err, "consecutiveFailures", failures)
+		if failures < maxRemuxFailures {
+			return false, "", err
+		}
+		log.Error("giving up on the video companion after repeated build failures; storing the audio without it",
+			"videoKey", vt.key, "failures", failures)
+		return false, "video build failed: " + vbe.err.Error(), nil
+	case err != nil:
+		return false, "", err
+	}
+
+	objMeta := m.objectMetadata(sum, objectFacts{
+		duration:   res.Duration,
+		frames:     res.Frames,
+		codec:      res.Codec,
+		profile:    res.Profile,
+		sampleRate: res.SampleRate,
+		channels:   res.Channels,
+		transcoded: transcoded || kind == videoKindTranscode,
+		video:      true,
+		videoKind:  kind,
+		videoCodec: res.Video.VideoCodec,
+		width:      res.Video.Width,
+		height:     res.Video.Height,
+	})
+	// Replacing exactly the companion the HEAD saw (or creating it): a racing
+	// writer makes the attempt look again instead of being overwritten.
+	if _, err := m.putObject(ctx, out, vt.key, videoContentType, objMeta, vt.etag, res.Size, log); err != nil {
+		return false, "", err
+	}
+	return true, "", nil
+}
+
+// buildVideoCompanion lays out the companion's timeline — the stored part
+// first (its own picture when that is reusable, else its audio), then the new
+// sessions — and builds it into out. Failures of the build itself come back
+// as *videoBuildError; a failed download of the stored .mp4 does not.
+func (m *Manager) buildVideoCompanion(ctx context.Context, vt *videoTarget, toAdd []*uploadMember,
+	remotePart *buildPart, audioM4A, out string, meta remux.Metadata, dir, tmpID string, tmps *tempFiles,
+	log *slog.Logger,
+) (string, remux.Result, error) {
+	vr, err := m.videoRemuxer()
+	if err != nil {
+		return "", remux.Result{}, &videoBuildError{err}
+	}
+	var remoteSeg *remux.VideoSegment
+	if remotePart != nil {
+		remoteSeg = &remux.VideoSegment{Audio: remotePart.path, Duration: remotePart.info.Duration}
+		if vt.inSync {
+			mp4 := filepath.Join(dir, ".tmp-remote-"+tmpID+".mp4")
+			ts := filepath.Join(dir, ".tmp-remote-"+tmpID+".ts")
+			tmps.add(mp4, ts)
+			dctx, cancel := context.WithTimeout(ctx, m.transferDeadline(vt.size))
+			err := m.up.Download(dctx, vt.key, vt.etag, mp4)
+			cancel()
+			if err != nil {
+				return "", remux.Result{}, err
+			}
+			if err := vr.ExtractVideoTS(ctx, mp4, ts); err != nil {
+				return "", remux.Result{}, &videoBuildError{fmt.Errorf("extract stored video: %w", err)}
+			}
+			_ = os.Remove(mp4) // only the extraction is needed from here on
+			remoteSeg = &remux.VideoSegment{TS: ts}
+			log.Info("merging into the stored video companion", "videoKey", vt.key, "remoteBytes", vt.size)
+		}
+	}
+	segs, err := m.videoSegments(toAdd, remoteSeg, dir, tmpID, tmps)
+	if err != nil {
+		return "", remux.Result{}, &videoBuildError{err}
+	}
+	return m.buildVideo(ctx, vr, segs, audioM4A, out, m.transcodeBitrate(toAdd), meta, log)
+}
+
+// videoSegments is the companion's timeline in playback order: remote (if
+// any), then per new session either its whole capture as audio (no video
+// captured at all, or a session without Video) or, run by run, the run's TS
+// files or — for a run that has none — its ADTS byte range cut into a
+// temporary file.
+func (m *Manager) videoSegments(toAdd []*uploadMember, remote *remux.VideoSegment, dir, tmpID string,
+	tmps *tempFiles,
+) ([]remux.VideoSegment, error) {
+	var segs []remux.VideoSegment
+	if remote != nil {
+		segs = append(segs, *remote)
+	}
+	n := 0
+	for _, mem := range toAdd {
+		m.mu.Lock()
+		runs := append([]Run(nil), mem.s.Runs...)
+		m.mu.Unlock()
+
+		ts := make([][]string, len(runs))
+		anyTS := false
+		if mem.s.Video {
+			for i, r := range runs {
+				for _, name := range r.VideoFiles {
+					p := mem.s.VideoPath(name)
+					if st, err := os.Stat(p); err == nil && st.Size() > 0 {
+						ts[i] = append(ts[i], p)
+						anyTS = true
+					}
+				}
+			}
+		}
+		if !anyTS {
+			segs = append(segs, remux.VideoSegment{Audio: mem.path, Duration: mem.info.Duration})
+			continue
+		}
+		for i, r := range runs {
+			if len(ts[i]) > 0 {
+				for _, p := range ts[i] {
+					segs = append(segs, remux.VideoSegment{TS: p})
+				}
+				continue
+			}
+			d := time.Duration(r.DurationSeconds * float64(time.Second))
+			if i < len(mem.runs) {
+				if mem.runs[i].Frames == 0 {
+					continue // nothing decodable in this run's range
+				}
+				d = mem.runs[i].Duration
+			}
+			if r.Bytes <= 0 {
+				continue
+			}
+			chunk := filepath.Join(dir, fmt.Sprintf(".tmp-vchunk-%s-%d.aac", tmpID, n))
+			n++
+			tmps.add(chunk)
+			if err := copyRange(mem.path, chunk, r.Offset, r.Bytes); err != nil {
+				return nil, err
+			}
+			segs = append(segs, remux.VideoSegment{Audio: chunk, Duration: d})
+		}
+	}
+	if len(segs) == 0 {
+		return nil, errors.New("nothing to build the video from")
+	}
+	return segs, nil
+}
+
+// buildVideo picks the cheapest correct build for segs: no captured picture
+// at all ⇒ black over the finished .m4a (its audio is copied sample-exact);
+// only captured pictures with identical parameters ⇒ stream copy; anything
+// else ⇒ one re-encode at the first captured picture's size and rate.
+func (m *Manager) buildVideo(ctx context.Context, vr VideoRemuxer, segs []remux.VideoSegment, audioM4A, out,
+	bitrate string, meta remux.Metadata, log *slog.Logger,
+) (string, remux.Result, error) {
+	var tsFiles []string
+	var infos []remux.VideoInfo
+	for _, sg := range segs {
+		if sg.TS == "" {
+			continue
+		}
+		info, err := vr.ProbeVideo(ctx, sg.TS)
+		if err != nil {
+			kind := videoKindTranscode
+			if allTS(segs) {
+				kind = videoKindCopy
+			}
+			m.met.VideoBuildsTotal.WithLabelValues(kind, "failure").Inc()
+			return kind, remux.Result{}, &videoBuildError{fmt.Errorf("probe %s: %w", filepath.Base(sg.TS), err)}
+		}
+		tsFiles = append(tsFiles, sg.TS)
+		infos = append(infos, info)
+	}
+
+	kind := videoKindTranscode
+	switch {
+	case len(tsFiles) == 0:
+		kind = videoKindBlack
+	case len(tsFiles) == len(segs) && sameVideo(infos):
+		kind = videoKindCopy
+	}
+
+	started := time.Now()
+	var res remux.Result
+	var err error
+	switch kind {
+	case videoKindBlack:
+		res, err = vr.BuildBlackVideo(ctx, audioM4A, out, meta)
+	case videoKindCopy:
+		res, err = vr.BuildVideoConcat(ctx, tsFiles, out, meta)
+	default:
+		w, h, fps := transcodeTarget(infos)
+		log.Warn("video pieces differ (picture parameters, or runs without picture); re-encoding the video companion",
+			"pieces", len(segs), "captured", len(tsFiles), "target", fmt.Sprintf("%dx%d@%g", w, h, fps))
+		res, err = vr.BuildVideoTranscode(ctx, segs, out, w, h, fps, bitrate, meta)
+	}
+	if err != nil {
+		m.met.VideoBuildsTotal.WithLabelValues(kind, "failure").Inc()
+		return kind, remux.Result{}, &videoBuildError{err}
+	}
+	m.met.VideoBuildsTotal.WithLabelValues(kind, "success").Inc()
+	log.Info("built video companion", "kind", kind, "video", fmt.Sprintf("%s %dx%d", res.Video.VideoCodec, res.Video.Width, res.Video.Height),
+		"duration", res.Duration.Truncate(time.Millisecond).String(), "bytes", res.Size,
+		"took", time.Since(started).Truncate(time.Millisecond).String())
+	return kind, res, nil
+}
+
+func allTS(segs []remux.VideoSegment) bool {
+	for _, sg := range segs {
+		if sg.TS == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// sameVideo reports whether every probed capture has a picture and the same
+// parameters as the first (a stream copy can join them).
+func sameVideo(infos []remux.VideoInfo) bool {
+	for _, in := range infos {
+		if !in.HasVideo || !remux.SameVideoParams(infos[0], in) {
+			return false
+		}
+	}
+	return true
+}
+
+// transcodeTarget is the picture a re-encode produces: the first captured
+// picture in the timeline, else the black placeholder's.
+func transcodeTarget(infos []remux.VideoInfo) (w, h int, fps float64) {
+	for _, in := range infos {
+		if !in.HasVideo || in.Width <= 0 || in.Height <= 0 {
+			continue
+		}
+		fps = in.FPS
+		if fps <= 0 || fps > 120 {
+			fps = 25 // unknown or a timebase artefact: a common broadcast rate
+		}
+		return in.Width, in.Height, fps
+	}
+	return remux.BlackVideoWidth, remux.BlackVideoHeight, remux.BlackVideoFPS
+}
+
+// noteVideoFailure counts a consecutive companion build failure for the key.
+func (m *Manager) noteVideoFailure(key string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.videoFailures == nil {
+		m.videoFailures = map[string]int{}
+	}
+	m.videoFailures[key]++
+	return m.videoFailures[key]
+}
+
+// ---------------------------------------------------------------------------
 // kept mode
 // ---------------------------------------------------------------------------
 
 // keepLocally is the UPLOAD_DISABLED path: the capture is remuxed to
 // <session>.m4a next to its sidecar and the .aac is removed only once the
 // sidecar durably names the .m4a. Kept mode never merges — each session is its
-// own file, exactly as it was captured.
+// own file, exactly as it was captured. A Video session also gets
+// <session>.mp4 (built by the same rules as the uploaded companion); when that
+// fails the .m4a is kept anyway and the TS files stay on disk.
 func (m *Manager) keepLocally(s *Session) {
 	defer m.uploadWG.Done()
 	defer func() {
@@ -1191,6 +1640,9 @@ func (m *Manager) keepLocally(s *Session) {
 			s.OutputFile = out
 			s.LastError = ""
 		}
+		if _, serr := os.Stat(s.OutputVideoPath()); serr == nil && s.Video {
+			s.OutputVideoFile = s.OutputVideoPath()
+		}
 		_ = s.save()
 		m.mu.Unlock()
 		return
@@ -1218,6 +1670,14 @@ func (m *Manager) keepLocally(s *Session) {
 		fail("remux: "+err.Error(), err)
 		return
 	}
+
+	// The video companion is built while the .aac still exists: audio-only
+	// runs are cut out of it.
+	videoOut, videoErr := "", ""
+	if s.Video {
+		videoOut, videoErr = m.keepVideo(ctx, mem, tmp, meta, log)
+	}
+
 	if err := os.Rename(tmp, out); err != nil {
 		fail("rename remuxed file: "+err.Error(), err)
 		return
@@ -1228,6 +1688,10 @@ func (m *Manager) keepLocally(s *Session) {
 	s.OutputFile = out
 	s.Transcoded = transcoded
 	s.LastError = ""
+	if s.Video {
+		s.OutputVideoFile = videoOut
+		s.VideoError = videoErr
+	}
 	saveErr := s.save()
 	m.mu.Unlock()
 	if saveErr != nil {
@@ -1238,8 +1702,49 @@ func (m *Manager) keepLocally(s *Session) {
 	if err := os.Remove(mem.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Warn("remove capture after remux", "file", mem.path, "error", err)
 	}
+	if videoOut != "" {
+		m.mu.Lock()
+		s.removeVideoFiles()
+		m.mu.Unlock()
+	}
 	log.Info("uploads disabled: recording remuxed and kept locally", "file", out,
-		"duration", res.Duration.Truncate(time.Millisecond).String(), "transcoded", transcoded)
+		"duration", res.Duration.Truncate(time.Millisecond).String(), "transcoded", transcoded, "videoFile", videoOut)
+}
+
+// keepVideo builds the kept <session>.mp4 from the capture and the .m4a just
+// built at audioM4A. It returns the file, or "" and why there is none; a
+// failure only costs the video (the TS files stay for a manual rebuild).
+func (m *Manager) keepVideo(ctx context.Context, mem *uploadMember, audioM4A string, meta remux.Metadata,
+	log *slog.Logger,
+) (string, string) {
+	s := mem.s
+	tmp := filepath.Join(s.Dir(), ".tmp-kept-"+s.SessionID+".mp4")
+	tmps := &tempFiles{}
+	tmps.add(tmp)
+	defer tmps.cleanup()
+
+	members := []*uploadMember{mem}
+	failed := func(err error) (string, string) {
+		log.Error("could not build the kept video companion; the .m4a is kept without it and the TS files stay on disk",
+			"error", err, "tsFiles", len(s.VideoFilesAll()))
+		return "", "video build failed: " + err.Error()
+	}
+	vr, err := m.videoRemuxer()
+	if err != nil {
+		return failed(err)
+	}
+	segs, err := m.videoSegments(members, nil, s.Dir(), s.SessionID, tmps)
+	if err != nil {
+		return failed(err)
+	}
+	if _, _, err := m.buildVideo(ctx, vr, segs, audioM4A, tmp, m.transcodeBitrate(members), meta, log); err != nil {
+		return failed(err)
+	}
+	out := s.OutputVideoPath()
+	if err := os.Rename(tmp, out); err != nil {
+		return failed(err)
+	}
+	return out, ""
 }
 
 // ---------------------------------------------------------------------------

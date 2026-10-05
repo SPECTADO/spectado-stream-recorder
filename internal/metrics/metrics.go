@@ -73,6 +73,10 @@ type Metrics struct {
 	RemuxDuration        prometheus.Histogram
 	RemuxTranscodedTotal prometheus.Counter // remuxes that had to re-encode (stream parameters changed)
 
+	// Video companion (.mp4 next to the .m4a, RECORD_VIDEO=true).
+	VideoBuildsTotal          *prometheus.CounterVec // kind=black|copy|transcode, result=success|failure
+	VideoCaptureDisabledTotal *prometheus.CounterVec // reason=empty-runs
+
 	// System (host view via /proc, plus container cgroup view).
 	SysCPUPercent          prometheus.Gauge
 	SysCPUCount            prometheus.Gauge
@@ -231,6 +235,18 @@ func New(version string) *Metrics {
 	})
 	reg.MustRegister(m.RemuxDuration)
 	m.RemuxTranscodedTotal = counter("remux_transcoded_total", "Remuxes that re-encoded because the stream parameters changed mid-capture.")
+
+	m.VideoBuildsTotal = counterVec("video_builds_total", "Builds of the .mp4 video companion by kind and result.", "kind", "result")
+	for _, k := range []string{"black", "copy", "transcode"} {
+		for _, r := range []string{"success", "failure"} {
+			m.VideoBuildsTotal.WithLabelValues(k, r)
+		}
+	}
+	m.VideoCaptureDisabledTotal = counterVec("video_capture_disabled_total",
+		"Sessions whose video capture was turned off (the .mp4 then gets a black picture), by reason.", "reason")
+	for _, r := range []string{"empty-runs"} {
+		m.VideoCaptureDisabledTotal.WithLabelValues(r)
+	}
 
 	m.SysCPUPercent = gauge("host_cpu_percent", "Host-wide CPU utilisation percent as visible through /proc (not container-scoped).")
 	m.SysCPUCount = gauge("host_cpu_count", "Logical CPUs visible to the process.")

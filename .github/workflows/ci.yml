@@ -40,3 +40,5 @@ jobs:
         run: |
           docker run --rm stream-recorder:pr --version
           docker run --rm --entrypoint ffmpeg stream-recorder:pr -version | head -1
+          # RECORD_VIDEO=true refuses to start without libx264.
+          docker run --rm --entrypoint ffmpeg stream-recorder:pr -hide_banner -h encoder=libx264 | grep -q "Encoder libx264"

@@ -1,7 +1,7 @@
 VERSION ?= $(shell tr -d '[:space:]' < VERSION)
 IMAGE   ?= stream-recorder:dev
 
-.PHONY: build test vet fmt docker compose-up compose-down e2e clean
+.PHONY: build test vet fmt docker compose-up compose-down e2e e2e-video clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o bin/recorder ./cmd/recorder
@@ -30,6 +30,11 @@ compose-down:
 # tone for ~50 s, suspends/resumes via SIGTERM, validates the file with ffprobe.
 e2e:
 	./scripts/e2e-local.sh
+
+# Same with RECORD_VIDEO=true: adds an audio+video HLS stream and validates the
+# kept .mp4 companions (needs an ffmpeg with libx264).
+e2e-video:
+	E2E_VIDEO=1 ./scripts/e2e-local.sh
 
 clean:
 	rm -rf bin

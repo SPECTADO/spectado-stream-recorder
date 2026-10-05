@@ -19,7 +19,7 @@ var envKeys = []string{
 	"RECORD_START_EARLY", "RECORD_STOP_LATE", "MAX_SESSION_DURATION", "MAX_RECORDINGS",
 	"FFMPEG_PATH", "FFPROBE_PATH", "FFPROBE_TIMEOUT", "PROBE_CONCURRENCY", "AUDIO_CODEC", "AUDIO_BITRATE",
 	"FFMPEG_USER_AGENT", "FFMPEG_RW_TIMEOUT", "FFMPEG_STALL_TIMEOUT", "FFMPEG_RESTART_BACKOFF_MIN",
-	"FFMPEG_RESTART_BACKOFF_MAX", "FFMPEG_STOP_GRACE", "FFMPEG_STDERR_LOG", "FFMPEG_TLS_VERIFY",
+	"FFMPEG_RESTART_BACKOFF_MAX", "FFMPEG_STOP_GRACE", "FFMPEG_STDERR_LOG", "FFMPEG_TLS_VERIFY", "RECORD_VIDEO",
 	"KEY_DATE_TZ", "CLOCK_ID3_INTERVAL", "CLOCK_PDT_LOOKUP",
 	"SHUTDOWN_TIMEOUT", "SYSMON_INTERVAL", "LOG_LEVEL", "LOG_FORMAT",
 }
@@ -136,6 +136,7 @@ func TestLoad_Defaults(t *testing.T) {
 		{"FFmpegStopGrace", c.FFmpegStopGrace, 5 * time.Second},
 		{"FFmpegStderrLog", c.FFmpegStderrLog, "warn"},
 		{"FFmpegTLSVerify", c.FFmpegTLSVerify, false},
+		{"RecordVideo", c.RecordVideo, false},
 		{"KeyDateTZ", c.KeyDateTZ, "UTC"},
 		{"ClockPDTLookup", c.ClockPDTLookup, true},
 		{"ShutdownTimeout", c.ShutdownTimeout, 45 * time.Second},
@@ -283,6 +284,7 @@ func TestLoad_InvalidValues(t *testing.T) {
 		{"METRICS_REQUIRE_AUTH", "yes", `METRICS_REQUIRE_AUTH: invalid boolean "yes"`},
 		{"S3_FORCE_PATH_STYLE", "maybe", `S3_FORCE_PATH_STYLE: invalid boolean "maybe"`},
 		{"FFMPEG_TLS_VERIFY", "on", `FFMPEG_TLS_VERIFY: invalid boolean "on"`},
+		{"RECORD_VIDEO", "yes", `RECORD_VIDEO: invalid boolean "yes"`},
 		{"MAX_RECORDINGS", "many", `MAX_RECORDINGS: invalid integer "many"`},
 	}
 	for _, tc := range cases {
@@ -349,6 +351,7 @@ func TestLoad_ValuesAndNormalization(t *testing.T) {
 		"API_TOKEN":             "s3cret",
 		"METRICS_REQUIRE_AUTH":  "true",
 		"FFMPEG_TLS_VERIFY":     "1",
+		"RECORD_VIDEO":          "true",
 		"MIN_FREE_DISK":         "512MiB",
 		"MAX_RECORDINGS":        "12",
 		"DATA_DIR":              "/var/lib/recorder",
@@ -373,8 +376,8 @@ func TestLoad_ValuesAndNormalization(t *testing.T) {
 	if c.S3ChecksumAlgorithm != "crc32" || c.FFmpegStderrLog != "debug" || c.LogLevel != "debug" || c.LogFormat != "text" {
 		t.Errorf("lower-casing: checksum %q stderr %q level %q format %q", c.S3ChecksumAlgorithm, c.FFmpegStderrLog, c.LogLevel, c.LogFormat)
 	}
-	if c.APIToken != "s3cret" || !c.MetricsRequireAuth || !c.FFmpegTLSVerify {
-		t.Errorf("token %q metricsAuth %v tlsVerify %v", c.APIToken, c.MetricsRequireAuth, c.FFmpegTLSVerify)
+	if c.APIToken != "s3cret" || !c.MetricsRequireAuth || !c.FFmpegTLSVerify || !c.RecordVideo {
+		t.Errorf("token %q metricsAuth %v tlsVerify %v recordVideo %v", c.APIToken, c.MetricsRequireAuth, c.FFmpegTLSVerify, c.RecordVideo)
 	}
 	if c.MinFreeDiskBytes != 512<<20 || c.MaxRecordings != 12 {
 		t.Errorf("MinFreeDiskBytes %d MaxRecordings %d", c.MinFreeDiskBytes, c.MaxRecordings)

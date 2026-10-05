@@ -15,6 +15,10 @@ container.
   finished ones are uploaded, nothing is deleted before the upload is verified.
 * Heartbeat, readiness, JSON state API and Prometheus metrics (recorder + system
   + container cgroup + per-stream ffmpeg CPU/RSS).
+* Optional video companion (`RECORD_VIDEO=true`, off by default): a `.mp4` next
+  to every `.m4a` under the same key — the source's video (stream-copied), or a
+  static black picture for audio-only sources. The `.m4a` is unchanged. See
+  [Video companion](#video-companion-record_video).
 
 ## Breaking changes in 1.1.0
 
@@ -100,13 +104,18 @@ container.
   mid-recording is transcoded instead of copied; an object that fails to remux
   three times in a row is uploaded raw as a marked `.aac` fallback so audio is
   never silently lost.
+* **Optional video companion.** With `RECORD_VIDEO=true` the same ffmpeg also
+  writes the source's video (plus the same audio) to an MPEG-TS file per run,
+  and the upload builds a `.mp4` from it next to the `.m4a` — see
+  [Video companion](#video-companion-record_video).
 
 State machine per session:
 
 ```
 recording ─▶ finalized ─▶ uploading ─▶ uploaded          (local file deleted, .m4a in the bucket)
     │            │                          
-    │            └────────────────────────▶ kept          (UPLOAD_DISABLED=true: remuxed to <session>.m4a locally)
+    │            └────────────────────────▶ kept          (UPLOAD_DISABLED=true: remuxed to <session>.m4a locally,
+    │                                                       + <session>.mp4 with RECORD_VIDEO=true)
     │                                       failed        (empty file / file missing / no ADTS frames)
     └── shutdown: stays "recording" with suspendedAt, resumed on next start
 ```
@@ -176,7 +185,7 @@ are ignored.
 |---|---|---|
 | `id` | yes | Stable, unique identifier. Used for the local directory, default object key and metric labels. Any string (or number); unsafe characters are replaced and a hash suffix added for file names. |
 | `name` / `title` | no | Human readable, stored in object metadata. |
-| `source` / `url` | yes | `http(s)` URL of an HLS playlist or an Icecast/HTTP stream. Prefer *media* playlists over master playlists. |
+| `source` / `url` | yes | `http(s)` URL of an HLS playlist or an Icecast/HTTP stream. Prefer *media* playlists over master playlists (with `RECORD_VIDEO=true` a master's highest-bandwidth variant is recorded; see [Video companion](#video-companion-record_video)). |
 | `type` | no | `hls`, `icecast` or `auto` (default). Only used to pick HLS-specific ffmpeg options; `.m3u8` URLs are detected automatically. |
 | `start`, `end` | yes | RFC 3339 (`2026-08-30T06:00:00+02:00`, fractional seconds allowed) or unix seconds (number or numeric string; > 1e11 is treated as milliseconds). Timestamps **without an offset** are interpreted in `SCHEDULE_DEFAULT_TZ` (default UTC). `end` must be after `start`. Aliases: `startTime`, `start_time`, `from`; `endTime`, `end_time`, `to`. |
 | `key` / `objectKey` | no | Explicit object name for this recording's `.m4a` in the bucket (`S3_PREFIX` is still prepended, `.m4a` appended unless already present). Without it the default `{date}/{safeId}.m4a` key is used (see below). |
@@ -244,7 +253,9 @@ Duplicate `id`s: the first wins. Duplicate explicit `key`s: the second is invali
 
 * Local: `DATA_DIR/recordings/<safeId>/<safeId>_<sessionStartUTC>.aac` + `.json`
   (raw ADTS while recording; unchanged from 1.0.x — this is still the crash-safe
-  append target). `SafeID` turns an arbitrary `id` into a filesystem/object-safe
+  append target), plus `<session>.vNNNN.ts` video capture files with
+  `RECORD_VIDEO=true` (see [Video companion](#video-companion-record_video)).
+  `SafeID` turns an arbitrary `id` into a filesystem/object-safe
   name: strings using only `[A-Za-z0-9._-]` up to 64 chars pass through unchanged
   (`match-ro-jpOkle8Mp0` stays as is); anything else is truncated to 48 chars and
   gets an `-<8 hex>` suffix so distinct raw ids never collide.
@@ -365,6 +376,80 @@ Duplicate `id`s: the first wins. Duplicate explicit `key`s: the second is invali
   seconds of overlap — visible in the `description` table's `off`/`dur` pairs,
   not trimmed.
 
+### Video companion (`RECORD_VIDEO`)
+
+Off by default; with it off nothing on this page changes. With
+`RECORD_VIDEO=true` every recording gets, **in addition to** its unchanged
+`.m4a`, a `.mp4` (H.264 + the same AAC) under the same key with the suffix
+swapped — `2026-09-22/match-ro-jpOkle8Mp0.m4a` → `2026-09-22/match-ro-jpOkle8Mp0.mp4`,
+content type `video/mp4`. Design and trade-offs: [ADR-0002](docs/adr/0002-optional-video-companion.md).
+
+* **Pinned per session.** A session's mode (`video` in the API/sidecar) is set
+  when the session is created; flipping the variable only affects new
+  sessions. Sessions recorded without it (or before an upgrade) contribute a
+  black picture when merged into a recording that has video.
+* **Which video.** The source is probed once per session (the same ffprobe that
+  decides the audio codec). No video stream → black picture at upload
+  (`videoSource=none`). H.264/HEVC → stream-copied (`copy`, no re-encode);
+  any other codec → re-encoded live to H.264 (`x264`, libx264 `veryfast` CRF 23).
+  An HLS **master** playlist with several video variants → the variant with the
+  highest `BANDWIDTH`.
+* **Capture.** The same ffmpeg process gets a second output: the chosen video
+  plus the same audio as the ADTS output, written to
+  `DATA_DIR/recordings/<safeId>/<session>.v0001.ts`, `.v0002.ts` … (one MPEG-TS
+  file per ffmpeg run, listed in `runs[].videoFiles`). The ADTS output is
+  byte-identical to an audio-only run and stall detection still watches it
+  only. If two consecutive runs produce nothing with the video output active
+  and a trial run without it does produce audio, video capture is turned off
+  for the session (`videoCaptureError`, `recorder_video_capture_disabled_total`)
+  and the `.mp4` falls back to the black picture — video problems never stop
+  the audio.
+* **Building the `.mp4`** (at upload, after the `.m4a` is built, before it is
+  put): the recording is split into segments in timeline order — the remote
+  part when merging, then every run of every new session; a run with TS files
+  is a *video* segment, a run without (or a session without `video`) is an
+  *audio* segment. Then:
+  * only audio segments → **black**: a 16x16, 1 fps H.264 picture
+    (libx264 `ultrafast`, `stillimage`) over the merged `.m4a`'s audio,
+    stream-copied; metadata `synthetic-video=true`;
+  * only video segments with identical parameters (video codec, profile,
+    size, pixel format; audio codec, sample rate, channels) → **copy**: the
+    TS files are joined with ffmpeg's concat demuxer and stream-copied (no
+    re-encode);
+  * anything mixed (resolution or codec change, audio-only runs between video
+    runs) → **transcode**: one libx264 `veryfast` CRF 23 pass, scaled/padded to
+    the first video segment's size and frame rate, audio-only stretches get a
+    black picture, AAC at the session bitrate.
+
+  Every result is verified with ffprobe (streams, codecs, packet counts,
+  duration) before it is uploaded. Each concat join adds ~0.1–0.4 s, so a
+  multi-run `.mp4` can be marginally longer than its `.m4a`; use the `.m4a`'s
+  `description` table for wall-clock mapping.
+* **Merging.** When the `.m4a` merges with an existing object, an existing
+  `.mp4` whose `sessions` manifest equals the remote `.m4a`'s (and is not
+  synthetic) is downloaded and its video reused; otherwise the remote part
+  becomes an audio segment (black). A `.mp4` with a missing or foreign
+  `recording-id` renames the group to a `-2` key exactly like a foreign `.m4a`.
+  The `.mp4` is written **unconditionally** (it is derived from the `.m4a`'s
+  timeline; the `.m4a`'s conditional write stays the point of consistency).
+* **Audio always wins.** An `.mp4` build that fails is retried with the whole
+  upload attempt; after 3 consecutive failures for a key the `.m4a` is
+  uploaded without the `.mp4` (`videoError`, `recorder_video_builds_total{result="failure"}`).
+  The raw-`.aac` remux fallback never has a `.mp4`. Network/put errors on the
+  `.mp4` retry like any upload error.
+* **Object metadata** on the `.mp4`: the `.m4a`'s manifest keys
+  (`recording-id`, `sessions`, `parts`, `last-session-start`) and the same
+  descriptive fields, plus `media=video`, `video-kind` (`black`|`copy`|`transcode`),
+  `synthetic-video`, `video-codec`, `width`, `height`. MP4 tags
+  (`creation_time`, `title`, `description` …) are the same as the `.m4a`'s.
+* **Kept mode** (`UPLOAD_DISABLED=true`): `<session>.mp4` is built next to
+  `<session>.m4a` with the same rules (no remote part) and reported as
+  `outputVideoFile`; on failure the TS files stay on disk and the error is
+  logged.
+* **Cleanup.** TS files are deleted with the session's `.aac` (after a
+  verified upload, by retention, or when a run produced no audio); the
+  orphan scan also reports stray `.ts`/`.mp4` files.
+
 ## Configuration
 
 Everything is configured through environment variables (see `.env.example`).
@@ -411,7 +496,8 @@ Durations accept Go syntax (`90s`, `5m`, `1h30m`) or plain seconds; sizes accept
 | `MAX_RECORDINGS` | `0` | Hard cap on simultaneous recordings (`0` = unlimited). |
 | `AUDIO_CODEC` | `auto` | `auto` (copy AAC, transcode the rest), `copy`, `aac`. |
 | `AUDIO_BITRATE` | `128k` | Transcode bitrate. |
-| `FFMPEG_PATH`, `FFPROBE_PATH` | `ffmpeg`, `ffprobe` | Binaries (the image ships a static ffmpeg 8.0). |
+| `RECORD_VIDEO` | `false` | Also produce a `.mp4` video companion next to every `.m4a` (same key, `.mp4` suffix; the `.m4a` is unchanged). Pinned per session when it is created. Requires an ffmpeg with libx264 — the recorder refuses to start otherwise. See [Video companion](#video-companion-record_video). |
+| `FFMPEG_PATH`, `FFPROBE_PATH` | `ffmpeg`, `ffprobe` | Binaries (the image ships a static ffmpeg 8.0 with libx264). |
 | `FFPROBE_TIMEOUT` | `15s` | Probe timeout in `auto` mode. |
 | `PROBE_CONCURRENCY` | `32` | Max concurrent probes at mass start (recurring shows reuse the previous session's codec decision). |
 | `FFMPEG_USER_AGENT` | `spectado-stream-recorder/1.0` | Sent to stream servers. |
@@ -499,6 +585,14 @@ Per-recording diagnostic fields (in each `recordings.items[]` entry):
   object keys").
 * `transcoded` — `true` when the uploaded object was built by re-encoding
   (heterogeneous AAC parameters across parts) rather than a stream copy.
+* Video companion (only for sessions created with `RECORD_VIDEO=true`):
+  `video` (the session's pinned mode), `videoSource` (`""` not yet probed,
+  `copy`, `x264`, or `none` = no video in the source or capture turned off →
+  black picture), `videoCaptureError` (why video capture was turned off for
+  this session), `videoUploaded` (the `.mp4` companion holds this session),
+  `videoError` (last reason the `.mp4` was skipped — the `.m4a` was still
+  uploaded), `outputVideoFile` (kept mode: local path of `<session>.mp4`).
+  `runs[].videoFiles` lists the run's MPEG-TS capture files.
 
 ## Prometheus metrics
 
@@ -518,6 +612,7 @@ documented list):
 | `ffmpeg_cpu_seconds_total{id}`, `ffmpeg_memory_rss_bytes{id}` | per stream | Resource use of the ffmpeg children |
 | `uploads_total{result}`, `upload_bytes_total`, `upload_duration_seconds` (histogram 1 s – 1 h), `uploads_pending`, `upload_pending_bytes`, `uploads_in_progress`, `uploads_blocked`, `upload_oldest_pending_age_seconds`, `recordings_failed` | | Upload pipeline |
 | `remux_total{result}` (`success`\|`failure`\|`nospace`), `remux_duration_seconds` (histogram 0.5 s – 600 s), `remux_transcoded_total` | | ADTS → `.m4a` remux (the copy-vs-transcode decision and how long it takes) |
+| `video_builds_total{kind,result}` (`kind`: `black`\|`copy`\|`transcode`; `result`: `success`\|`failure`), `video_capture_disabled_total{reason}` (`empty-runs`) | counter | `.mp4` video companion (`RECORD_VIDEO=true`): how each companion was built, and sessions whose video capture was turned off (their `.mp4` gets a black picture) |
 | `upload_merges_total`, `upload_fallback_total`, `object_key_renames_total{reason}` (`conflict`\|`out-of-order`\|`parts-cap`\|`no-conditional-writes`\|`remux-failed`) | counter | One-object-per-recording bookkeeping: how often parts merged into an existing object, fell back to a raw `.aac` upload, or a key had to be renamed because the object under it wasn't safe to merge into |
 | `recordings_on_disk_bytes`, `disk_free_bytes{path}`, `disk_used_percent{path}`, `disk_low` | gauge | Local storage |
 | `host_cpu_percent`, `host_load1/5/15`, `host_memory_*`, `system_processes` | gauge | Host as seen through `/proc` |
@@ -565,6 +660,21 @@ support `-f ipod` and `-movflags +faststart`.
   (input ADTS + output `.m4a`); a merge needs roughly 4× (also the downloaded
   remote object and its re-extracted ADTS).
 * Network: 100 × 128 kbit/s ≈ 13 Mbit/s inbound.
+* **`RECORD_VIDEO=true` changes all of the above for video sources.** Disk,
+  inbound network, egress and bucket size scale with the source's video
+  bitrate: 2–5 Mbit/s ≈ 0.9–2.3 GB/h per stream (×100 ≈ 90–230 GB/h of TS on
+  disk, 200–500 Mbit/s inbound), and the audio is stored twice (`.m4a` and
+  inside the `.mp4`). `recorder_recording_bytes_total` / the API's `bytes`
+  count only the ADTS. A master playlist whose first-listed variant is not the
+  highest is downloaded twice over (the audio map follows the first variant,
+  the video the highest). Stream copy stays ≈ 0 CPU; a non-h264/hevc source
+  (`videoSource=x264`) is re-encoded live (≈ a core per SD stream), and the
+  upload adds a `.mp4` build per recording (a remux, or a libx264 transcode
+  when parts differ). Upload preflight reserves 1.2× the TS bytes, plus 3× the
+  remote `.mp4` when merging. With `UPLOAD_PART_SIZE=16MiB` the multipart limit
+  (10 000 parts) caps an object at 160 GB — raise it for very long
+  high-bitrate recordings. Audio-only sources cost almost nothing extra (the
+  black 16x16 1 fps picture is built at upload in seconds).
 
 **Volume permissions.** The image runs as uid/gid `10001`. A named volume inherits
 the right ownership; for a bind mount run `mkdir -p data && sudo chown 10001:10001 data`
@@ -618,6 +728,8 @@ access in the package settings.
 go build ./... && go test ./... -race          # unit tests (fake ffmpeg, no network)
 make e2e                                       # scripts/e2e-local.sh: real ffmpeg, local HLS tone,
                                                # SIGTERM suspend/resume, remux + .m4a validation (~90 s)
+make e2e-video                                 # same with RECORD_VIDEO=true (E2E_VIDEO=1): adds an A/V HLS
+                                               # stream, validates both .m4a and the .mp4 companions
 go run ./cmd/recorder                          # needs SCHEDULE_URL etc. in the environment
 
 # run against a local test stream without Docker (or simply `make e2e`)
@@ -636,7 +748,8 @@ Layout: `cmd/recorder` (main, subcommands) · `internal/config` (env) ·
 supervisor, sidecars, upload queue, API views) · `internal/storage` (S3/R2) ·
 `internal/adts` (ADTS parsing, tail trimming, run scanning, homogeneous-chunk
 detection) · `internal/remux` (ADTS → `.m4a` via ffmpeg: copy path, transcode
-fallback, probe, extract) · `internal/sysmon` (system/cgroup sampling) ·
+fallback, probe, extract; TS/ADTS → `.mp4` video companion: black, concat,
+transcode, probe, extract) · `internal/sysmon` (system/cgroup sampling) ·
 `internal/metrics` · `internal/httpapi` · `example/` (compose assets, schedule
 server, Prometheus rules, Grafana dashboard).
 
@@ -655,4 +768,7 @@ server, Prometheus rules, Grafana dashboard).
 | `remuxFailures` climbing, `recorder_remux_total{result="failure"}` | ffmpeg rejected the input (corrupt tail, unsupported parameters) — check the recording's `lastError` for ffmpeg's last stderr line. After 3 consecutive failures the recording is uploaded raw as a `.aac` fallback (`remux-failed=true` metadata, `recorder_upload_fallback_total`) so it is not lost; remux it by hand once the cause is fixed. |
 | `recorder_remux_total{result="nospace"}` rising, uploads not progressing | Not enough free disk for the remux/merge temp files (`MIN_FREE_DISK` protects new recordings, not necessarily a remux mid-backlog) — free space or grow the volume; this is retried without counting as a remux failure. |
 | "recording written to a second object" in the logs, `recorder_object_key_renames_total{reason}` | The object under this recording's key was not safe to merge into (`conflict`: foreign or mismatched object; `out-of-order`: an earlier part arrived after a later one was already uploaded; `parts-cap`: 20-part merge limit hit; `no-conditional-writes`: the bucket doesn't enforce `If-Match`/`If-None-Match`; `remux-failed`: the fallback path never merges) — the recording continues under a `-2`/`-3` suffixed key instead of risking data loss; both objects belong to the same recording. |
+| `RECORD_VIDEO=true requires an ffmpeg with the libx264 encoder` at startup | `FFMPEG_PATH` points at a build without libx264 (`ffmpeg -h encoder=libx264` must print `Encoder libx264`). Use the image's ffmpeg or a GPL build. |
+| A recording has a `.m4a` but no `.mp4` (`videoError` set, `recorder_video_builds_total{result="failure"}`) | Building the companion failed three times for that key — the `.m4a` was uploaded on its own by design (video never costs audio). `videoError` holds ffmpeg's reason. Also expected for the raw-`.aac` remux fallback, which never gets a `.mp4`. |
+| `.mp4` of a video source shows a black 16x16 picture (`synthetic-video=true`) | `videoSource=none`: the source had no video stream when probed, or video capture was turned off (`videoCaptureError`, `recorder_video_capture_disabled_total{reason="empty-runs"}`: ffmpeg produced nothing with the video output active but audio flowed without it). A recurring show re-probes next session. |
 | `object manifest inconsistent; refusing to merge` | The object's `sessions`/`parts` metadata doesn't agree with itself (hand-edited object, corrupted metadata) — merging is blocked entirely for that key rather than guessing; the local `.aac` is kept so nothing is lost while you investigate. |

@@ -67,6 +67,10 @@ type Config struct {
 	FFmpegStopGrace         time.Duration
 	FFmpegStderrLog         string // warn | debug | off
 	FFmpegTLSVerify         bool   // verify TLS certificates of stream sources
+	// RecordVideo adds a .mp4 video companion next to every .m4a (the source's
+	// video, or a static black picture for audio-only sources). The .m4a itself
+	// is unchanged. Pinned per session at creation (Session.Video).
+	RecordVideo bool
 
 	// Real-world clock embedding.
 	ClockPDTLookup bool // read the source playlist's PDT to anchor each run
@@ -137,6 +141,7 @@ func Load() (*Config, error) {
 	c.FFmpegStopGrace = envDuration(&errs, "FFMPEG_STOP_GRACE", 5*time.Second)
 	c.FFmpegStderrLog = strings.ToLower(envString("FFMPEG_STDERR_LOG", "warn"))
 	c.FFmpegTLSVerify = envBool(&errs, "FFMPEG_TLS_VERIFY", false)
+	c.RecordVideo = envBool(&errs, "RECORD_VIDEO", false)
 
 	c.ClockPDTLookup = envBool(&errs, "CLOCK_PDT_LOOKUP", true)
 	// CLOCK_ID3_INTERVAL controlled the in-band ID3 wall-clock tags that 1.1.0

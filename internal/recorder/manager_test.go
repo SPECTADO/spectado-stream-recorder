@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1417,5 +1418,213 @@ func TestRecordingsViewRedactsSecrets(t *testing.T) {
 	items := sv["items"].([]schedule.Item)
 	if items[0].Headers["Authorization"] != "***" || strings.Contains(items[0].Source, "SECRET") {
 		t.Fatalf("schedule view leaks secrets: %+v", items[0])
+	}
+}
+
+// fakeFFmpegVideo writes a fake ffmpeg/ffprobe for video sessions. As ffprobe
+// (-show_entries) it reports an aac + h264 source. As ffmpeg it appends bytes
+// to the video companion output (the "file:" argument) while streaming real
+// ADTS frames to stdout; while the file failFlag exists, a run WITH a video
+// output creates its TS file and exits without audio (a video-caused failure).
+func fakeFFmpegVideo(t *testing.T, dir, failFlag string) string {
+	t.Helper()
+	frames := adtsFramesFile(t, dir)
+	body := fmt.Sprintf(`#!/bin/sh
+trap 'exit 0' INT TERM
+ts=""
+for a in "$@"; do
+  case "$a" in
+    -show_entries) echo '{"streams":[{"index":0,"codec_type":"audio","codec_name":"aac","profile":"LC"},{"index":1,"codec_type":"video","codec_name":"h264"}]}'; exit 0;;
+    file:*) ts="${a#file:}";;
+  esac
+done
+if [ -n "$ts" ] && [ -f %q ]; then
+  : > "$ts"
+  echo '[error] video output failed' >&2
+  exit 1
+fi
+while :; do
+  cat %q || exit 0
+  if [ -n "$ts" ]; then printf 'TSDATA' >> "$ts"; fi
+  sleep 0.05
+done
+`, failFlag, frames)
+	p := filepath.Join(dir, "ffmpeg-video.sh")
+	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func newVideoTestManager(t *testing.T, failFlag bool) (*Manager, string) {
+	t.Helper()
+	dir := t.TempDir()
+	flag := filepath.Join(dir, "video-fails")
+	if failFlag {
+		if err := os.WriteFile(flag, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := testConfig(dir, fakeFFmpegVideo(t, dir, flag))
+	cfg.RecordVideo = true
+	m := NewManager(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), metrics.New("test"), &fakeUploader{}, "test")
+	m.SetRemuxer(newFakeRemuxer())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		m.Shutdown(ctx)
+	})
+	return m, dir
+}
+
+// TestVideoCaptureWritesRunTSFile: a RECORD_VIDEO session pins Video, resolves
+// the video once, hands each run its own numbered TS file and lists it in the
+// run record; the API view shows the decision.
+func TestVideoCaptureWritesRunTSFile(t *testing.T) {
+	m, _ := newVideoTestManager(t, false)
+	now := time.Now()
+	m.SetSchedule(sched(item("v", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("v")
+	if ar == nil {
+		t.Fatal("recording not started")
+	}
+	waitFor(t, 5*time.Second, "run record with a video file", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return len(ar.s.Runs) == 1 && len(ar.s.Runs[0].VideoFiles) == 1
+	})
+	m.mu.Lock()
+	s := ar.s
+	name := s.Runs[0].VideoFiles[0]
+	video, source, vmap, seq := s.Video, s.VideoSource, s.VideoMap, s.VideoSeq
+	m.mu.Unlock()
+	if !video || source != "copy" || vmap != "0:v:0" || seq != 1 || name != s.SessionID+".v0001.ts" {
+		t.Fatalf("video=%v source=%q map=%q seq=%d file=%q", video, source, vmap, seq, name)
+	}
+	waitFor(t, 5*time.Second, "TS bytes", func() bool {
+		st, err := os.Stat(s.VideoPath(name))
+		return err == nil && st.Size() > 0
+	})
+	var view RecordingView
+	for _, v := range m.Recordings() {
+		if v.SessionID == s.SessionID {
+			view = v
+		}
+	}
+	if !view.Video || view.VideoSource != "copy" {
+		t.Errorf("view video=%v source=%q", view.Video, view.VideoSource)
+	}
+	// The sidecar on disk already knows the file (persisted with the record).
+	disk, err := loadSession(s.SidecarPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(disk.Runs) != 1 || !slices.Equal(disk.Runs[0].VideoFiles, []string{name}) || disk.VideoSeq != 1 {
+		t.Errorf("sidecar runs=%+v seq=%d", disk.Runs, disk.VideoSeq)
+	}
+}
+
+// TestVideoCaptureFailureDisablesVideoNotAudio: runs that die without audio
+// while the video output is active are blamed on the video only after an
+// audio-only trial run succeeds; video is then turned off for the session
+// (black at upload), the audio keeps recording, the copy fallback never fires,
+// and the failed runs' TS files are gone.
+func TestVideoCaptureFailureDisablesVideoNotAudio(t *testing.T) {
+	m, dir := newVideoTestManager(t, true)
+	now := time.Now()
+	m.SetSchedule(sched(item("v", now.Add(-time.Second), now.Add(time.Hour))))
+	ar := m.activeFor("v")
+	if ar == nil {
+		t.Fatal("recording not started")
+	}
+	waitFor(t, 10*time.Second, "video turned off", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return ar.s.VideoSource == "none"
+	})
+	waitFor(t, 5*time.Second, "audio flowing", func() bool { return ar.bytes.Load() > 0 })
+	m.mu.Lock()
+	s := ar.s
+	capErr, resolved, runs := s.VideoCaptureError, s.ResolvedCodec, append([]Run(nil), s.Runs...)
+	m.mu.Unlock()
+	if capErr == "" {
+		t.Error("VideoCaptureError not set")
+	}
+	if resolved != "aac" { // testConfig requests aac: unchanged, no copy fallback
+		t.Errorf("ResolvedCodec = %q", resolved)
+	}
+	for _, r := range runs {
+		if len(r.VideoFiles) > 0 {
+			t.Errorf("run lists video files %q", r.VideoFiles)
+		}
+	}
+	if got := counterValue(t, m, "recorder_video_capture_disabled_total", map[string]string{"reason": "empty-runs"}); got != 1 {
+		t.Errorf("video_capture_disabled_total = %v", got)
+	}
+	if got := counterValue(t, m, "recorder_codec_fallbacks_total", nil); got != 0 {
+		t.Errorf("codec_fallbacks_total = %v", got)
+	}
+	left, _ := filepath.Glob(filepath.Join(dir, s.SafeID, "*.ts"))
+	if len(left) != 0 {
+		t.Errorf("TS files of failed runs left behind: %q", left)
+	}
+}
+
+// TestVideoDecisionInheritance: a new session of a recurring show reuses the
+// latest video decision of the same id and source, except one that came from
+// turning video off after capture failures.
+func TestVideoDecisionInheritance(t *testing.T) {
+	m, dir := newVideoTestManager(t, false)
+	now := time.Now()
+	it := item("r", now.Add(-time.Second), now.Add(time.Hour))
+	m.mu.Lock()
+	m.sessions["r_old"] = &Session{ID: "r", SessionID: "r_old", Source: it.Source, State: StateUploaded, Video: true,
+		VideoSource: "x264", VideoMap: "0:p:3:v:0", SessionStart: now.Add(-3 * time.Hour), dir: filepath.Join(dir, "r")}
+	m.sessions["r_failed"] = &Session{ID: "r", SessionID: "r_failed", Source: it.Source, State: StateUploaded, Video: true,
+		VideoSource: "none", VideoCaptureError: "boom", SessionStart: now.Add(-2 * time.Hour), dir: filepath.Join(dir, "r")}
+	m.sessions["r_other"] = &Session{ID: "r", SessionID: "r_other", Source: "http://elsewhere/x.m3u8", State: StateUploaded,
+		Video: true, VideoSource: "copy", VideoMap: "0:v:0", SessionStart: now.Add(-time.Hour), dir: filepath.Join(dir, "r")}
+	m.mu.Unlock()
+	m.SetSchedule(sched(it))
+	ar := m.activeFor("r")
+	if ar == nil {
+		t.Fatal("recording not started")
+	}
+	m.mu.Lock()
+	video, source, vmap := ar.s.Video, ar.s.VideoSource, ar.s.VideoMap
+	m.mu.Unlock()
+	if !video || source != "x264" || vmap != "0:p:3:v:0" {
+		t.Errorf("inherited video=%v source=%q map=%q, want x264 0:p:3:v:0", video, source, vmap)
+	}
+}
+
+// TestVideoRetentionRemovesLeftoverTS: retention of an uploaded session drops
+// TS files left behind (they are only an input of the .mp4) with the sidecar.
+func TestVideoRetentionRemovesLeftoverTS(t *testing.T) {
+	m, dir := newVideoTestManager(t, false)
+	sdir := filepath.Join(dir, "x")
+	if err := os.MkdirAll(sdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	s := &Session{ID: "x", SafeID: "x", SessionID: "x_1", State: StateUploaded, Video: true, dir: sdir,
+		Runs: []Run{{VideoFiles: []string{"x_1.v0001.ts"}}}}
+	if err := s.save(); err != nil {
+		t.Fatal(err)
+	}
+	ts := filepath.Join(sdir, "x_1.v0001.ts")
+	if err := os.WriteFile(ts, []byte("TS"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.UpdatedAt = old
+	m.mu.Lock()
+	m.sessions[s.SessionID] = s
+	m.mu.Unlock()
+	m.retention()
+	if _, err := os.Stat(ts); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("leftover TS not removed: %v", err)
+	}
+	if _, err := os.Stat(s.SidecarPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("sidecar not removed: %v", err)
 	}
 }

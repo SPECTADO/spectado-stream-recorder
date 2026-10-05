@@ -54,6 +54,10 @@ services:
     # so 100 streams need ~3-4 GiB; with AUDIO_CODEC=copy (no transcoding)
     # ~2 GiB is enough. The Go process itself stays well below GOMEMLIMIT.
     # Transcoding 100 streams needs ~2-4 cores; stream copy is nearly free.
+    # RECORD_VIDEO=true (.mp4 companion, see .env.example) stream-copies video
+    # sources at no extra CPU, but disk/egress grow with the video bitrate
+    # (2-5 Mbit/s ~ 1-2 GB/h per stream) and the upload step's .mp4 build
+    # (remux, or libx264 when parts differ) adds CPU bursts per recording.
     mem_limit: 4g
     cpus: 4
     # Hardening: the binary only writes to /data (volume) and /tmp (tmpfs).

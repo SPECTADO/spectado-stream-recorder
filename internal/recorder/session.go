@@ -67,6 +67,10 @@ type Run struct {
 	Bytes           int64      `json:"bytes"`        // bytes written (frames + junk)
 	Frames          int        `json:"frames"`
 	DurationSeconds float64    `json:"durationSeconds"`
+	// VideoFiles are the basenames of the MPEG-TS files (video companion, see
+	// Session.Video) this run wrote next to the .aac, normally one. Coalesced
+	// runs concatenate their lists in order.
+	VideoFiles []string `json:"videoFiles,omitempty"`
 }
 
 // RunExit records why one ffmpeg run ended (kept for diagnosis after upload).
@@ -143,6 +147,27 @@ type Session struct {
 	RemuxFailures int    `json:"remuxFailures,omitempty"`
 	OutputFile    string `json:"outputFile,omitempty"` // kept mode: the local .m4a produced from the capture
 
+	// Video companion (RECORD_VIDEO). Video is pinned when the session is
+	// created and never changes afterwards, so flipping the switch never
+	// changes what an already running/finished session produces. The capture
+	// writes the source's video (plus the same audio) into one MPEG-TS file per
+	// ffmpeg run next to the .aac; the upload turns them into <key>.mp4, or a
+	// static black picture when there is no video.
+	Video bool `json:"video,omitempty"`
+	// VideoSource is the capture decision: "" unresolved, "none" (no video in
+	// the source, or capture turned off after failures: black at upload),
+	// "copy" (h264/hevc stream copy) or "x264" (re-encoded while capturing).
+	VideoSource string `json:"videoSource,omitempty"`
+	VideoMap    string `json:"videoMap,omitempty"` // ffmpeg -map spec of the video stream, e.g. 0:p:2:v:0
+	VideoSeq    int    `json:"videoSeq,omitempty"` // last TS file number handed out (persisted before ffmpeg starts)
+	// VideoCaptureError is why video capture was turned off for this session
+	// (VideoSource forced to "none"). A session with it set does not pass its
+	// VideoSource on to the next session of the same show.
+	VideoCaptureError string `json:"videoCaptureError,omitempty"`
+	VideoUploaded     bool   `json:"videoUploaded,omitempty"`   // the .mp4 companion holds this session
+	VideoError        string `json:"videoError,omitempty"`      // last reason the .mp4 was skipped
+	OutputVideoFile   string `json:"outputVideoFile,omitempty"` // kept mode: the local .mp4
+
 	UpdatedAt time.Time `json:"updatedAt"`
 
 	dir           string // directory holding the files (not serialized)
@@ -156,6 +181,40 @@ func (s *Session) FilePath() string { return filepath.Join(s.dir, s.SessionID+".
 
 // OutputPath is where kept mode (UPLOAD_DISABLED=true) writes the remuxed file.
 func (s *Session) OutputPath() string { return filepath.Join(s.dir, s.SessionID+".m4a") }
+
+// OutputVideoPath is where kept mode writes the video companion.
+func (s *Session) OutputVideoPath() string { return filepath.Join(s.dir, s.SessionID+".mp4") }
+
+// videoFileName is the name of the TS file of video file number seq.
+func (s *Session) videoFileName(seq int) string { return fmt.Sprintf("%s.v%04d.ts", s.SessionID, seq) }
+
+// VideoPath returns the full path of a TS file listed in Run.VideoFiles.
+func (s *Session) VideoPath(name string) string { return filepath.Join(s.dir, name) }
+
+// VideoFilesAll returns the full paths of every run's TS files in timeline
+// order (files that were never listed in a run are not included).
+func (s *Session) VideoFilesAll() []string {
+	var out []string
+	for _, r := range s.Runs {
+		for _, name := range r.VideoFiles {
+			out = append(out, s.VideoPath(name))
+		}
+	}
+	return out
+}
+
+// removeVideoFiles deletes every TS file of the session, listed in a run or
+// not (a run that produced no audio leaves no record but may leave a file).
+// Called wherever the .aac is removed.
+func (s *Session) removeVideoFiles() {
+	matches, _ := filepath.Glob(filepath.Join(s.dir, s.SessionID+".v*.ts"))
+	for _, p := range append(matches, s.VideoFilesAll()...) {
+		_ = os.Remove(p)
+	}
+}
+
+// videoKey is the key of the .mp4 video companion of the object under key.
+func videoKey(key string) string { return strings.TrimSuffix(key, objectExt) + ".mp4" }
 
 // setKey is the ONLY way Session.Key may change. Moving a session to another
 // key invalidates everything we know about the object it used to belong to: an
@@ -210,6 +269,8 @@ func (s *Session) applyItem(it schedule.Item) (sourceChanged bool) {
 	}
 	if sourceChanged {
 		s.ResolvedCodec = "" // re-probe against the new source
+		s.VideoSource = ""
+		s.VideoMap = ""
 	}
 	return sourceChanged
 }
@@ -370,6 +431,9 @@ func (s *Session) appendRun(r Run) (coalescedNow bool) {
 	a.Bytes += b.Bytes
 	a.Frames += b.Frames
 	a.DurationSeconds += b.DurationSeconds
+	if len(b.VideoFiles) > 0 {
+		a.VideoFiles = append(append([]string(nil), a.VideoFiles...), b.VideoFiles...)
+	}
 	a.EndedAt = laterTime(a.EndedAt, b.EndedAt)
 	merged := make([]Run, 0, len(s.Runs)-1)
 	merged = append(merged, a)

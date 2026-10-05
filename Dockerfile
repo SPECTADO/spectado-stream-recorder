@@ -49,13 +49,21 @@ COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
 COPY --from=build /out/recorder /usr/local/bin/recorder
 
 # Smoke test: the shipped ffmpeg must encode AAC into ADTS, speak https, and
-# remux ADTS into the .m4a (ipod muxer) the upload path relies on.
+# remux ADTS into the .m4a (ipod muxer) the upload path relies on. The video
+# companion (RECORD_VIDEO=true) additionally needs libx264 (the same check the
+# recorder runs at startup), the mpegts muxer of the capture and the mp4 muxer
+# of the upload: a 1 s black 16x16 picture + sine tone goes TS -> .mp4.
 RUN ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=0.2" -c:a aac -f adts - > /dev/null \
     && ffmpeg -hide_banner -protocols 2>/dev/null | grep -q https \
     && ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=440:duration=0.2" -c:a aac -f adts /tmp/smoke.aac \
     && ffmpeg -hide_banner -loglevel error -xerror -i /tmp/smoke.aac -c:a copy -movflags +faststart -f ipod /tmp/smoke.m4a \
     && ffprobe -v error -show_entries format=format_name -of default=nw=1 /tmp/smoke.m4a | grep -q mp4 \
-    && rm -f /tmp/smoke.aac /tmp/smoke.m4a \
+    && ffmpeg -hide_banner -h encoder=libx264 2>/dev/null | grep -q "Encoder libx264" \
+    && ffmpeg -hide_banner -loglevel error -f lavfi -i "color=c=black:s=16x16:r=1:d=1" -f lavfi -i "sine=frequency=440:duration=1" \
+         -map 0:v:0 -map 1:a:0 -c:v libx264 -preset ultrafast -tune stillimage -pix_fmt yuv420p -g 10 -c:a aac -f mpegts /tmp/smoke.ts \
+    && ffmpeg -hide_banner -loglevel error -xerror -i /tmp/smoke.ts -map 0:v:0 -map 0:a:0 -c copy -movflags +faststart -f mp4 /tmp/smoke.mp4 \
+    && ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height -of csv=p=0 /tmp/smoke.mp4 | grep -qx "h264,16,16" \
+    && rm -f /tmp/smoke.aac /tmp/smoke.m4a /tmp/smoke.ts /tmp/smoke.mp4 \
     && /usr/local/bin/recorder --version
 
 ENV DATA_DIR=/data \

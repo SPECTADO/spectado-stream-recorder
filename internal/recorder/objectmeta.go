@@ -156,6 +156,13 @@ type objectFacts struct {
 	channels    int
 	transcoded  bool
 	remuxFailed bool
+
+	// Video companion (.mp4) only; zero for the .m4a and the raw fallback.
+	video      bool
+	videoKind  string // black | copy | transcode (see videoKind* constants)
+	videoCodec string
+	width      int
+	height     int
 }
 
 // objectMetadata builds the x-amz-meta-* set of the stored object.
@@ -219,6 +226,20 @@ func (m *Manager) objectMetadata(sum objectSummary, f objectFacts) map[string]st
 	}
 	if f.remuxFailed {
 		meta["remux-failed"] = "true"
+	}
+	if f.video {
+		// synthetic-video is always written, "false" included: the next merge
+		// only reuses a stored picture it is told is real, so a value lost to
+		// the metadata budget degrades to "black", never to a black picture
+		// being passed off as the source's.
+		meta["media"] = "video"
+		meta["synthetic-video"] = strconv.FormatBool(f.videoKind == videoKindBlack)
+		set("video-kind", f.videoKind)
+		set("video-codec", f.videoCodec)
+		if f.width > 0 && f.height > 0 {
+			meta["width"] = strconv.Itoa(f.width)
+			meta["height"] = strconv.Itoa(f.height)
+		}
 	}
 	return meta
 }

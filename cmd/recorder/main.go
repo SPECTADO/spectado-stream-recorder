@@ -95,7 +95,7 @@ func run() error {
 		"scheduleUrl", recorder.RedactURL(cfg.ScheduleURL), "pollInterval", cfg.SchedulePollInterval.String(),
 		"dataDir", cfg.DataDir, "httpAddr", cfg.HTTPAddr, "uploads", !cfg.UploadDisabled,
 		"bucket", cfg.S3Bucket, "codec", cfg.AudioCodec, "bitrate", cfg.AudioBitrate,
-		"keyDateTz", cfg.KeyDateTZ,
+		"keyDateTz", cfg.KeyDateTZ, "recordVideo", cfg.RecordVideo,
 		"startEarly", cfg.RecordStartEarly.String(), "stopLate", cfg.RecordStopLate.String())
 	// Configuration that loaded but is not what the operator probably meant
 	// (e.g. a variable a later version removed). Logged once, never fatal.
@@ -145,8 +145,14 @@ func run() error {
 
 	mgr := recorder.NewManager(cfg, log, met, up, version)
 	caps := recorder.DetectFFmpegCapabilities(ctx, ffPath)
+	// The video companion needs libx264 (black picture for audio-only sources,
+	// transcode fallback): fail at startup, not on the first upload hours later.
+	if cfg.RecordVideo && !caps.LibX264 {
+		return fmt.Errorf("RECORD_VIDEO=true requires an ffmpeg with the libx264 encoder (%s has none)", ffPath)
+	}
 	mgr.SetFFmpegCapabilities(caps)
-	log.Info("ffmpeg capabilities", "hlsExtensionPicky", caps.HLSExtensionPicky, "caFile", caps.CAFile, "tlsVerify", cfg.FFmpegTLSVerify)
+	log.Info("ffmpeg capabilities", "hlsExtensionPicky", caps.HLSExtensionPicky, "libx264", caps.LibX264,
+		"caFile", caps.CAFile, "tlsVerify", cfg.FFmpegTLSVerify)
 
 	mon := sysmon.New(cfg.SysmonInterval, cfg.DataDir, mgr.FFmpegProcessCount)
 	mon.OnSample = met.UpdateSystem

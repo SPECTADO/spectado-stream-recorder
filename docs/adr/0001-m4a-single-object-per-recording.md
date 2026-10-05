@@ -4,6 +4,9 @@
 - **Date:** 2026-09-22
 - **Deciders:** Ladislav Soukup (requirements, format choice), Claude (design)
 - **Tags:** storage, media-format, api
+- **Related:** [ADR-0002](0002-optional-video-companion.md) adds an optional
+  `.mp4` video companion under the same key (`RECORD_VIDEO`); everything
+  decided here for the `.m4a` is unchanged by it.
 
 ## Context
 

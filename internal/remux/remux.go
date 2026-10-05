@@ -54,6 +54,11 @@ type Remuxer struct {
 	MinThroughput int64 // bytes per second
 	// ProbeTimeout bounds one ffprobe run (default 60 s).
 	ProbeTimeout time.Duration
+	// MinTranscodeSpeed is the slowest video re-encode (BuildVideoTranscode)
+	// still considered healthy, in media seconds per wall-clock second; the
+	// run's timeout grows by mediaDuration / MinTranscodeSpeed on top of the
+	// byte-based bound. Zero uses the default (0.25, i.e. 4× real time).
+	MinTranscodeSpeed float64
 }
 
 // Metadata is what Build embeds in the MP4 container (iTunes ilst + the movie
@@ -91,6 +96,9 @@ type Result struct {
 	SampleRate int
 	Channels   int
 	Tags       map[string]string // format tags (creation_time, title, description, …)
+	// Video is the stream-level probe of the produced file; set only by the
+	// video builders (BuildBlackVideo, BuildVideoConcat, BuildVideoTranscode).
+	Video VideoInfo
 }
 
 // ErrDurationMismatch is returned (wrapped) when a produced file's probed
@@ -664,10 +672,19 @@ func (r *Remuxer) classify(runCtx, parentCtx context.Context, waitErr error, tai
 
 // runFFprobe runs ffprobe and returns its stdout.
 func (r *Remuxer) runFFprobe(ctx context.Context, args []string) ([]byte, error) {
-	timeout := r.ProbeTimeout
-	if timeout <= 0 {
-		timeout = defaultProbeTimeout
+	return r.runFFprobeFor(ctx, r.probeTimeout(), args)
+}
+
+func (r *Remuxer) probeTimeout() time.Duration {
+	if r.ProbeTimeout <= 0 {
+		return defaultProbeTimeout
 	}
+	return r.ProbeTimeout
+}
+
+// runFFprobeFor is runFFprobe with an explicit bound (ProbeVideo reads every
+// packet, so its bound grows with the file).
+func (r *Remuxer) runFFprobeFor(ctx context.Context, timeout time.Duration, args []string) ([]byte, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
