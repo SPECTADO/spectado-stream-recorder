@@ -393,7 +393,7 @@ neither a `HEAD` nor an MP4 parser:
 ```json
 {
   "schema": 1,
-  "recorderVersion": "1.1.0",
+  "recorderVersion": "1.2.0",
   "recordingId": "match-ro-jpOkle8Mp0",
   "name": "Rádio Jedna",
   "source": "https://example.com/live/master.m3u8",
@@ -417,7 +417,7 @@ neither a `HEAD` nor an MP4 parser:
   "video": {"key": "2026-09-22/match-ro-jpOkle8Mp0.mp4", "stored": true, "kind": "copy",
             "synthetic": false, "codec": "h264", "width": 1280, "height": 720},
   "tags": {"title": "Rádio Jedna", "date": "2026-09-22",
-           "comment": "spectado-stream-recorder 1.1.0; id=…", "creationTime": "2026-09-22T17:59:22Z"},
+           "comment": "spectado-stream-recorder 1.2.0; id=…", "creationTime": "2026-09-22T17:59:22Z"},
   "runs": [{"sid": "…", "t": "2026-09-22T17:59:22.120Z", "src": "hls-pdt", "off": 0, "dur": 3600.24}, …],
   "updatedAt": "2026-09-22T20:02:11.503Z"
 }
