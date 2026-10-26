@@ -67,6 +67,7 @@ type Metrics struct {
 	UploadMergesTotal      prometheus.Counter     // uploads that merged new audio into an existing object
 	UploadFallbackTotal    prometheus.Counter     // uploads that stored raw ADTS after repeated remux failures
 	ObjectKeyRenamesTotal  *prometheus.CounterVec // reason=conflict|out-of-order|parts-cap|no-conditional-writes|remux-failed
+	MetadataUploadsTotal   *prometheus.CounterVec // result=success|failure (the .json metadata document)
 
 	// Remux (ADTS -> .m4a, on the upload path and in kept mode).
 	RemuxTotal           *prometheus.CounterVec // result=success|failure|nospace
@@ -221,6 +222,10 @@ func New(version string) *Metrics {
 	m.ObjectKeyRenamesTotal = counterVec("object_key_renames_total", "Recordings written to a second object key, by reason.", "reason")
 	for _, r := range []string{"conflict", "out-of-order", "parts-cap", "no-conditional-writes", "remux-failed"} {
 		m.ObjectKeyRenamesTotal.WithLabelValues(r)
+	}
+	m.MetadataUploadsTotal = counterVec("metadata_uploads_total", "Uploads of the .json metadata document stored next to every recording, by result.", "result")
+	for _, r := range []string{"success", "failure"} {
+		m.MetadataUploadsTotal.WithLabelValues(r)
 	}
 
 	m.RemuxTotal = counterVec("remux_total", "ADTS-to-.m4a remuxes by result.", "result")

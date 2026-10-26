@@ -219,6 +219,12 @@ func (s *Session) removeVideoFiles() {
 // videoKey is the key of the .mp4 video companion of the object under key.
 func videoKey(key string) string { return strings.TrimSuffix(key, objectExt) + ".mp4" }
 
+// metadataKey is the .json metadata document's key for the audio object under
+// key (the .m4a, or the raw .aac of the remux fallback, which shares its base).
+func metadataKey(key string) string {
+	return strings.TrimSuffix(strings.TrimSuffix(key, objectExt), ".aac") + ".json"
+}
+
 // setKey is the ONLY way Session.Key may change. Moving a session to another
 // key invalidates everything we know about the object it used to belong to: an
 // object under a different key never contains this session, so a stale

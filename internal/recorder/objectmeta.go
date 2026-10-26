@@ -418,3 +418,185 @@ func formatOrEmpty(t time.Time) string {
 // round3 keeps the run table readable: milliseconds are the precision of the
 // anchors, and full float64 noise would triple the size of the tag.
 func round3(v float64) float64 { return math.Round(v*1000) / 1000 }
+
+// ---------------------------------------------------------------------------
+// metadata document (.json next to the media objects)
+// ---------------------------------------------------------------------------
+
+const (
+	// metadataContentType is what the .json metadata document is stored as.
+	metadataContentType = "application/json"
+	// metadataSchema versions the document's layout; bump it on an
+	// incompatible change so consumers can tell the shapes apart.
+	metadataSchema = 1
+)
+
+// metadataDoc is the .json stored next to every recording: the same facts the
+// object metadata (x-amz-meta-*) and the container tags carry, typed and in
+// one place, so a consumer does not have to HEAD the object or parse the MP4.
+// It is derived from the same summary and is rewritten with every upload of
+// the recording (a merge replaces it like it replaces the .m4a).
+type metadataDoc struct {
+	Schema            int            `json:"schema"`
+	RecorderVersion   string         `json:"recorderVersion,omitempty"`
+	RecordingID       string         `json:"recordingId"`
+	Name              string         `json:"name,omitempty"`
+	Source            string         `json:"source,omitempty"`
+	Date              string         `json:"date,omitempty"`
+	ScheduledStart    string         `json:"scheduledStart,omitempty"`
+	ScheduledEnd      string         `json:"scheduledEnd,omitempty"`
+	SessionStart      string         `json:"sessionStart,omitempty"`
+	SessionEnd        string         `json:"sessionEnd,omitempty"`
+	LastSessionStart  string         `json:"lastSessionStart,omitempty"`
+	FirstSampleTime   string         `json:"firstSampleTime,omitempty"`
+	ClockSource       string         `json:"clockSource,omitempty"`
+	FinishReason      string         `json:"finishReason,omitempty"`
+	Parts             int            `json:"parts"`
+	Sessions          []string       `json:"sessions"`
+	FFmpegRuns        int            `json:"ffmpegRuns"`
+	FFmpegRestarts    int            `json:"ffmpegRestarts"`
+	FFmpegExitReasons map[string]int `json:"ffmpegExitReasons,omitempty"`
+	Audio             metadataAudio  `json:"audio"`
+	Video             *metadataVideo `json:"video,omitempty"`
+	Tags              *metadataTags  `json:"tags,omitempty"`
+	Runs              []runEntry     `json:"runs"`
+	UpdatedAt         string         `json:"updatedAt"`
+}
+
+// metadataAudio describes the stored audio object (.m4a, or the raw .aac of
+// the remux fallback).
+type metadataAudio struct {
+	Key             string  `json:"key"`
+	ContentType     string  `json:"contentType"`
+	DurationSeconds float64 `json:"durationSeconds"`
+	Frames          int     `json:"frames,omitempty"`
+	Codec           string  `json:"codec,omitempty"`
+	Profile         string  `json:"profile,omitempty"`
+	SampleRate      int     `json:"sampleRate,omitempty"`
+	Channels        int     `json:"channels,omitempty"`
+	Transcoded      bool    `json:"transcoded,omitempty"`
+	RemuxFailed     bool    `json:"remuxFailed,omitempty"`
+}
+
+// metadataVideo describes the .mp4 companion (RECORD_VIDEO only). Stored is
+// false when the recording was uploaded without it; Error then says why.
+type metadataVideo struct {
+	Key       string `json:"key"`
+	Stored    bool   `json:"stored"`
+	Error     string `json:"error,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Synthetic *bool  `json:"synthetic,omitempty"`
+	Codec     string `json:"codec,omitempty"`
+	Width     int    `json:"width,omitempty"`
+	Height    int    `json:"height,omitempty"`
+}
+
+// metadataTags are the tags embedded in the container (absent for the raw
+// .aac fallback, which has no container).
+type metadataTags struct {
+	Title        string `json:"title,omitempty"`
+	Date         string `json:"date,omitempty"`
+	Comment      string `json:"comment,omitempty"`
+	CreationTime string `json:"creationTime,omitempty"`
+}
+
+// metadataDocument builds the .json document of the recording stored under
+// audioKey. meta is what was (or, for the fallback, would have been) embedded
+// in the container; embedded says whether it actually was. The run table is
+// read back from meta.Description so the document carries exactly the table
+// the .m4a does.
+func (m *Manager) metadataDocument(sum objectSummary, audioKey, contentType string, f objectFacts,
+	meta remux.Metadata, embedded bool, video *metadataVideo,
+) metadataDoc {
+	fmtTime := func(t time.Time) string {
+		if t.IsZero() {
+			return ""
+		}
+		return t.UTC().Format(time.RFC3339)
+	}
+	doc := metadataDoc{
+		Schema:           metadataSchema,
+		RecorderVersion:  m.version,
+		RecordingID:      sum.recordingID,
+		Name:             sum.name,
+		Source:           sum.source,
+		Date:             meta.Date,
+		ScheduledStart:   fmtTime(sum.schedStart),
+		ScheduledEnd:     fmtTime(sum.schedEnd),
+		SessionStart:     fmtTime(sum.sessStart),
+		SessionEnd:       fmtTime(sum.sessEnd),
+		LastSessionStart: fmtTime(sum.lastStart),
+		ClockSource:      sum.clockSource,
+		FinishReason:     sum.finishReason,
+		Parts:            sum.parts,
+		Sessions:         append([]string{}, sum.digests...),
+		FFmpegRuns:       sum.runs,
+		FFmpegRestarts:   sum.restarts,
+		Audio: metadataAudio{
+			Key:             audioKey,
+			ContentType:     contentType,
+			DurationSeconds: round3(f.duration.Seconds()),
+			Frames:          f.frames,
+			Codec:           f.codec,
+			Profile:         f.profile,
+			SampleRate:      f.sampleRate,
+			Channels:        f.channels,
+			Transcoded:      f.transcoded,
+			RemuxFailed:     f.remuxFailed,
+		},
+		Video:     video,
+		Runs:      []runEntry{},
+		UpdatedAt: time.Now().UTC().Format(milliLayout),
+	}
+	if !sum.firstSample.IsZero() {
+		doc.FirstSampleTime = sum.firstSample.UTC().Format(milliLayout)
+	}
+	if len(sum.exits) > 0 {
+		doc.FFmpegExitReasons = make(map[string]int)
+		for _, e := range sum.exits {
+			doc.FFmpegExitReasons[e.Reason]++
+		}
+	}
+	if embedded {
+		doc.Tags = &metadataTags{Title: meta.Title, Date: meta.Date, Comment: meta.Comment,
+			CreationTime: fmtTime(meta.CreationTime)}
+	}
+	if desc := strings.TrimSpace(meta.Description); desc != "" {
+		var entries []runEntry
+		if json.Unmarshal([]byte(desc), &entries) == nil {
+			doc.Runs = entries
+		}
+	}
+	return doc
+}
+
+// videoMetadata describes the .mp4 companion of a recording with
+// RECORD_VIDEO on: f are its facts when it is stored (nil when it is not),
+// videoErr why it is not.
+func videoMetadata(key string, f *objectFacts, videoErr string) *metadataVideo {
+	v := &metadataVideo{Key: videoKey(key), Error: videoErr}
+	if f == nil {
+		return v
+	}
+	synthetic := f.videoKind == videoKindBlack
+	v.Stored, v.Error = true, ""
+	v.Kind, v.Synthetic, v.Codec = f.videoKind, &synthetic, f.videoCodec
+	v.Width, v.Height = f.width, f.height
+	return v
+}
+
+// videoFactsFromMeta reads the facts of a stored .mp4 companion back from its
+// object metadata (the attempt keeps it as it is, so nothing was probed).
+func videoFactsFromMeta(meta map[string]string) *objectFacts {
+	kind := strings.TrimSpace(meta["video-kind"])
+	if kind == "" && strings.TrimSpace(meta["synthetic-video"]) != "false" {
+		kind = videoKindBlack
+	}
+	return &objectFacts{
+		video:      true,
+		videoKind:  kind,
+		videoCodec: strings.TrimSpace(meta["video-codec"]),
+		width:      atoiMeta(meta["width"]),
+		height:     atoiMeta(meta["height"]),
+	}
+}

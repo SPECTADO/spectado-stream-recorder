@@ -36,9 +36,10 @@ type Uploader interface {
 	// return ErrObjectChanged otherwise.
 	Upload(ctx context.Context, path, key, contentType string, metadata map[string]string, replaceETag string) (etag string, err error)
 	// Overwrite stores the file at path under key unconditionally (no
-	// If-Match/If-None-Match), replacing whatever is there. Only the derived
-	// .mp4 video companion is written this way, and only on an endpoint that
-	// does not enforce conditional writes (ADR 0002); never the audio.
+	// If-Match/If-None-Match), replacing whatever is there. Only derived
+	// objects are written this way: the .json metadata document (ADR 0003),
+	// and the .mp4 video companion on an endpoint that does not enforce
+	// conditional writes (ADR 0002); never the audio.
 	Overwrite(ctx context.Context, path, key, contentType string, metadata map[string]string) (etag string, err error)
 	// Head reports size, ETag and user metadata of key; found is false when
 	// there is no such object.

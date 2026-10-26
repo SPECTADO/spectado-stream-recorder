@@ -19,6 +19,9 @@ container.
   to every `.m4a` under the same key — the source's video (stream-copied), or a
   static black picture for audio-only sources. The `.m4a` is unchanged. See
   [Video companion](#video-companion-record_video).
+* Every uploaded recording also gets a `.json` metadata document under the same
+  key (`/YYYY-MM-DD/{streamId}.json`) with the same facts as the object
+  metadata and the MP4 tags, typed — see [Metadata document](#metadata-document-json).
 
 ## Breaking changes in 1.1.0
 
@@ -369,12 +372,77 @@ Duplicate `id`s: the first wins. Duplicate explicit `key`s: the second is invali
   only the last 20 exits kept in `exits[]` (the unbounded per-reason totals live
   in the `recorder_ffmpeg_exits_total{reason}` metric). Content type
   `audio/mp4`.
+* **Metadata document** — see [below](#metadata-document-json): a `.json` under
+  the same key carries all of the above in one typed document.
 * Notes for consumers: live HLS is delivered a few segments behind real time —
   the first run starts ~3 segments back (natural pre-roll, why
   `RECORD_STOP_LATE` defaults to 30 s), and restarts start at the live edge, so
   a restart may leave a small gap or, for Icecast burst-on-connect, a few
   seconds of overlap — visible in the `description` table's `off`/`dur` pairs,
   not trimmed.
+
+### Metadata document (`.json`)
+
+Every upload of a recording also stores a JSON document next to it, under the
+same key with the suffix swapped — `2026-09-22/match-ro-jpOkle8Mp0.m4a` →
+`2026-09-22/match-ro-jpOkle8Mp0.json` (content type `application/json`,
+object metadata `recording-id`). It holds the same facts as the `.m4a`'s
+`x-amz-meta-*` and its MP4 tags, typed and in one place, so a consumer needs
+neither a `HEAD` nor an MP4 parser:
+
+```json
+{
+  "schema": 1,
+  "recorderVersion": "1.1.0",
+  "recordingId": "match-ro-jpOkle8Mp0",
+  "name": "Rádio Jedna",
+  "source": "https://example.com/live/master.m3u8",
+  "date": "2026-09-22",
+  "scheduledStart": "2026-09-22T18:00:00Z",
+  "scheduledEnd": "2026-09-22T20:00:00Z",
+  "sessionStart": "2026-09-22T17:59:30Z",
+  "sessionEnd": "2026-09-22T20:00:30Z",
+  "lastSessionStart": "2026-09-22T17:59:30Z",
+  "firstSampleTime": "2026-09-22T17:59:22.120Z",
+  "clockSource": "hls-pdt",
+  "finishReason": "ended",
+  "parts": 1,
+  "sessions": ["3f9c0a1b"],
+  "ffmpegRuns": 2,
+  "ffmpegRestarts": 1,
+  "ffmpegExitReasons": {"demux-error": 1},
+  "audio": {"key": "2026-09-22/match-ro-jpOkle8Mp0.m4a", "contentType": "audio/mp4",
+            "durationSeconds": 7260.416, "frames": 340332, "codec": "aac", "profile": "LC",
+            "sampleRate": 48000, "channels": 2},
+  "video": {"key": "2026-09-22/match-ro-jpOkle8Mp0.mp4", "stored": true, "kind": "copy",
+            "synthetic": false, "codec": "h264", "width": 1280, "height": 720},
+  "tags": {"title": "Rádio Jedna", "date": "2026-09-22",
+           "comment": "spectado-stream-recorder 1.1.0; id=…", "creationTime": "2026-09-22T17:59:22Z"},
+  "runs": [{"sid": "…", "t": "2026-09-22T17:59:22.120Z", "src": "hls-pdt", "off": 0, "dur": 3600.24}, …],
+  "updatedAt": "2026-09-22T20:02:11.503Z"
+}
+```
+
+* Field meanings are those of the object metadata above (`camelCase` instead of
+  `kebab-case`); times are RFC 3339 UTC, `firstSampleTime`/`runs[].t`/`updatedAt`
+  with milliseconds. `runs` is exactly the `description` table embedded in the
+  `.m4a`. `name` is always the real (decoded) name. Empty values are omitted.
+* `audio.transcoded` / `audio.remuxFailed` appear only when true. For the raw
+  `.aac` remux fallback the document has the same base name, `audio.key` points
+  at the `.aac`, there are no `tags` (raw ADTS has no container), and `runs` is
+  still filled.
+* `video` is present only with `RECORD_VIDEO=true`: `stored: false` plus
+  `error` when the recording was uploaded without its `.mp4`.
+* `schema` is bumped on an incompatible change; new fields may be added
+  without a bump.
+* **When it is written.** Right before the `.m4a` (after the `.mp4`), and
+  rewritten by every merge, so it always describes the latest object. It is
+  derived data and written unconditionally (no `If-Match`). A transfer error
+  retries the whole upload attempt like an error on the audio; a permanent
+  refusal (e.g. access denied) is logged and costs the document only — the
+  audio is still stored (`recorder_metadata_uploads_total{result="failure"}`).
+  Recordings uploaded before this feature have no document; kept mode
+  (`UPLOAD_DISABLED=true`) writes none.
 
 ### Video companion (`RECORD_VIDEO`)
 
@@ -656,6 +724,7 @@ documented list):
 | `uploads_total{result}`, `upload_bytes_total`, `upload_duration_seconds` (histogram 1 s – 1 h), `uploads_pending`, `upload_pending_bytes`, `uploads_in_progress`, `uploads_blocked`, `upload_oldest_pending_age_seconds`, `recordings_failed` | | Upload pipeline |
 | `remux_total{result}` (`success`\|`failure`\|`nospace`), `remux_duration_seconds` (histogram 0.5 s – 600 s), `remux_transcoded_total` | | ADTS → `.m4a` remux (the copy-vs-transcode decision and how long it takes) |
 | `video_builds_total{kind,result}` (`kind`: `black`\|`copy`\|`transcode`, `result`: `success`\|`failure`; plus `kind="none",result="nospace"`: the disk fits the audio but not the companion), `video_capture_disabled_total{reason}` (`output-error`\|`empty-runs`) | counter | `.mp4` video companion (`RECORD_VIDEO=true`): how each companion was built, and sessions whose video capture was turned off (the rest of the session is black in their `.mp4`) |
+| `metadata_uploads_total{result}` (`success`\|`failure`) | counter | Puts of the `.json` metadata document stored next to every recording |
 | `upload_merges_total`, `upload_fallback_total`, `object_key_renames_total{reason}` (`conflict`\|`out-of-order`\|`parts-cap`\|`no-conditional-writes`\|`remux-failed`) | counter | One-object-per-recording bookkeeping: how often parts merged into an existing object, fell back to a raw `.aac` upload, or a key had to be renamed because the object under it wasn't safe to merge into |
 | `recordings_on_disk_bytes`, `disk_free_bytes{path}`, `disk_used_percent{path}`, `disk_low` | gauge | Local storage |
 | `host_cpu_percent`, `host_load1/5/15`, `host_memory_*`, `system_processes` | gauge | Host as seen through `/proc` |

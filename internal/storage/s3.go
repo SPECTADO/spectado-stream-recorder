@@ -241,9 +241,9 @@ func (s *S3) Upload(ctx context.Context, path, key, contentType string, metadata
 
 // Overwrite stores the file under key UNCONDITIONALLY (no If-Match, no
 // If-None-Match), replacing whatever is there, and verifies the stored size
-// like Upload. The recorder uses it only for the .mp4 video companion: a
-// derived object whose consistency is checked through its sessions manifest,
-// never for the audio (see recorder.Overwriter, ADR 0002).
+// like Upload. The recorder uses it only for derived objects — the .mp4 video
+// companion, whose consistency is checked through its sessions manifest, and
+// the .json metadata document — never for the audio (ADR 0002, ADR 0003).
 func (s *S3) Overwrite(ctx context.Context, path, key, contentType string, metadata map[string]string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {

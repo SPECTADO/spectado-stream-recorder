@@ -2,6 +2,7 @@ package recorder
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -381,6 +382,7 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 	// before anything is built, so a foreign object there moves the group now.
 	var vt *videoTarget
 	var vdone completion
+	var vfacts *objectFacts // the stored .mp4's, for the metadata document
 	if groupHasVideo(group) {
 		if vt, err = m.headVideo(ctx, key, s.ID, group, remote, toAdd, log); err != nil {
 			return err
@@ -483,28 +485,24 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 	if vt != nil && vt.reuse {
 		log.Info("the stored video companion already holds these sessions; keeping it", "videoKey", vt.key)
 		vdone.video = true
+		vfacts = videoFactsFromMeta(vt.meta)
 	} else if vt != nil {
 		var remotePart *buildPart
 		if merging {
 			remotePart = &parts[0]
 		}
-		stored, verr, err := m.uploadVideo(ctx, vt, key, toAdd, remotePart, out, transcoded, sum, meta, dir, tmpID, tmps, log)
+		vf, verr, err := m.uploadVideo(ctx, vt, key, toAdd, remotePart, out, transcoded, sum, meta, dir, tmpID, tmps, log)
 		if err != nil {
 			return err
 		}
-		vdone.video, vdone.videoErr = stored, verr
+		vfacts = vf
+		vdone.video, vdone.videoErr = vf != nil, verr
 	}
 	if !vdone.video && vdone.videoErr != "" {
 		vdone.videoHeld = held
 	}
 
-	// 7. Store it: a new object is written conditionally (never overwrite), a
-	//    merge replaces exactly the object the HEAD saw.
-	replaceETag := ""
-	if merging {
-		replaceETag = remote.etag
-	}
-	objMeta := m.objectMetadata(sum, objectFacts{
+	af := objectFacts{
 		duration:   res.Duration,
 		frames:     res.Frames,
 		codec:      res.Codec,
@@ -512,7 +510,27 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 		sampleRate: res.SampleRate,
 		channels:   res.Channels,
 		transcoded: transcoded,
-	})
+	}
+
+	// 7. The .json metadata document goes right before the .m4a, for the same
+	//    reason as the .mp4: once the .m4a lists the sessions, no later attempt
+	//    writes anything for them again.
+	var vdoc *metadataVideo
+	if groupHasVideo(group) {
+		vdoc = videoMetadata(key, vfacts, vdone.videoErr)
+	}
+	doc := m.metadataDocument(sum, key, objectContentType, af, meta, true, vdoc)
+	if err := m.putMetadata(ctx, doc, dir, tmpID, tmps, log); err != nil {
+		return err
+	}
+
+	// 8. Store it: a new object is written conditionally (never overwrite), a
+	//    merge replaces exactly the object the HEAD saw.
+	replaceETag := ""
+	if merging {
+		replaceETag = remote.etag
+	}
+	objMeta := m.objectMetadata(sum, af)
 	etag, err := m.putObject(ctx, out, key, objectContentType, objMeta, replaceETag, res.Size, log)
 	if err != nil {
 		return err
@@ -521,7 +539,7 @@ func (m *Manager) uploadOnce(ctx context.Context, s *Session, key string) error 
 		m.met.UploadMergesTotal.Inc()
 	}
 
-	// 8. Both the sessions that were already in the object and the ones this
+	// 9. Both the sessions that were already in the object and the ones this
 	//    attempt added are done.
 	return m.completeGroup(append(toAdd, present...), key, etag,
 		completion{transcoded: transcoded, duration: res.Duration, video: vdone.video, videoErr: vdone.videoErr,
@@ -1096,7 +1114,7 @@ func (m *Manager) uploadFallback(ctx context.Context, group []*Session, toAdd, p
 	if err != nil {
 		return fmt.Errorf("concatenate raw capture: %w", err)
 	}
-	objMeta := m.objectMetadata(sum, objectFacts{
+	af := objectFacts{
 		duration:    duration,
 		frames:      frames,
 		codec:       "aac",
@@ -1104,7 +1122,18 @@ func (m *Manager) uploadFallback(ctx context.Context, group []*Session, toAdd, p
 		sampleRate:  toAdd[0].info.Params.SampleRate,
 		channels:    toAdd[0].info.Params.Channels(),
 		remuxFailed: true,
-	})
+	}
+	objMeta := m.objectMetadata(sum, af)
+	// Raw ADTS carries no tags, but the document still gets the run table:
+	// the concatenation keeps the captures' order and durations.
+	var vdoc *metadataVideo
+	if groupHasVideo(group) {
+		vdoc = videoMetadata(key, nil, done.videoErr)
+	}
+	doc := m.metadataDocument(sum, fbKey, fallbackContentType, af, m.mp4Metadata(sum, toAdd, nil, 0), false, vdoc)
+	if err := m.putMetadata(ctx, doc, dir, tmpID, tmps, log); err != nil {
+		return err
+	}
 	log.Error("storing the raw ADTS capture instead of an .m4a after repeated remux failures",
 		"key", fbKey, "bytes", size)
 	etag, err := m.putObject(ctx, out, fbKey, fallbackContentType, objMeta, "", size, log)
@@ -1154,6 +1183,44 @@ func (m *Manager) putObject(ctx context.Context, path, key, contentType string, 
 	log.Info("object stored", "key", key, "bytes", size, "etag", etag,
 		"duration", took.Truncate(time.Millisecond).String())
 	return etag, nil
+}
+
+// putMetadata stores the recording's .json metadata document next to its
+// audio. It is derived (rebuilt from the summary on every upload of the
+// recording), so it is written unconditionally. A transfer error retries the
+// attempt like one on the audio; a refusal that retrying cannot fix costs the
+// document, never the audio.
+func (m *Manager) putMetadata(ctx context.Context, doc metadataDoc, dir, tmpID string, tmps *tempFiles,
+	log *slog.Logger,
+) error {
+	key := metadataKey(doc.Audio.Key)
+	data, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode metadata document: %w", err)
+	}
+	data = append(data, '\n')
+	path := filepath.Join(dir, ".tmp-upload-"+tmpID+".json")
+	tmps.add(path)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write metadata document: %w", err)
+	}
+	uctx, cancel := context.WithTimeout(ctx, m.transferDeadline(int64(len(data))))
+	defer cancel()
+	etag, err := m.up.Overwrite(uctx, path, key, metadataContentType, map[string]string{"recording-id": doc.RecordingID})
+	if err != nil {
+		m.met.MetadataUploadsTotal.WithLabelValues("failure").Inc()
+		var perm *PermanentError
+		if errors.As(err, &perm) {
+			log.Error("the metadata document upload was refused; storing the recording without it",
+				"metadataKey", key, "error", err)
+			return nil
+		}
+		return fmt.Errorf("metadata document %s: %w", key, err)
+	}
+	m.met.MetadataUploadsTotal.WithLabelValues("success").Inc()
+	m.met.UploadBytesTotal.Add(float64(len(data)))
+	log.Info("metadata document stored", "key", key, "bytes", len(data), "etag", etag)
+	return nil
 }
 
 // completion carries what the finished object says about its members.
@@ -1345,6 +1412,7 @@ type videoTarget struct {
 	key  string
 	etag string // the stored companion's ETag (for its download); "" = none there
 	size int64
+	meta map[string]string // the stored companion's object metadata
 	// inSync: the stored .mp4 is a real (captured) picture of the stored
 	// .m4a's parts followed by the first skip sessions of this attempt (an
 	// earlier attempt stored it, then failed before its .m4a): it becomes the
@@ -1381,7 +1449,7 @@ func (m *Manager) headVideo(ctx context.Context, key, recordingID string, group 
 			"videoKey", vkey, "remoteId", id)
 		return nil, m.renameGroup(group, "conflict", log)
 	}
-	vt.etag, vt.size = info.ETag, info.Size
+	vt.etag, vt.size, vt.meta = info.ETag, info.Size, info.Metadata
 	stored := digestList(info.Metadata["sessions"])
 	if stored == "" {
 		return vt, nil
@@ -1446,13 +1514,13 @@ func digestList(v string) string {
 }
 
 // uploadVideo builds and stores the companion of the .m4a built at audioM4A.
-// It returns stored=true once the .mp4 is in the bucket; a build that failed
-// maxRemuxFailures times in a row returns stored=false and the reason, and the
-// caller stores the .m4a without it. Any other error retries the attempt.
+// It returns the stored .mp4's facts once it is in the bucket; a build that
+// failed maxRemuxFailures times in a row returns nil facts and the reason, and
+// the caller stores the .m4a without it. Any other error retries the attempt.
 func (m *Manager) uploadVideo(ctx context.Context, vt *videoTarget, key string, toAdd []*uploadMember,
 	remotePart *buildPart, audioM4A string, transcoded bool, sum objectSummary, meta remux.Metadata,
 	dir, tmpID string, tmps *tempFiles, log *slog.Logger,
-) (stored bool, videoErr string, err error) {
+) (stored *objectFacts, videoErr string, err error) {
 	out := filepath.Join(dir, ".tmp-upload-"+tmpID+".mp4")
 	tmps.add(out)
 	kind, res, err := m.buildVideoCompanion(ctx, vt, toAdd, remotePart, audioM4A, out, meta, dir, tmpID, tmps, log)
@@ -1461,21 +1529,21 @@ func (m *Manager) uploadVideo(ctx context.Context, vt *videoTarget, key string, 
 	case errors.As(err, &vbe):
 		if ctx.Err() != nil {
 			// Shutdown, not a broken recording.
-			return false, "", ctx.Err()
+			return nil, "", ctx.Err()
 		}
 		failures := m.noteVideoFailure(key)
 		log.Error("video companion build failed", "error", vbe.err, "consecutiveFailures", failures)
 		if failures < maxRemuxFailures {
-			return false, "", err
+			return nil, "", err
 		}
 		log.Error("giving up on the video companion after repeated build failures; storing the audio without it",
 			"videoKey", vt.key, "failures", failures)
-		return false, "video build failed: " + vbe.err.Error(), nil
+		return nil, "video build failed: " + vbe.err.Error(), nil
 	case err != nil:
-		return false, "", err
+		return nil, "", err
 	}
 
-	objMeta := m.objectMetadata(sum, objectFacts{
+	vf := objectFacts{
 		duration:   res.Duration,
 		frames:     res.Frames,
 		codec:      res.Codec,
@@ -1488,7 +1556,8 @@ func (m *Manager) uploadVideo(ctx context.Context, vt *videoTarget, key string, 
 		videoCodec: res.Video.VideoCodec,
 		width:      res.Video.Width,
 		height:     res.Video.Height,
-	})
+	}
+	objMeta := m.objectMetadata(sum, vf)
 	// Conditional where the endpoint enforces it (create-only when the HEAD
 	// found nothing, If-Match on the ETag it found), so a concurrent writer's
 	// companion under the same key is never replaced: ErrObjectExists /
@@ -1501,11 +1570,11 @@ func (m *Manager) uploadVideo(ctx context.Context, vt *videoTarget, key string, 
 		var perm *PermanentError
 		if errors.As(err, &perm) {
 			log.Error("the video companion upload was refused; storing the audio without it", "videoKey", vt.key, "error", err)
-			return false, "video upload refused: " + err.Error(), nil
+			return nil, "video upload refused: " + err.Error(), nil
 		}
-		return false, "", err
+		return nil, "", err
 	}
-	return true, "", nil
+	return &vf, "", nil
 }
 
 // putVideo stores the companion. When the endpoint enforces conditional

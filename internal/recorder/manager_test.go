@@ -113,6 +113,10 @@ type fakeUploader struct {
 	noCond    bool // endpoint does NOT enforce conditional writes
 	condErr   error
 	etagSeq   int
+	// The .json metadata documents are kept out of calls/errs, which describe
+	// the media objects: docCalls records their puts, docErrs fails them.
+	docCalls []uploadCall
+	docErrs  []error
 }
 
 func copyMeta(in map[string]string) map[string]string {
@@ -167,12 +171,18 @@ func (f *fakeUploader) Upload(ctx context.Context, path, key, contentType string
 	return etag, nil
 }
 
-// Overwrite stores unconditionally (the .mp4 companion); errs apply as for
-// Upload. Its calls are recorded with overwrite set.
+// Overwrite stores unconditionally (the .mp4 companion, the .json metadata
+// document); errs apply as for Upload. Its calls are recorded with overwrite
+// set; metadata documents go to docCalls/docErrs instead.
 func (f *fakeUploader) Overwrite(ctx context.Context, path, key, contentType string, meta map[string]string) (string, error) {
+	doc := contentType == metadataContentType
 	f.mu.Lock()
 	var err error
-	if len(f.errs) > 0 {
+	if doc {
+		if len(f.docErrs) > 0 {
+			err, f.docErrs = f.docErrs[0], f.docErrs[1:]
+		}
+	} else if len(f.errs) > 0 {
 		err, f.errs = f.errs[0], f.errs[1:]
 	}
 	f.mu.Unlock()
@@ -191,8 +201,13 @@ func (f *fakeUploader) Overwrite(ctx context.Context, path, key, contentType str
 	f.etagSeq++
 	etag := fmt.Sprintf("etag-%d", f.etagSeq)
 	f.objects[key] = &fakeObject{body: body, meta: copyMeta(meta), etag: etag, ctype: contentType}
-	f.calls = append(f.calls, uploadCall{path: path, key: key, contentType: contentType,
-		size: int64(len(body)), meta: copyMeta(meta), overwrite: true})
+	call := uploadCall{path: path, key: key, contentType: contentType,
+		size: int64(len(body)), meta: copyMeta(meta), overwrite: true}
+	if doc {
+		f.docCalls = append(f.docCalls, call)
+	} else {
+		f.calls = append(f.calls, call)
+	}
 	return etag, nil
 }
 
