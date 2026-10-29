@@ -342,6 +342,14 @@ func TestApplyItem(t *testing.T) {
 	if s.effectiveStopLate(time.Minute) != time.Minute {
 		t.Fatal("override removed -> default applies")
 	}
+	s.applyItem(schedule.Item{Source: "http://b", StreamInfo: []byte(`{"matchId":1}`)})
+	if string(s.StreamInfo) != `{"matchId":1}` {
+		t.Fatalf("streamInfo = %s", s.StreamInfo)
+	}
+	s.applyItem(schedule.Item{Source: "http://b"})
+	if s.StreamInfo != nil {
+		t.Fatalf("streamInfo removed from the item must be removed from the session: %s", s.StreamInfo)
+	}
 }
 
 // TestFFmpegArgsAudioOnlyGolden pins the complete command line of an audio-only

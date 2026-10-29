@@ -68,7 +68,8 @@ EXTRA=""
 [ "$VIDEO" = 1 ] && EXTRA="$EXTRA,{\"id\":\"test-video\",\"type\":\"hls\",\"source\":\"http://127.0.0.1:$PORT/hls/video.m3u8\",\"start\":\"$START\",\"end\":\"$END\"}"
 # Local items only (test-hls, + test-video): the optional external stream may fail.
 EXPECTED_RECORDINGS=$(( 1 + VIDEO ))
-echo "[{\"id\":\"test-hls\",\"type\":\"hls\",\"source\":\"http://127.0.0.1:$PORT/hls/test.m3u8\",\"start\":\"$START\",\"end\":\"$END\"}$EXTRA]" > "$WWW/schedule.json"
+STREAM_INFO='{"matchId":4711,"commentator":{"id":42,"name":"Jan Novák"},"language":"cs"}'
+echo "[{\"id\":\"test-hls\",\"type\":\"hls\",\"source\":\"http://127.0.0.1:$PORT/hls/test.m3u8\",\"start\":\"$START\",\"end\":\"$END\",\"streamInfo\":$STREAM_INFO}$EXTRA]" > "$WWW/schedule.json"
 (cd "$WWW" && exec python3 -m http.server "$PORT" --bind 127.0.0.1 >"$WORK/http.log" 2>&1) &
 SRV=$!
 sleep 1
@@ -95,6 +96,13 @@ say "SIGTERM -> suspend"
 kill -TERM $REC; wait $REC
 grep -q "recording suspended for shutdown" "$WORK/recorder.log" || fail "not suspended"
 python3 -c "import json,glob; [print(' sidecar', json.load(open(f))['state']) for f in glob.glob('$DATA/recordings/*/*.json')]"
+# streamInfo from the schedule is carried 1:1 in the session sidecar (and from there into the .json document).
+python3 -c "
+import json,glob,sys
+want = json.loads(sys.argv[1])
+got = [json.load(open(f)).get('streamInfo') for f in glob.glob('$DATA/recordings/test-hls*/*.json')]
+if not got or any(g != want for g in got): sys.exit(f'sidecar streamInfo {got}, want {want}')
+" "$STREAM_INFO" || fail "streamInfo not carried into the sidecar"
 
 say "run 2 -> resume"
 run_recorder; sleep 12

@@ -1,6 +1,7 @@
 package recorder
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -253,5 +254,48 @@ func TestMetadataKey(t *testing.T) {
 		if got := metadataKey(in); got != want {
 			t.Errorf("metadataKey(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestMetadataDocumentCarriesStreamInfo: the schedule item's streamInfo is
+// copied into the document as is (through the sidecar, so it survives a
+// restart). Of several sessions the newest one that has it wins; a recording
+// without it has no streamInfo key at all.
+func TestMetadataDocumentCarriesStreamInfo(t *testing.T) {
+	dir := t.TempDir()
+	start := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
+	key := start.UTC().Format("2006-01-02") + "/a.m4a"
+	older := seedFinalized(t, dir, "a", "a_20260101T000000Z", start, key, 30)
+	newer := seedFinalized(t, dir, "a", "a_20260101T010000Z", start.Add(time.Hour), key, 30)
+	plain := seedFinalized(t, dir, "b", "b_20260101T000000Z", start, start.UTC().Format("2006-01-02")+"/b.m4a", 30)
+	for s, info := range map[*Session]string{
+		older: `{"matchId": 7, "commentator": "Old"}`,
+		newer: `{"matchId": 7, "commentator": "Jan Novák", "teams": ["A", "B"], "x": {"y": null}}`,
+	} {
+		s.StreamInfo = []byte(info)
+		if err := s.save(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	up := &fakeUploader{}
+	m, _ := newRecoverManager(t, dir, up)
+	m.Recover()
+	m.settle()
+
+	for _, s := range []*Session{older, newer, plain} {
+		if st, _ := m.sessionState(s.SessionID); st != StateUploaded {
+			t.Fatalf("%s: state = %s", s.SessionID, st)
+		}
+	}
+	doc := storedDoc(t, up, strings.TrimSuffix(key, ".m4a")+".json")
+	want := `{"matchId":7,"commentator":"Jan Novák","teams":["A","B"],"x":{"y":null}}`
+	var got bytes.Buffer
+	if err := json.Compact(&got, doc.StreamInfo); err != nil || doc.Parts != 2 || got.String() != want {
+		t.Fatalf("parts=%d streamInfo = %s, want the newest session's %s", doc.Parts, doc.StreamInfo, want)
+	}
+	o := up.object(start.UTC().Format("2006-01-02") + "/b.json")
+	if o == nil || strings.Contains(string(o.body), "streamInfo") {
+		t.Fatalf("recording without streamInfo: document %v", o)
 	}
 }

@@ -56,6 +56,7 @@ type objectSummary struct {
 	restarts     int
 	runs         int
 	exits        []RunExit
+	streamInfo   json.RawMessage // of the newest local session that has one
 }
 
 // summarize folds the stored object's manifest (when merging) and the sessions
@@ -67,6 +68,7 @@ func (m *Manager) summarize(toAdd []*uploadMember, remote *remoteObject) objectS
 
 	var sum objectSummary
 	var remoteName string
+	var streamInfoAt time.Time
 	setAnchor := func(t time.Time, src string) {
 		if t.IsZero() {
 			return
@@ -112,6 +114,9 @@ func (m *Manager) summarize(toAdd []*uploadMember, remote *remoteObject) objectS
 		sum.restarts += s.Restarts
 		sum.runs += len(s.Runs)
 		sum.exits = append(sum.exits, s.Exits...)
+		if len(s.StreamInfo) > 0 && !s.SessionStart.Before(streamInfoAt) {
+			sum.streamInfo, streamInfoAt = s.StreamInfo, s.SessionStart
+		}
 		if len(s.Runs) > 0 {
 			setAnchor(s.Runs[0].Anchor, s.Runs[0].AnchorSource)
 		} else {
@@ -437,30 +442,31 @@ const (
 // It is derived from the same summary and is rewritten with every upload of
 // the recording (a merge replaces it like it replaces the .m4a).
 type metadataDoc struct {
-	Schema            int            `json:"schema"`
-	RecorderVersion   string         `json:"recorderVersion,omitempty"`
-	RecordingID       string         `json:"recordingId"`
-	Name              string         `json:"name,omitempty"`
-	Source            string         `json:"source,omitempty"`
-	Date              string         `json:"date,omitempty"`
-	ScheduledStart    string         `json:"scheduledStart,omitempty"`
-	ScheduledEnd      string         `json:"scheduledEnd,omitempty"`
-	SessionStart      string         `json:"sessionStart,omitempty"`
-	SessionEnd        string         `json:"sessionEnd,omitempty"`
-	LastSessionStart  string         `json:"lastSessionStart,omitempty"`
-	FirstSampleTime   string         `json:"firstSampleTime,omitempty"`
-	ClockSource       string         `json:"clockSource,omitempty"`
-	FinishReason      string         `json:"finishReason,omitempty"`
-	Parts             int            `json:"parts"`
-	Sessions          []string       `json:"sessions"`
-	FFmpegRuns        int            `json:"ffmpegRuns"`
-	FFmpegRestarts    int            `json:"ffmpegRestarts"`
-	FFmpegExitReasons map[string]int `json:"ffmpegExitReasons,omitempty"`
-	Audio             metadataAudio  `json:"audio"`
-	Video             *metadataVideo `json:"video,omitempty"`
-	Tags              *metadataTags  `json:"tags,omitempty"`
-	Runs              []runEntry     `json:"runs"`
-	UpdatedAt         string         `json:"updatedAt"`
+	Schema            int             `json:"schema"`
+	RecorderVersion   string          `json:"recorderVersion,omitempty"`
+	RecordingID       string          `json:"recordingId"`
+	Name              string          `json:"name,omitempty"`
+	Source            string          `json:"source,omitempty"`
+	StreamInfo        json.RawMessage `json:"streamInfo,omitempty"`
+	Date              string          `json:"date,omitempty"`
+	ScheduledStart    string          `json:"scheduledStart,omitempty"`
+	ScheduledEnd      string          `json:"scheduledEnd,omitempty"`
+	SessionStart      string          `json:"sessionStart,omitempty"`
+	SessionEnd        string          `json:"sessionEnd,omitempty"`
+	LastSessionStart  string          `json:"lastSessionStart,omitempty"`
+	FirstSampleTime   string          `json:"firstSampleTime,omitempty"`
+	ClockSource       string          `json:"clockSource,omitempty"`
+	FinishReason      string          `json:"finishReason,omitempty"`
+	Parts             int             `json:"parts"`
+	Sessions          []string        `json:"sessions"`
+	FFmpegRuns        int             `json:"ffmpegRuns"`
+	FFmpegRestarts    int             `json:"ffmpegRestarts"`
+	FFmpegExitReasons map[string]int  `json:"ffmpegExitReasons,omitempty"`
+	Audio             metadataAudio   `json:"audio"`
+	Video             *metadataVideo  `json:"video,omitempty"`
+	Tags              *metadataTags   `json:"tags,omitempty"`
+	Runs              []runEntry      `json:"runs"`
+	UpdatedAt         string          `json:"updatedAt"`
 }
 
 // metadataAudio describes the stored audio object (.m4a, or the raw .aac of
@@ -520,6 +526,7 @@ func (m *Manager) metadataDocument(sum objectSummary, audioKey, contentType stri
 		RecordingID:      sum.recordingID,
 		Name:             sum.name,
 		Source:           sum.source,
+		StreamInfo:       sum.streamInfo,
 		Date:             meta.Date,
 		ScheduledStart:   fmtTime(sum.schedStart),
 		ScheduledEnd:     fmtTime(sum.schedEnd),

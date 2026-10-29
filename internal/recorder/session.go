@@ -108,6 +108,7 @@ type Session struct {
 	Codec        string             `json:"codec"`                 // requested: auto|aac|copy
 	Bitrate      string             `json:"bitrate,omitempty"`
 	Headers      map[string]string  `json:"headers,omitempty"`
+	StreamInfo   json.RawMessage    `json:"streamInfo,omitempty"` // opaque, from the schedule item (latest known)
 
 	ResolvedCodec string     `json:"resolvedCodec,omitempty"` // aac|copy after probing
 	SessionStart  time.Time  `json:"sessionStart"`
@@ -270,6 +271,7 @@ func (s *Session) applyItem(it schedule.Item) (sourceChanged bool) {
 	s.StopLate = it.StopLate
 	s.StallTimeout = it.StallTimeout
 	s.InsecureTLS = it.InsecureTLS
+	s.StreamInfo = it.StreamInfo
 	if it.Codec != "" {
 		s.Codec = it.Codec
 	}

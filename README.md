@@ -22,6 +22,8 @@ container.
 * Every uploaded recording also gets a `.json` metadata document under the same
   key (`/YYYY-MM-DD/{streamId}.json`) with the same facts as the object
   metadata and the MP4 tags, typed — see [Metadata document](#metadata-document-json).
+  An optional `streamInfo` object from the schedule item (match, commentator,
+  …) is copied into it as is.
 
 ## Breaking changes in 1.1.0
 
@@ -179,7 +181,8 @@ are ignored.
     "bitrate": "96k",
     "headers": { "Authorization": "Bearer …" },
     "startEarly": "15s",
-    "stopLate": "60s"
+    "stopLate": "60s",
+    "streamInfo": { "matchId": 4711, "commentator": "Jan Novák", "language": "cs" }
   }
 ]
 ```
@@ -198,6 +201,7 @@ are ignored.
 | `startEarly`, `stopLate` | no | Per-item override of `RECORD_START_EARLY` / `RECORD_STOP_LATE` (`"15s"` or seconds). |
 | `stallTimeout` | no | Per-item override of `FFMPEG_STALL_TIMEOUT` (≥ 5 s). |
 | `insecureTLS` | no | Skip TLS verification for this source (only relevant with `FFMPEG_TLS_VERIFY=true`). |
+| `streamInfo` / `stream_info` | no | Any JSON value (normally an object) describing the stream — e.g. match, commentator, language, competition. **Not validated**; copied 1:1 into the recording's [metadata document](#metadata-document-json) as `streamInfo`. Changes are picked up while recording (latest value wins). `null` = absent. Visible in `/api/schedule` and the session sidecar, so do not put secrets in it. |
 
 Validation happens per item: an invalid entry is skipped and reported in
 `/api/state` (`schedule.invalidItems`) and `recorder_schedule_invalid_items`,
@@ -393,10 +397,11 @@ neither a `HEAD` nor an MP4 parser:
 ```json
 {
   "schema": 1,
-  "recorderVersion": "1.2.0",
+  "recorderVersion": "1.3.0",
   "recordingId": "match-ro-jpOkle8Mp0",
   "name": "Rádio Jedna",
   "source": "https://example.com/live/master.m3u8",
+  "streamInfo": {"matchId": 4711, "commentator": "Jan Novák", "language": "cs"},
   "date": "2026-09-22",
   "scheduledStart": "2026-09-22T18:00:00Z",
   "scheduledEnd": "2026-09-22T20:00:00Z",
@@ -417,7 +422,7 @@ neither a `HEAD` nor an MP4 parser:
   "video": {"key": "2026-09-22/match-ro-jpOkle8Mp0.mp4", "stored": true, "kind": "copy",
             "synthetic": false, "codec": "h264", "width": 1280, "height": 720},
   "tags": {"title": "Rádio Jedna", "date": "2026-09-22",
-           "comment": "spectado-stream-recorder 1.2.0; id=…", "creationTime": "2026-09-22T17:59:22Z"},
+           "comment": "spectado-stream-recorder 1.3.0; id=…", "creationTime": "2026-09-22T17:59:22Z"},
   "runs": [{"sid": "…", "t": "2026-09-22T17:59:22.120Z", "src": "hls-pdt", "off": 0, "dur": 3600.24}, …],
   "updatedAt": "2026-09-22T20:02:11.503Z"
 }
@@ -431,6 +436,10 @@ neither a `HEAD` nor an MP4 parser:
   `.aac` remux fallback the document has the same base name, `audio.key` points
   at the `.aac`, there are no `tags` (raw ADTS has no container), and `runs` is
   still filled.
+* `streamInfo` is the schedule item's `streamInfo`, copied verbatim (no schema
+  check; the recorder does not interpret it). With several sessions it is the
+  value of the newest session that had one; absent when the item has none. It
+  is not put into `x-amz-meta-*` nor into the MP4 tags (size budget).
 * `video` is present only with `RECORD_VIDEO=true`: `stored: false` plus
   `error` when the recording was uploaded without its `.mp4`.
 * `schema` is bumped on an incompatible change; new fields may be added

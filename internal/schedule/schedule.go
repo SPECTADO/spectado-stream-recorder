@@ -72,6 +72,10 @@ type Item struct {
 	StopLate     *Duration         `json:"stopLate,omitempty"`     // per-item override
 	StallTimeout *Duration         `json:"stallTimeout,omitempty"` // per-item override (>= 5s)
 	InsecureTLS  bool              `json:"insecureTLS,omitempty"`  // skip TLS verification for this source
+	// StreamInfo is opaque metadata about the stream (match, commentator, ...)
+	// supplied by the schedule source. It is not validated, only carried 1:1
+	// into the recording's .json metadata document.
+	StreamInfo json.RawMessage `json:"streamInfo,omitempty"`
 }
 
 // InvalidItem describes an entry that was rejected during parsing.
@@ -355,6 +359,9 @@ func parseItem(raw json.RawMessage, loc *time.Location) (Item, error) {
 		if err := json.Unmarshal(raw, &it.InsecureTLS); err != nil {
 			return it, errors.New("insecureTLS must be a boolean")
 		}
+	}
+	if raw, ok := get("streamInfo", "stream_info"); ok {
+		it.StreamInfo = append(json.RawMessage(nil), raw...)
 	}
 	return it, nil
 }
